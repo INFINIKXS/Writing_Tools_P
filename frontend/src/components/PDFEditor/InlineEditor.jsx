@@ -48,20 +48,46 @@ function buildInitialChildren(str, superscriptRanges, defaultColor) {
   let cursor = 0;
   sorted.forEach((r, idx) => {
     if (r.charStart > cursor) {
-      children.push(displayStr.slice(cursor, r.charStart));
+      let beforeText = displayStr.slice(cursor, r.charStart);
+      // Clean up excess spaces right before superscript (e.g. "Bost et al   " -> "Bost et al ")
+      beforeText = beforeText.replace(/ {2,}$/, ' ');
+      children.push(beforeText);
     }
-    const chunk = displayStr.slice(r.charStart, r.charEnd);
+    // Trim superscript chunk to eliminate space gaps inside <sup>
+    const chunk = displayStr.slice(r.charStart, r.charEnd).trim();
     // Use authoritative backend-extracted span color r.color
     const supColor = r.color || defaultColor || 'inherit';
     if (r.kind === 'super') {
       children.push(
-        <sup key={`sup-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'super', whiteSpace: 'pre-wrap' }}>
+        <sup
+          key={`sup-${idx}`}
+          style={{
+            fontSize: '0.65em',
+            lineHeight: 0,
+            margin: 0,
+            padding: 0,
+            color: supColor,
+            verticalAlign: '0.4em',
+            whiteSpace: 'nowrap',
+          }}
+        >
           {chunk}
         </sup>,
       );
     } else {
       children.push(
-        <sub key={`sub-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'sub', whiteSpace: 'pre-wrap' }}>
+        <sub
+          key={`sub-${idx}`}
+          style={{
+            fontSize: '0.65em',
+            lineHeight: 0,
+            margin: 0,
+            padding: 0,
+            color: supColor,
+            verticalAlign: '-0.2em',
+            whiteSpace: 'nowrap',
+          }}
+        >
           {chunk}
         </sub>,
       );
@@ -69,7 +95,10 @@ function buildInitialChildren(str, superscriptRanges, defaultColor) {
     cursor = r.charEnd;
   });
   if (cursor < displayStr.length) {
-    children.push(displayStr.slice(cursor));
+    let afterText = displayStr.slice(cursor);
+    // Clean up excess spaces right after superscript
+    afterText = afterText.replace(/^ {2,}/, ' ');
+    children.push(afterText);
   }
   return children;
 }
@@ -271,17 +300,55 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
     ? (item.renderedFontFamily || `${realFontStack}, "Times New Roman", Georgia, serif`) 
     : fontFamily;
 
-
-  // Live verification if the embedded PDF font is active in browser document.fonts
-  const isFontEmbeddedAndActive = React.useMemo(() => {
+  // Check if the browser has actually loaded the embedded font from the PDF.
+  // Used to drive the ✓ Embedded / ⚠ Fallback badge in the toolbar.
+  const isFontEmbeddedAndActive = useMemo(() => {
+    if (fontFamily !== 'Original') return false;
     try {
-      const psName = stripSubset(item.fontPostScriptName || item.fontName);
-      if (!psName) return false;
-      return document.fonts.check(`12px "${psName}"`);
-    } catch (e) {
+      return sanitizedCandidates.some(name =>
+        document.fonts.check(`12px "${name}"`)
+      );
+    } catch {
       return false;
     }
-  }, [item.fontPostScriptName, item.fontName]);
+  }, [fontFamily, sanitizedCandidates]);
+
+  // ── Horizontal spacing correction ─────────────────────────────────────────
+  // Paragraphs: use CSS letter-spacing to distribute any width deficit/surplus
+  // evenly across characters — this preserves glyph shapes and works in concert
+  // with text-align:justify (which already handles word-spacing via Tw).
+  //
+  // Single-line items: keep scaleX geometric compression since justify has no
+  // effect on a single unwrapped line and letter-spacing alone can't fill the gap.
+  const [scaleX, setScaleX] = useState(1);
+  const [letterSpacing, setLetterSpacing] = useState(0); // px, applied to paragraphs only
+
+  useEffect(() => {
+    if (!spanRef.current || !r.w) return;
+    const measure = () => {
+      if (!spanRef.current) return;
+      const domW = spanRef.current.scrollWidth;
+      const deficit = r.w - domW; // positive = text runs short, negative = overflow
+
+      if (item.isParagraph) {
+        // Distribute delta across non-whitespace characters.
+        // Clamp to ±1.5px so we don't over-kern on very short paragraphs.
+        const charCount = Math.max(1, (initialStr || '').replace(/\s/g, '').length);
+        const raw = deficit / charCount;
+        setLetterSpacing(Math.max(-1.5, Math.min(1.5, raw)));
+        setScaleX(1); // never distort glyphs on paragraphs
+      } else {
+        // Single-line: geometric compression/expansion via scaleX
+        if (domW > r.w + 1) {
+          setScaleX(Math.max(0.88, r.w / domW));
+        } else {
+          setScaleX(1);
+        }
+        setLetterSpacing(0);
+      }
+    };
+    requestAnimationFrame(measure);
+  }, [item.str, item.isParagraph, r.w, scale, fontSizeAdj, fontFamily, initialStr]);
 
   // ─── Fix 4: Baseline vs Bounding Box Alignment ───────────────────────────
   // PDF draws text from its BASELINE (pdfY_base). HTML positions from the TOP
@@ -307,8 +374,11 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
       const ctx = canvas.getContext('2d');
       ctx.font = canvasFontFamily;
       const m = ctx.measureText('Hpx');
-      // actualBoundingBoxAscent = distance from baseline to top of tallest glyph
-      return m.actualBoundingBoxAscent;
+      // Prioritize fontBoundingBoxAscent (EM-box metric) over actualBoundingBoxAscent (ink height)
+      const asc = (m.fontBoundingBoxAscent != null && !isNaN(m.fontBoundingBoxAscent))
+        ? m.fontBoundingBoxAscent
+        : m.actualBoundingBoxAscent;
+      return asc;
     } catch (e) {
       // Fallback: assume 80% of font-size is above the baseline
       return fontSizePx * 0.8;
@@ -437,7 +507,8 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           paddingBottom: '0px',
           paddingLeft: item.isParagraph ? '0px' : '2px',
           paddingRight: item.isParagraph ? '0px' : '2px',
-          transform: keyboardOffset ? `translateY(${-keyboardOffset}px)` : undefined,
+          // scaleX only applies to single-line items (paragraphs use letterSpacing instead)
+          transform: `scaleX(${scaleX}) ${keyboardOffset ? `translateY(${-keyboardOffset}px)` : ''}`,
           transformOrigin: '0% 0%',
           fontFamily: currentFontFamily,
           fontSize: `${(item.fontSize * scale) + fontSizeAdj}px`,
@@ -447,6 +518,7 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           // Always use 'pre-wrap' to preserve all whitespace including leading indents
           // and paragraph structure without stripping spaces.
           whiteSpace: 'pre-wrap',
+          textIndent: (item.isParagraph && item.textIndent) ? `${item.textIndent * scale}px` : undefined,
           wordBreak: item.isParagraph ? 'break-word' : 'normal',
           width: `${r.w}px`,
           minWidth: `${r.w}px`,
@@ -458,6 +530,13 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           zIndex: 100,
           lineHeight: item.isParagraph && item.lineHeight ? `${item.lineHeight * scale}px` : `${r.h}px`,
           textAlign: item.align || (item.isParagraph ? 'justify' : 'left'),
+          // inter-word: browser expands word gaps to fill width (mirrors PDF Tw operator)
+          textJustify: item.isParagraph ? 'inter-word' : undefined,
+          // hyphens: allows the browser to break at soft-hyphen positions if present
+          hyphens: item.isParagraph ? 'auto' : undefined,
+          // letterSpacing: fine-tunes glyph advance to match PDF Tc tracking.
+          // Applied to paragraphs only (single-line items use scaleX instead).
+          letterSpacing: item.isParagraph && letterSpacing !== 0 ? `${letterSpacing.toFixed(3)}px` : undefined,
           margin: 0,
           outline: 'none',
           border: '1px dashed rgba(148, 163, 184, 0.8)',

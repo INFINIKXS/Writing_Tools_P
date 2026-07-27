@@ -4,6 +4,7 @@ import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { TextOverlay } from './TextOverlay';
 import { InlineEditor } from './InlineEditor';
+import { DebugOverlay } from './DebugOverlay';
 import { useSyncExternalStore } from 'react';
 import { pdfEditStore, activeFileId } from '../../stores/pdfEditStore';
 import { loadPDFFonts } from '../../utils/pdfFontLoader';
@@ -258,6 +259,9 @@ export default function PDFViewer({
   const [previousNumPages, setPreviousNumPages] = useState(null);
   // Track whether custom PDF fonts have been loaded and rendered by the browser
   const [fontsLoaded, setFontsLoaded] = useState(false);
+
+  // Developer Debug Mode (Ctrl+Shift+D)
+  const [debugMode, setDebugMode] = useState(false);
 
   const [fileGeneration, setFileGeneration] = useState(0);
   const scrollContainerRef = useRef(null);
@@ -609,100 +613,153 @@ export default function PDFViewer({
         });
 
         if (blockLines.length > 1) {
-          // Sort blockLines strictly top-to-bottom, left-to-right in reading order
-          blockLines.sort((a, b) => Math.abs(a.pdfY_top - b.pdfY_top) > 2.0 ? a.pdfY_top - b.pdfY_top : a.pdfX - b.pdfX);
+          // ── Fix 2: Split on font-family or font-size boundaries ──────────
+          // Never merge a heading (e.g. bold condensed 12pt) with body text
+          // (regular serif 10pt) into the same editable block. Compare the
+          // root family name (strip subset prefix + weight/style suffixes) and
+          // the rounded font size. Start a fresh sub-group whenever either
+          // changes significantly.
+          const rootFamily = (name) =>
+            (name || '')
+              .replace(/^[A-Z]{6}\+/, '')          // strip subset tag e.g. NBUDXT+
+              .replace(/[-_](Bold|Italic|Oblique|Regular|Roman|Light|Medium|Thin|Black|Heavy|Cond(?:ensed)?|Ext(?:ended)?|Narrow)/gi, '')
+              .toLowerCase()
+              .trim();
 
-          // Calculate dominant color to prevent heading color contamination
-          const colorCounts = {};
-          blockLines.forEach((l) => {
-            const c = l.color || 'rgb(0, 0, 0)';
-            colorCounts[c] = (colorCounts[c] || 0) + 1;
-          });
-          const dominantColor = Object.keys(colorCounts).reduce((a, b) =>
-            colorCounts[a] > colorCounts[b] ? a : b
-          );
-
-          const pX0 = Math.min(...blockLines.map((l) => l.pdfX));
-          const pX1 = Math.max(...blockLines.map((l) => l.pdfX + l.pdfW));
-          const pY0 = Math.min(...blockLines.map((l) => l.pdfY_top));
-          const pY1 = Math.max(...blockLines.map((l) => l.pdfY_top + l.pdfH));
-
-          const blockAlign = blockData.align || 'left';
-
-          // Build unified string pStr and track exact inter-line separators
-          let pStr = '';
-          const lineSeps = [];
-          blockLines.forEach((l, i) => {
-            if (i === 0) {
-              pStr = l.str;
+          const subGroups = [];
+          let currentGroup = [blockLines[0]];
+          for (let gi = 1; gi < blockLines.length; gi++) {
+            const prev = blockLines[gi - 1];
+            const curr = blockLines[gi];
+            const prevFamily = rootFamily(prev.fontName);
+            const currFamily = rootFamily(curr.fontName);
+            // Font-size difference > 1.5pt = different style tier
+            const sizeDiffers = Math.abs((prev.fontSize || 0) - (curr.fontSize || 0)) > 1.5;
+            // Different root family = different typeface entirely
+            const familyDiffers = prevFamily && currFamily && prevFamily !== currFamily;
+            if (sizeDiffers || familyDiffers) {
+              subGroups.push(currentGroup);
+              currentGroup = [curr];
             } else {
-              const sep = (blockAlign === 'justify' && pStr.endsWith('-')) ? '' : (blockAlign === 'justify' ? ' ' : '\n');
-              lineSeps.push(sep);
-              pStr += sep + l.str;
+              currentGroup.push(curr);
             }
-          });
-
-          // Accumulate superscript / subscript ranges across all lines with exact charOffset alignment
-          const pSuperscriptRanges = [];
-          let charOffset = 0;
-          blockLines.forEach((l, i) => {
-            if (l.superscriptRanges && l.superscriptRanges.length > 0) {
-              l.superscriptRanges.forEach((r) => {
-                pSuperscriptRanges.push({
-                  ...r,
-                  charStart: charOffset + r.charStart,
-                  charEnd: charOffset + r.charEnd,
-                });
-              });
-            }
-            if (i < blockLines.length - 1) {
-              const sep = lineSeps[i] !== undefined ? lineSeps[i] : ((blockAlign === 'justify' && l.str.endsWith('-')) ? '' : (blockAlign === 'justify' ? ' ' : '\n'));
-              charOffset += l.str.length + sep.length;
-            }
-          });
-
-          // Dominant font size across all lines in paragraph block
-          const sizeCounts = {};
-          blockLines.forEach((l) => {
-            const s = Math.round(l.fontSize * 10) / 10;
-            sizeCounts[s] = (sizeCounts[s] || 0) + 1;
-          });
-          const dominantFontSize = parseFloat(
-            Object.keys(sizeCounts).reduce((a, b) => (sizeCounts[a] > sizeCounts[b] ? a : b))
-          );
-
-          // Calculate exact baseline pitch so CSS line-height matches PDF pitch pixel-for-pixel (no upward jump)
-          let linePitch;
-          if (blockLines.length > 1) {
-            const firstBase = blockLines[0].pdfY_base;
-            const lastBase = blockLines[blockLines.length - 1].pdfY_base;
-            linePitch = (lastBase - firstBase) / (blockLines.length - 1);
-          } else {
-            linePitch = blockLines[0].pdfH;
           }
+          subGroups.push(currentGroup);
 
-          paragraphItems.push({
-            str: pStr,
-            pdfX: pX0,
-            pdfY_base: blockLines[0].pdfY_base,
-            pdfY_top: pY0,
-            pdfW: pX1 - pX0,
-            pdfH: pY1 - pY0,
-            fontSize: dominantFontSize,
-            fontName: blockLines[0].fontName,
-            color: dominantColor,
-            isBold: blockLines[0].isBold,
-            isItalic: blockLines[0].isItalic,
-            isParagraph: true,
-            align: blockData.align || 'left',
-            lineCount: blockLines.length,
-            lineHeight: linePitch,
-            hasSuperscript: pSuperscriptRanges.length > 0,
-            superscriptRanges: pSuperscriptRanges,
-            origLines: blockLines,
+
+          // ── Process each font-homogeneous sub-group as its own paragraph ──
+          // Sort every sub-group top-to-bottom before processing
+          subGroups.forEach((sgLines) => {
+            sgLines.sort((a, b) => Math.abs(a.pdfY_top - b.pdfY_top) > 2.0 ? a.pdfY_top - b.pdfY_top : a.pdfX - b.pdfX);
+
+            if (sgLines.length === 1) {
+              // Single-line sub-group: emit as a plain (non-paragraph) item
+              paragraphItems.push(sgLines[0]);
+              return;
+            }
+
+            // Multi-line sub-group: build a unified paragraph item
+            const colorCounts = {};
+            sgLines.forEach((l) => {
+              const c = l.color || 'rgb(0, 0, 0)';
+              colorCounts[c] = (colorCounts[c] || 0) + 1;
+            });
+            const dominantColor = Object.keys(colorCounts).reduce((a, b) =>
+              colorCounts[a] > colorCounts[b] ? a : b
+            );
+
+            const pX0 = Math.min(...sgLines.map((l) => l.pdfX));
+            const pX1 = Math.max(...sgLines.map((l) => l.pdfX + l.pdfW));
+            const pY0 = Math.min(...sgLines.map((l) => l.pdfY_top));
+            const pY1 = Math.max(...sgLines.map((l) => l.pdfY_top + l.pdfH));
+
+            const blockAlign = blockData.align || 'left';
+
+            // Build unified string pStr and track exact inter-line separators
+            // Fix 1: Use '\n' as separator for justified paragraphs too, so hard
+            // line-breaks from PyMuPDF are preserved and CSS pre-wrap honours them.
+            let pStr = '';
+            const lineSeps = [];
+            sgLines.forEach((l, i) => {
+              if (i === 0) {
+                pStr = l.str;
+              } else {
+                // Preserve hyphenated line-endings (no separator); otherwise use
+                // a space for justified text so words flow naturally, or '\n' for
+                // non-justified text where each line is a visual unit.
+                const sep = pStr.endsWith('-') ? '' : (blockAlign === 'justify' ? ' ' : '\n');
+                lineSeps.push(sep);
+                pStr += sep + l.str;
+              }
+            });
+
+            // Accumulate superscript / subscript ranges with char-offset alignment
+            const pSuperscriptRanges = [];
+            let charOffset = 0;
+            sgLines.forEach((l, i) => {
+              if (l.superscriptRanges && l.superscriptRanges.length > 0) {
+                l.superscriptRanges.forEach((r) => {
+                  pSuperscriptRanges.push({
+                    ...r,
+                    charStart: charOffset + r.charStart,
+                    charEnd: charOffset + r.charEnd,
+                  });
+                });
+              }
+              if (i < sgLines.length - 1) {
+                const sep = lineSeps[i] !== undefined ? lineSeps[i] : (pStr.endsWith('-') ? '' : (blockAlign === 'justify' ? ' ' : '\n'));
+                charOffset += l.str.length + sep.length;
+              }
+            });
+
+            // Dominant font size
+            const sizeCounts = {};
+            sgLines.forEach((l) => {
+              const s = Math.round(l.fontSize * 10) / 10;
+              sizeCounts[s] = (sizeCounts[s] || 0) + 1;
+            });
+            const dominantFontSize = parseFloat(
+              Object.keys(sizeCounts).reduce((a, b) => (sizeCounts[a] > sizeCounts[b] ? a : b))
+            );
+
+            // Baseline pitch for pixel-perfect CSS line-height
+            let linePitch;
+            if (sgLines.length > 1) {
+              const firstBase = sgLines[0].pdfY_base;
+              const lastBase = sgLines[sgLines.length - 1].pdfY_base;
+              linePitch = (lastBase - firstBase) / (sgLines.length - 1);
+            } else {
+              linePitch = sgLines[0].pdfH;
+            }
+
+            const firstLineIndent = sgLines[0].pdfX - pX0;
+            const textIndentPdf = firstLineIndent > 1.0 ? firstLineIndent : 0;
+
+            paragraphItems.push({
+              str: pStr,
+              pdfX: pX0,
+              pdfY_base: sgLines[0].pdfY_base,
+              pdfY_top: pY0,
+              pdfW: pX1 - pX0,
+              pdfH: pY1 - pY0,
+              fontSize: dominantFontSize,
+              fontName: sgLines[0].fontName,
+              color: dominantColor,
+              isBold: sgLines[0].isBold,
+              isItalic: sgLines[0].isItalic,
+              isParagraph: true,
+              align: blockData.align || 'left',
+              lineCount: sgLines.length,
+              lineHeight: linePitch,
+              textIndent: textIndentPdf,
+              hasSuperscript: pSuperscriptRanges.length > 0,
+              superscriptRanges: pSuperscriptRanges,
+              origLines: sgLines,
+            });
           });
         } else if (blockLines.length === 1) {
           paragraphItems.push(blockLines[0]);
+
         }
       });
 
@@ -808,7 +865,10 @@ export default function PDFViewer({
   // ─── Keyboard shortcuts (undo/redo) ──────────────────────────────────────
   useEffect(() => {
     const handleGlobalKey = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'd') {
+        e.preventDefault();
+        setDebugMode(prev => !prev);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         if (e.shiftKey) {
           pdfEditStore.redo(activeFileId);
         } else {
@@ -1110,6 +1170,14 @@ export default function PDFViewer({
             {/* Text hit-testing overlay and inline editor */}
             {pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && (
               <>
+                {debugMode && (
+                  <DebugOverlay
+                    items={pageMetadata[index + 1].items}
+                    scale={scale}
+                    selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
+                  />
+                )}
+
                 <TextOverlay
                   items={pageMetadata[index + 1].items}
                   scale={scale}
@@ -1320,6 +1388,32 @@ export default function PDFViewer({
           </div>
         ))}
       </Document>
+
+      {/* Floating Debugger Status Bar */}
+      {debugMode && (
+        <div className="fixed top-20 right-8 z-[200] bg-gray-900/95 text-white text-xs px-3.5 py-2 rounded-xl shadow-2xl border border-gray-700/80 flex items-center gap-3 backdrop-blur-md">
+          <span className="flex items-center gap-1.5 font-bold text-purple-400">
+            <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
+            <span>🛠️</span> Debugger Active
+          </span>
+          <span className="text-gray-600">|</span>
+          <span className="flex items-center gap-1.5 text-red-400">
+            <span className="w-3 h-0.5 bg-red-500 inline-block rounded-full" /> Red: PyMuPDF Baseline
+          </span>
+          <span className="flex items-center gap-1.5 text-blue-400">
+            <span className="w-3 h-0.5 border-t border-dashed border-blue-400 inline-block" /> Blue: DOM Baseline
+          </span>
+          <span className="text-gray-600">|</span>
+          <span className="font-mono text-gray-300 bg-gray-800 px-1.5 py-0.5 rounded text-[11px]">Ctrl+Shift+D</span>
+          <button
+            onClick={() => setDebugMode(false)}
+            className="ml-1 text-gray-400 hover:text-white hover:bg-gray-800 rounded p-1 transition-colors"
+            title="Close Debugger"
+          >
+            ✕
+          </button>
+        </div>
+      )}
     </div>
   );
 }
