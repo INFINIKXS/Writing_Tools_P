@@ -1,0 +1,83 @@
+Ethnic and social inequalities in
+women’s experience of
+maternity care in England: results
+of a national survey
+VS Raleigh1
++
+D Hussey2
++
+I Seccombe3
++
+K Hallt
+1 The King’s Fund, 11–13 Cavendish Square, London W1G 0AN
+2 NatCen, 35 Northampton Square, London EC1V 0AX
+3 Care Quality Commission, Finsbury Tower, 103–105 Bunhill Row, London EC1Y 8TG
+Correspondence to: VS Raleigh. E-mail: v.raleigh@kingsfund.org.uk
+Summary
+Objective To examine ethnic and social inequalities in women’s
+experience of maternity care in England.
+Design A 2007 national survey of women (16 years or over) about their
+experience of maternity care. Multiple logistic regression analysis,
+controlling for several maternal characteristics, was used to examine
+inequalities by ethnicity, partner status and education.
+Setting Sample of records of 149 NHS acute trusts and two primary care
+trusts (PCTs) providing maternity services in England.
+Results A total of 26,325 women responded to the survey (response rate
+59%). Ethnic minority women were more likely thanWhite British women to
+access services late, not have a scan by 20 weeks, and experience
+complications during pregnancy and birth. They were more likely to initiate
+breastfeeding and say they were treated with respect and dignity. Single
+women responded more negatively to almost all questions than women with a
+husband/partner. They were less likely to access care within 12 weeks of
+pregnancy (OR 0.45, 95% CI 0.39–0.52), have a scan at 20 weeks (OR 0.49, 95%
+CI 0.39–0.63), attend NHS antenatal classes (OR 0.56, 95% CI 0.49–0.65), have a
+postnatal check-up (OR 0.67, 95% CI 0.60–0.75), and initiate breastfeeding (OR
+0.57, 95% CI 0.51–0.62), and were more likely to experience complications.
+Women completing education at 19+ years were more likely to access services
+early (OR 1.21, 95% CI 1.04–1.40), attend antenatal classes (OR 1.48, 95% CI 1.31–
+1.67), have a postnatal check-up (OR 1.19, 95% CI 1.07–1.32) and initiate
+breastfeeding (OR 3.88, 95% CI 3.56–4.22) than those completing education at
+16 years or younger, and were less likely to experience complications.
+Conclusions Ethnic minority women, single mothers, and those with an
+earlier age at completing education access maternity services late, have poorer
+outcomes, and report poorer experiences across some – though not all –
+dimensions of maternity care. Ethnic differences were absent or inconsistent
+between groups for some aspects of care.We recommend these findings are
+used by commissioners, trusts and healthcare professionals to inform
+improvements in maternity services for high-risk groups and reduce inequalities.
+DECLARATIONS
+Competing interests
+None declared
+Funding
+Development of the
+survey
+questionnaire,
+sampling approach
+and guidance was
+undertaken by the
+Picker Institute
+Europe and funded
+by the Healthcare
+Commission. The
+trust level surveys
+were commissioned
+and funded by
+individual NHS trusts
+Ethical approval
+Granted by the
+Multi-Centre
+Research Ethics
+Committee for the
+North West (07/
+MRE08/1). The
+covering letter to the
+questionnaire
+describes how the
+personal data and
+survey responses
+will be used.
+Consent is implied
+by virtue of returning
+RESEARCH
+J R Soc Med 2010: 103: 188–198. DOI 10.1258/jrsm.2010.090460
+188

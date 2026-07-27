@@ -1,0 +1,128 @@
+// Minimal observable store for PDF inline edits
+// No external dependencies needed
+
+const store = new Map(); // fileId -> string -> array of edits
+const listeners = new Set();
+// For undo/redo
+const undoStacks = new Map();
+const redoStacks = new Map();
+
+const EMPTY_EDITS = []; // Stable reference to prevent infinite loops in React's useSyncExternalStore
+
+function emit() {
+  for (const listener of listeners) {
+    listener();
+  }
+}
+
+export const activeFileId = 'default_file'; // Could be dynamic, using a default for simplicity if single file
+
+export const pdfEditStore = {
+  subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  },
+
+  getEdits(fileId = activeFileId) {
+    return store.get(fileId) || EMPTY_EDITS;
+  },
+
+  commitEdit(fileId = activeFileId, edit) {
+    if (!store.has(fileId)) store.set(fileId, []);
+    if (!undoStacks.has(fileId)) undoStacks.set(fileId, []);
+    
+    const currentEdits = [...this.getEdits(fileId)];
+    undoStacks.get(fileId).push(currentEdits);
+    
+    // Clear redo stack on new action
+    if (!redoStacks.has(fileId)) redoStacks.set(fileId, []);
+    redoStacks.get(fileId).length = 0;
+
+    // Prune undo stack to 50 items memory limit
+    if (undoStacks.get(fileId).length > 50) {
+      undoStacks.get(fileId).shift();
+    }
+
+    const editsList = store.get(fileId);
+    const existingIdx = editsList.findIndex(e => e.pageNum === edit.pageNum && e.nodeIndex === edit.nodeIndex);
+    
+    if (existingIdx !== -1) {
+      // Preserve tracking coordinates (dx, dy) across multiple edit commits
+      const preservedDx = editsList[existingIdx].pdfDx;
+      const preservedDy = editsList[existingIdx].pdfDy;
+      editsList[existingIdx] = { ...edit, pdfDx: preservedDx || 0, pdfDy: preservedDy || 0 };
+    } else {
+      editsList.push(edit);
+    }
+    
+    emit();
+  },
+
+  updateEdit(fileId = activeFileId, pageNum, nodeIndex, partialEdit) {
+    if (!store.has(fileId)) return;
+    
+    // Save state for undo/redo
+    if (!undoStacks.has(fileId)) undoStacks.set(fileId, []);
+    const currentEdits = [...this.getEdits(fileId)];
+    undoStacks.get(fileId).push(currentEdits.map(e => ({...e}))); // Deep copy the array of objects
+    
+    if (!redoStacks.has(fileId)) redoStacks.set(fileId, []);
+    redoStacks.get(fileId).length = 0;
+
+    if (undoStacks.get(fileId).length > 50) {
+      undoStacks.get(fileId).shift();
+    }
+
+    const edits = store.get(fileId);
+    const targetIdx = edits.findIndex(e => e.pageNum === pageNum && e.nodeIndex === nodeIndex);
+    if (targetIdx !== -1) {
+      edits[targetIdx] = { ...edits[targetIdx], ...partialEdit };
+      emit();
+    }
+  },
+
+  undo(fileId = activeFileId) {
+    if (!undoStacks.has(fileId) || undoStacks.get(fileId).length === 0) return;
+    
+    if (!redoStacks.has(fileId)) redoStacks.set(fileId, []);
+    const currentEdits = [...this.getEdits(fileId)];
+    redoStacks.get(fileId).push(currentEdits);
+
+    const previousEdits = undoStacks.get(fileId).pop();
+    store.set(fileId, previousEdits);
+    emit();
+  },
+
+  redo(fileId = activeFileId) {
+    if (!redoStacks.has(fileId) || redoStacks.get(fileId).length === 0) return;
+    
+    if (!undoStacks.has(fileId)) undoStacks.set(fileId, []);
+    const currentEdits = [...this.getEdits(fileId)];
+    undoStacks.get(fileId).push(currentEdits);
+
+    const nextEdits = redoStacks.get(fileId).pop();
+    store.set(fileId, nextEdits);
+    emit();
+  },
+
+  clear(fileId = activeFileId) {
+    store.delete(fileId);
+    undoStacks.delete(fileId);
+    redoStacks.delete(fileId);
+    emit();
+  },
+
+  // ─── clearEdits ────────────────────────────────────────────────────────────
+  // Called after a successful bake so the store no longer holds pre-bake
+  // origStr / nodeIndex mappings that are now stale (they've been consumed
+  // into the PDF bytes).  Keeping them would cause:
+  //   1. existingEdit matching wrong items after nodeIndex drift
+  //   2. origStr pointing to text that no longer exists in the baked PDF
+  //   3. Deleted words reappearing in the InlineEditor
+  clearEdits(fileId = activeFileId) {
+    store.set(fileId, []);
+    // Intentionally not clearing undoStacks/redoStacks per review feedback,
+    // so that undo workflow doesn't break if edits span multiple live bakes.
+    emit();
+  }
+};

@@ -1,0 +1,439 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { pdfToScreen } from '../../utils/pdfCoords';
+
+const rgbToHex = (colorStr) => {
+  if (!colorStr) return '#000000';
+  if (colorStr.startsWith('#')) return colorStr;
+  const match = colorStr.match(/\d+/g);
+  if (!match || match.length < 3) return '#000000';
+  return '#' + match.slice(0, 3).map(x => parseInt(x).toString(16).padStart(2, '0')).join('');
+};
+
+const FONTS = ['Original', 'Arial', 'Times New Roman', 'Courier', 'Verdana', 'Georgia'];
+
+/**
+ * Build the initial DOM for the contentEditable span.
+ * Splits `str` based on `superscriptRanges` — chars inside a range become
+ * children of a <sup> or <sub> element, everything else is normal text.
+ * Returns an array of React children.
+ */
+function buildInitialChildren(str, superscriptRanges, defaultColor) {
+  if (!superscriptRanges || superscriptRanges.length === 0) {
+    return [str];
+  }
+  // Sort ranges by charStart so we can walk left-to-right
+  const sorted = [...superscriptRanges].sort((a, b) => a.charStart - b.charStart);
+  const children = [];
+  let cursor = 0;
+  sorted.forEach((r, idx) => {
+    if (r.charStart > cursor) {
+      children.push(str.slice(cursor, r.charStart));
+    }
+    const chunk = str.slice(r.charStart, r.charEnd);
+    // Use authoritative backend-extracted span color r.color
+    const supColor = r.color || defaultColor || 'inherit';
+    if (r.kind === 'super') {
+      children.push(
+        <sup key={`sup-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'super' }}>
+          {chunk}
+        </sup>,
+      );
+    } else {
+      children.push(
+        <sub key={`sub-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'sub' }}>
+          {chunk}
+        </sub>,
+      );
+    }
+    cursor = r.charEnd;
+  });
+  if (cursor < str.length) {
+    children.push(str.slice(cursor));
+  }
+  return children;
+}
+
+/**
+ * Walk the contentEditable DOM and extract plain text + the character
+ * ranges that are inside <sup>/<sub> elements.
+ * Returns { text, ranges: [{kind, charStart, charEnd}] }.
+ */
+function extractTextAndRanges(rootEl) {
+  let text = '';
+  const ranges = [];
+
+  function walk(node, inSup, inSub) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const chunk = node.textContent || '';
+      if (chunk.length === 0) return;
+      const start = text.length;
+      text += chunk;
+      if (inSup) {
+        ranges.push({ kind: 'super', charStart: start, charEnd: text.length });
+      } else if (inSub) {
+        ranges.push({ kind: 'sub', charStart: start, charEnd: text.length });
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName ? node.tagName.toLowerCase() : '';
+    const newInSup = inSup || tag === 'sup';
+    const newInSub = inSub || tag === 'sub';
+    for (const child of node.childNodes) {
+      walk(child, newInSup, newInSub);
+    }
+  }
+
+  walk(rootEl, false, false);
+
+  // Merge adjacent same-kind ranges
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && last.kind === r.kind && last.charEnd === r.charStart) {
+      last.charEnd = r.charEnd;
+    } else {
+      merged.push({ ...r });
+    }
+  }
+  return { text, ranges: merged };
+}
+
+/**
+ * Enrich newly-extracted ranges with metadata (font size, baseline Y) from
+ * the original ranges. We match by ORDER and KIND — if the Nth super in
+ * the new text corresponds to the Nth super in the original text, copy
+ * its fontSize/pdfY_top so the backend can render it at the same scale
+ * and elevation as the original.
+ *
+ * Brand-new ranges (no corresponding original) get null metadata, and
+ * the backend falls back to defaults.
+ */
+function enrichRangesWithOriginalMetadata(newRanges, originalRanges) {
+  if (!originalRanges || originalRanges.length === 0) return newRanges;
+  // Index originals by kind, in order of appearance
+  const origByKind = { super: [], sub: [] };
+  for (const o of originalRanges) {
+    if (o.kind === 'super' || o.kind === 'sub') {
+      origByKind[o.kind].push(o);
+    }
+  }
+  const usedByKind = { super: 0, sub: 0 };
+  return newRanges.map((nr) => {
+    const pool = origByKind[nr.kind];
+    if (!pool || usedByKind[nr.kind] >= pool.length) {
+      return { ...nr };
+    }
+    const orig = pool[usedByKind[nr.kind]];
+    usedByKind[nr.kind] += 1;
+    return {
+      ...nr,
+      // Carry forward original super/sub geometry. Backend uses these
+      // to render the new chars at the same size and baseline elevation
+      // as the original PDF's super/sub.
+      fontSize: orig.fontSize,
+      pdfY_top: orig.pdfY_top,
+      pdfX: orig.pdfX,
+      pdfH: orig.pdfH,
+      color: orig.color,
+    };
+  });
+}
+
+export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) {
+  const initialStr = existingEdit ? existingEdit.newStr : item.str;
+  const initialRanges = existingEdit
+    ? existingEdit.superscriptRanges || []
+    : item.superscriptRanges || [];
+
+  // We no longer store text as state — the DOM IS the source of truth.
+  // We only read it when the user commits.
+  const [fontSizeAdj, setFontSizeAdj] = useState(existingEdit ? existingEdit.fontSizeAdj : 0);
+  const [color, setColor] = useState(() => existingEdit && existingEdit.color ? existingEdit.color : rgbToHex(item.color));
+  const [fontFamily, setFontFamily] = useState(existingEdit && existingEdit.customFontFamily ? existingEdit.customFontFamily : 'Original');
+  // Read bold/italic from the backend's authoritative PyMuPDF font flags
+  // (item.isBold / item.isItalic). These are derived from either the
+  // font's PDF flag bits or the PostScript name containing "Bold" /
+  // "Italic" / "Oblique" — more reliable than PDF.js's text-layer
+  // CSS weight heuristics, which often misreport for subsetted fonts.
+  //
+  // Fall back to PDF.js heuristics only if the backend didn't provide
+  // the flags (e.g. regrouped items that skipped the extract-spacing path).
+  const [isBold, setIsBold] = useState(() => {
+    if (existingEdit) return existingEdit.isBold;
+    return item.isBold === true;
+  });
+  const [isItalic, setIsItalic] = useState(() => {
+    if (existingEdit) return existingEdit.isItalic;
+    return item.isItalic === true;
+  });
+
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
+
+  const r = pdfToScreen(item, scale);
+  const fsize = Math.max(8, Math.round(item.fontSize * scale) + fontSizeAdj);
+
+  const spanRef = useRef(null);
+
+  // Auto focus and place cursor at end
+  useEffect(() => {
+    if (spanRef.current) {
+      spanRef.current.focus();
+      try {
+        const range = document.createRange();
+        const sel = window.getSelection();
+        range.selectNodeContents(spanRef.current);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } catch (e) {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Handle mobile keyboard
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const reposition = () => {
+      const keyboardHeight = window.innerHeight - vv.height;
+      setKeyboardOffset(keyboardHeight > 0 ? keyboardHeight : 0);
+    };
+    vv.addEventListener('resize', reposition);
+    return () => vv.removeEventListener('resize', reposition);
+  }, []);
+
+  const handleCommit = () => {
+    let newText = initialStr;
+    let newRanges = initialRanges;
+    if (spanRef.current) {
+      const extracted = extractTextAndRanges(spanRef.current);
+      newText = extracted.text;
+      // Carry original super/sub metadata (fontSize, baseline Y) into the
+      // new ranges so the backend can render them at the correct size
+      // and elevation rather than estimating from parent line metrics.
+      newRanges = enrichRangesWithOriginalMetadata(
+        extracted.ranges,
+        initialRanges,
+      );
+    }
+    onCommit(
+      newText,
+      { fontSizeAdj, color, fontFamily, isBold, isItalic },
+      newRanges,
+    );
+  };
+
+  // Build font stack using the real embedded font (from /extract-fonts + @font-face).
+  // Try multiple name forms because different PDFs store names differently:
+  //   "NBUDXT+MetaProLight-Regular" (full with subset tag) 
+  //   "MetaProLight-Regular"        (stripped)
+  //   whatever the backend calls item.fontPostScriptName
+  const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
+  const fontCandidates = [
+    item.fontPostScriptName,
+    stripSubset(item.fontPostScriptName),
+    item.fontName,
+    stripSubset(item.fontName),
+  ].filter(Boolean);
+  // Dedupe while preserving order
+  const uniqueCandidates = [...new Set(fontCandidates)];
+  const realFontStack = uniqueCandidates.map(n => `"${n}"`).join(', ');
+
+  const currentFontFamily = fontFamily === 'Original' 
+    ? (item.renderedFontFamily || `${realFontStack}, "Times New Roman", Georgia, serif`) 
+    : fontFamily;
+
+
+  // Live verification if the embedded PDF font is active in browser document.fonts
+  const isFontEmbeddedAndActive = React.useMemo(() => {
+    try {
+      const psName = stripSubset(item.fontPostScriptName || item.fontName);
+      if (!psName) return false;
+      return document.fonts.check(`12px "${psName}"`);
+    } catch (e) {
+      return false;
+    }
+  }, [item.fontPostScriptName, item.fontName]);
+
+  // ─── Fix 4: Baseline vs Bounding Box Alignment ───────────────────────────
+  // PDF draws text from its BASELINE (pdfY_base). HTML positions from the TOP
+  // of the box (r.y = pdfY_top × scale). Inside the CSS box the browser places
+  // the first-line baseline at:  paddingTop + halfLeading + actualBoundingBoxAscent.
+  // We must solve for paddingTop so that the HTML baseline = PDF baseline.
+  const fontSizePx = (item.fontSize * scale) + fontSizeAdj;
+  const lineHeightPx = (item.isParagraph && item.lineHeight)
+    ? item.lineHeight * scale
+    : r.h;
+
+  // Measure where the browser actually puts the ascender for this font+size.
+  // We use the Canvas 2D API — it honours @font-face registrations.
+  const htmlAscenderPx = useMemo(() => {
+    try {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      ctx.font = `${fontSizePx}px ${currentFontFamily}`;
+      const m = ctx.measureText('Hpx');
+      // actualBoundingBoxAscent = distance from baseline to top of tallest glyph
+      return m.actualBoundingBoxAscent;
+    } catch (e) {
+      // Fallback: assume 80% of font-size is above the baseline
+      return fontSizePx * 0.8;
+    }
+  }, [fontSizePx, currentFontFamily]);
+
+  // PDF ascender: distance from bounding box top to baseline (PDF units → px)
+  const pdfAscenderPx = item.pdfY_base != null && item.pdfY_top != null
+    ? (item.pdfY_base - item.pdfY_top) * scale
+    : htmlAscenderPx; // graceful fallback: no shift
+
+  // CSS distributes (lineHeight - fontSize) evenly above and below each line
+  const halfLeading = Math.max(0, (lineHeightPx - fontSizePx) / 2);
+
+  // Solve: pdfAscenderPx = paddingTop + halfLeading + htmlAscenderPx
+  const baselineOffset = pdfAscenderPx - halfLeading - htmlAscenderPx;
+
+  // If offset > 0: add paddingTop to push text down to the PDF baseline.
+  // If offset < 0: pull the whole box up (can't use negative padding).
+  const baselinePaddingTop = baselineOffset >= 0 ? baselineOffset : 0;
+  const baselineTopAdj     = baselineOffset <  0 ? baselineOffset : 0; // negative px
+  // ─────────────────────────────────────────────────────────────────────────
+
+  return (
+    <>
+      <div
+        style={{
+          position: 'absolute',
+          left: r.x,
+          top: Math.max(0, r.y - 70 - keyboardOffset),
+          zIndex: 102,
+          width: 'max-content'
+        }}
+        className="flex flex-col bg-white border border-gray-300 rounded-md shadow-lg pointer-events-auto divide-y divide-gray-200"
+        onPointerDown={e => e.stopPropagation()}
+        onClick={e => e.stopPropagation()}
+        onMouseDown={e => e.stopPropagation()}
+      >
+        <div className="px-2 py-1 text-[10px] bg-gray-50 rounded-t-md flex items-center justify-between gap-3">
+          <span className="font-mono text-gray-600">Font: {stripSubset(item.fontPostScriptName || item.fontName) || 'Default'}</span>
+          {isFontEmbeddedAndActive ? (
+            <span className="px-1.5 py-0.5 text-[9px] font-semibold text-emerald-700 bg-emerald-100 border border-emerald-300 rounded flex items-center gap-1" title="Using exact embedded font from PDF file">
+              ✓ Embedded
+            </span>
+          ) : (
+            <span className="px-1.5 py-0.5 text-[9px] font-semibold text-amber-700 bg-amber-100 border border-amber-300 rounded flex items-center gap-1" title="Using browser fallback font">
+              ⚠ Fallback
+            </span>
+          )}
+          <span className="text-gray-500">{Math.round(item.fontSize)}px</span>
+        </div>
+        <div className="flex gap-1 p-1 items-center">
+          <select
+            value={fontFamily}
+            onChange={e => setFontFamily(e.target.value)}
+            className="text-xs border border-gray-300 rounded px-1 py-1 outline-none hover:border-blue-400"
+          >
+            {FONTS.map(f => (
+              <option key={f} value={f}>{f}</option>
+            ))}
+          </select>
+
+          <input
+            type="color"
+            value={color}
+            onChange={e => setColor(e.target.value)}
+            className="w-6 h-6 p-0 border-0 rounded cursor-pointer"
+            title="Text Color"
+          />
+
+          <div className="w-px h-4 bg-gray-300 mx-1"></div>
+
+          <button onClick={() => setIsBold(!isBold)} className={`w-6 h-6 flex items-center justify-center text-sm font-bold rounded ${isBold ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100'}`} title="Bold">B</button>
+          <button onClick={() => setIsItalic(!isItalic)} className={`w-6 h-6 flex items-center justify-center text-sm italic rounded ${isItalic ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100'}`} title="Italic">I</button>
+
+          <div className="w-px h-4 bg-gray-300 mx-1"></div>
+
+          <button onClick={() => setFontSizeAdj(v => v - 1)} className="px-1.5 py-1 text-xs font-semibold hover:bg-gray-100 rounded" title="Smaller">A-</button>
+          <button onClick={() => setFontSizeAdj(v => v + 1)} className="px-1.5 py-1 text-xs font-semibold hover:bg-gray-100 rounded" title="Larger">A+</button>
+
+          <div className="w-px h-4 bg-gray-300 mx-1"></div>
+
+          <button onClick={handleCommit} className="px-2 py-1 text-xs text-blue-600 font-medium hover:bg-blue-50 rounded">Done</button>
+          <button onClick={onCancel} className="px-2 py-1 text-xs text-gray-500 hover:bg-red-50 hover:text-red-600 rounded">✕</button>
+        </div>
+      </div>
+
+      {/* Solid white background rectangle to cover underlying PDF canvas text */}
+      <div
+        style={{
+          position: 'absolute',
+          left: r.x,
+          top: r.y,
+          width: r.w,
+          height: r.h,
+          backgroundColor: '#ffffff',
+          zIndex: 99,
+          pointerEvents: 'none',
+        }}
+      />
+
+      <span
+        ref={spanRef}
+        contentEditable
+        suppressContentEditableWarning
+        onKeyDown={e => {
+          e.stopPropagation();
+          if (e.key === 'Escape') onCancel();
+          if (!item.isParagraph && e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            handleCommit();
+          }
+        }}
+        onKeyUp={e => e.stopPropagation()}
+        onKeyPress={e => e.stopPropagation()}
+        onPointerDown={e => e.stopPropagation()}
+        onClick={e => e.stopPropagation()}
+        onMouseDown={e => e.stopPropagation()}
+        onMouseUp={e => e.stopPropagation()}
+        className="rounded-[3px]"
+        style={{
+          position: 'absolute',
+          top: r.y + baselineTopAdj,
+          left: r.x,
+          paddingTop: `${baselinePaddingTop}px`,
+          paddingBottom: '0px',
+          paddingLeft: item.isParagraph ? '0px' : '2px',
+          paddingRight: item.isParagraph ? '0px' : '2px',
+          transform: keyboardOffset ? `translateY(${-keyboardOffset}px)` : undefined,
+          transformOrigin: '0% 0%',
+          fontFamily: currentFontFamily,
+          fontSize: `${(item.fontSize * scale) + fontSizeAdj}px`,
+          fontWeight: isBold ? 'bold' : 'normal',
+          fontStyle: isItalic ? 'italic' : 'normal',
+          color: color,
+          // For justify: use whiteSpace:'normal' so the browser can reflow words
+          // and distribute spacing across the full box width. pre-wrap hard-breaks
+          // on every \n, making each sub-line too short to justify.
+          whiteSpace: (item.isParagraph && item.align === 'justify') ? 'normal' : (item.isParagraph ? 'pre-wrap' : 'pre'),
+          wordBreak: item.isParagraph ? 'break-word' : 'normal',
+          width: `${r.w}px`,
+          minWidth: `${r.w}px`,
+          height: item.isParagraph ? 'max-content' : `${r.h}px`,
+          minHeight: `${r.h}px`,
+          boxSizing: 'border-box',
+          display: 'block',
+          cursor: 'text',
+          zIndex: 100,
+          lineHeight: item.isParagraph && item.lineHeight ? `${item.lineHeight * scale}px` : `${r.h}px`,
+          textAlign: item.align || (item.isParagraph ? 'justify' : 'left'),
+          margin: 0,
+          outline: 'none',
+          border: '1px dashed rgba(148, 163, 184, 0.8)',
+          backgroundColor: '#ffffff',
+        }}
+      >
+        {buildInitialChildren(initialStr, initialRanges, color)}
+      </span>
+    </>
+  );
+}

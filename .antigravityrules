@@ -1,0 +1,31 @@
+# LOCAL PROJECT RULES: WRITING TOOLS APP
+# Overrides global rules for this specific workspace.
+
+## 1. Python & Backend Environment
+* Always assume we are operating within the local virtual environment (`venv`). Do not suggest or attempt global pip installs.
+* When writing data-fetching or web scraping scripts, implement robust error handling, respect rate limits, and default to modular architectures.
+* Prioritize clear, structured logging over standard `print()` statements for easier debugging.
+
+## 2. Text Processing, Verification & Citations
+* When building tools to verify text or parse files (e.g., extracting sentences from PDFs), strictly prioritize verbatim accuracy. 
+* Do not hallucinate, summarize, or alter source text under any circumstances.
+* When handling formatting guides (like APA), strictly adhere to the programmatic rules defined in the system.
+* Treat string encoding issues (like UTF-8 character read errors) as critical bugs and resolve them using safe string decoding methods immediately.
+* **Paragraph-Level Sentence Logic Flow (ASL Workflow):** Follow the two modes of the ASL workflow:
+  * **Mode 1 (Structure Preservation):** Deconstruct user-supplied drafts to identify their core semantic meaning, stance, and underlying question chain, keeping critical writing critical and descriptive writing descriptive. Search adjacent or different clinical/academic domains for pre-2022 model paragraphs executing a matching flow, harvest moulds, and perform the mapped pour.
+  * **Mode 2 (Autonomous Logic Discovery):** Autonomously derive the optimal question chain/logic flow to organize raw notes/facts and achieve the paragraph's goal, search for published paragraphs executing that flow, harvest moulds, and perform the pour.
+  * **Verify-Before-Write Citation Law:** Never use or cite any PMC ID, DOI, or sentence mould from an academic source without first verifying its existence via live NCBI E-utilities or local source text. Running automated compliance tests (e.g., matching draft text substrings against downloaded source files) is mandatory before declaring any writing task complete.
+
+
+
+
+
+## 3. Frontend (React)
+* Default to functional components and React Hooks. 
+* Avoid class components entirely.
+* Keep UI component logic clean; offload heavy data transformations or or verification checks to separate utility files before passing data to the views.
+
+## 4. Pre-Flight Check & Global Rules
+* BEFORE executing any code or plan, you MUST load, read, and strictly adhere to the global rules located at `C:\Users\Paradox-Labs\.gemini\antigravity\.antigravityrules`.
+* You MUST run the pre-flight Graphiti Developer Memory check on turn 1 of every session to query the Neo4j database and construct the Developer Memory Status report.
+
