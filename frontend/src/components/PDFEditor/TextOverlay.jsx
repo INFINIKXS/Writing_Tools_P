@@ -48,7 +48,7 @@ function ScaledTextSpan({ text, origText, fontFamily, fontSize, fontWeight, font
   );
 }
 
-export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [] }) {
+export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], fontsLoaded = true }) {
   if (!items || items.length === 0) return null;
 
   return (
@@ -72,6 +72,7 @@ export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [] })
             r={r}
             boxTop={boxTop}
             boxHeight={boxHeight}
+            fontsLoaded={fontsLoaded}
             onSelect={onSelect}
             updateEdit={(pNum, idx, partial) => pdfEditStore.updateEdit(activeFileId, pNum, idx, partial)}
           >

@@ -12,14 +12,35 @@ const rgbToHex = (colorStr) => {
 const FONTS = ['Original', 'Arial', 'Times New Roman', 'Courier', 'Verdana', 'Georgia'];
 
 /**
+ * Replace leading spaces with non-breaking spaces to prevent contenteditable
+ * from stripping them on focus. This is the standard WYSIWYG workaround.
+ */
+const sanitizeForDisplay = (text) => {
+  // Replace leading spaces with non-breaking spaces
+  return text.replace(/^\s+/g, (match) => match.replace(/\s/g, '\u00A0'));
+};
+
+/**
+ * Convert non-breaking spaces back to regular spaces before saving.
+ * This ensures the backend receives standard space characters.
+ */
+const sanitizeForCommit = (text) => {
+  return text.replace(/\u00A0/g, ' ');
+};
+
+/**
  * Build the initial DOM for the contentEditable span.
  * Splits `str` based on `superscriptRanges` — chars inside a range become
  * children of a <sup> or <sub> element, everything else is normal text.
  * Returns an array of React children.
  */
 function buildInitialChildren(str, superscriptRanges, defaultColor) {
+  // Replace leading spaces with non-breaking spaces to preserve indentation
+  // when the contenteditable element receives focus
+  const displayStr = sanitizeForDisplay(str);
+  
   if (!superscriptRanges || superscriptRanges.length === 0) {
-    return [str];
+    return [displayStr];
   }
   // Sort ranges by charStart so we can walk left-to-right
   const sorted = [...superscriptRanges].sort((a, b) => a.charStart - b.charStart);
@@ -27,28 +48,28 @@ function buildInitialChildren(str, superscriptRanges, defaultColor) {
   let cursor = 0;
   sorted.forEach((r, idx) => {
     if (r.charStart > cursor) {
-      children.push(str.slice(cursor, r.charStart));
+      children.push(displayStr.slice(cursor, r.charStart));
     }
-    const chunk = str.slice(r.charStart, r.charEnd);
+    const chunk = displayStr.slice(r.charStart, r.charEnd);
     // Use authoritative backend-extracted span color r.color
     const supColor = r.color || defaultColor || 'inherit';
     if (r.kind === 'super') {
       children.push(
-        <sup key={`sup-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'super' }}>
+        <sup key={`sup-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'super', whiteSpace: 'pre-wrap' }}>
           {chunk}
         </sup>,
       );
     } else {
       children.push(
-        <sub key={`sub-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'sub' }}>
+        <sub key={`sub-${idx}`} style={{ fontSize: '0.7em', lineHeight: 0, color: supColor, verticalAlign: 'sub', whiteSpace: 'pre-wrap' }}>
           {chunk}
         </sub>,
       );
     }
     cursor = r.charEnd;
   });
-  if (cursor < str.length) {
-    children.push(str.slice(cursor));
+  if (cursor < displayStr.length) {
+    children.push(displayStr.slice(cursor));
   }
   return children;
 }
@@ -217,8 +238,11 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
         initialRanges,
       );
     }
+    // Convert non-breaking spaces back to regular spaces before committing
+    // so the backend receives standard space characters
+    const cleanText = sanitizeForCommit(newText);
     onCommit(
-      newText,
+      cleanText,
       { fontSizeAdj, color, fontFamily, isBold, isItalic },
       newRanges,
     );
@@ -230,6 +254,7 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
   //   "MetaProLight-Regular"        (stripped)
   //   whatever the backend calls item.fontPostScriptName
   const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
+  const sanitizeFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
   const fontCandidates = [
     item.fontPostScriptName,
     stripSubset(item.fontPostScriptName),
@@ -238,7 +263,9 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
   ].filter(Boolean);
   // Dedupe while preserving order
   const uniqueCandidates = [...new Set(fontCandidates)];
-  const realFontStack = uniqueCandidates.map(n => `"${n}"`).join(', ');
+  // Ensure exact PostScript name matching for the FontFace API by removing spaces around dashes
+  const sanitizedCandidates = uniqueCandidates.map(sanitizeFontName);
+  const realFontStack = sanitizedCandidates.map(n => `"${n}"`).join(', ');
 
   const currentFontFamily = fontFamily === 'Original' 
     ? (item.renderedFontFamily || `${realFontStack}, "Times New Roman", Georgia, serif`) 
@@ -268,11 +295,17 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
 
   // Measure where the browser actually puts the ascender for this font+size.
   // We use the Canvas 2D API — it honours @font-face registrations.
+  // Ensure exact PostScript name matching by removing spaces around dashes.
+  const sanitizedFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
+  const canvasFontFamily = fontFamily === 'Original'
+    ? `${fontSizePx}px ${sanitizedFontName(item.fontPostScriptName || item.fontName)}, serif`
+    : `${fontSizePx}px ${currentFontFamily}`;
+  
   const htmlAscenderPx = useMemo(() => {
     try {
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
-      ctx.font = `${fontSizePx}px ${currentFontFamily}`;
+      ctx.font = canvasFontFamily;
       const m = ctx.measureText('Hpx');
       // actualBoundingBoxAscent = distance from baseline to top of tallest glyph
       return m.actualBoundingBoxAscent;
@@ -280,7 +313,7 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
       // Fallback: assume 80% of font-size is above the baseline
       return fontSizePx * 0.8;
     }
-  }, [fontSizePx, currentFontFamily]);
+  }, [fontSizePx, canvasFontFamily]);
 
   // PDF ascender: distance from bounding box top to baseline (PDF units → px)
   const pdfAscenderPx = item.pdfY_base != null && item.pdfY_top != null
@@ -411,10 +444,9 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           fontWeight: isBold ? 'bold' : 'normal',
           fontStyle: isItalic ? 'italic' : 'normal',
           color: color,
-          // For justify: use whiteSpace:'normal' so the browser can reflow words
-          // and distribute spacing across the full box width. pre-wrap hard-breaks
-          // on every \n, making each sub-line too short to justify.
-          whiteSpace: (item.isParagraph && item.align === 'justify') ? 'normal' : (item.isParagraph ? 'pre-wrap' : 'pre'),
+          // Always use 'pre-wrap' to preserve all whitespace including leading indents
+          // and paragraph structure without stripping spaces.
+          whiteSpace: 'pre-wrap',
           wordBreak: item.isParagraph ? 'break-word' : 'normal',
           width: `${r.w}px`,
           minWidth: `${r.w}px`,

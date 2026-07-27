@@ -256,6 +256,8 @@ export default function PDFViewer({
   const [isNewDocLoading, setIsNewDocLoading] = useState(false);
   // Separate page count for the backdrop so it renders the right number of pages
   const [previousNumPages, setPreviousNumPages] = useState(null);
+  // Track whether custom PDF fonts have been loaded and rendered by the browser
+  const [fontsLoaded, setFontsLoaded] = useState(false);
 
   const [fileGeneration, setFileGeneration] = useState(0);
   const scrollContainerRef = useRef(null);
@@ -277,17 +279,32 @@ export default function PDFViewer({
   useEffect(() => {
     if (!file) return;
     
+    // Reset fonts loaded state when a new file is loaded
+    setFontsLoaded(false);
+    
     const form = new FormData();
     form.append('file', file);
     
     fetch('/api/pdf/extract-fonts', { method: 'POST', body: form })
       .then(r => r.ok ? r.json() : {})
-      .then(fontsData => {
+      .then(async (fontsData) => {
         if (fontsData && Object.keys(fontsData).length > 0) {
-          loadPDFFonts(fontsData);
+          // 1. Wait for our custom font loader to finish injecting all FontFace objects
+          await loadPDFFonts(fontsData);
+          // 2. Wait for the browser's rendering engine to fully recognize them
+          await document.fonts.ready;
+          // 3. Update state to allow user interaction
+          setFontsLoaded(true);
+        } else {
+          // If there are no custom fonts to load, just allow interaction immediately
+          setFontsLoaded(true);
         }
       })
-      .catch(e => console.warn('font extraction failed:', e));
+      .catch(e => {
+        console.warn('font extraction failed:', e);
+        // Fail gracefully so the user isn't blocked forever if the API fails
+        setFontsLoaded(true);
+      });
   }, [file]);
 
   const [pageMetadata, setPageMetadata] = useState({});
@@ -1098,6 +1115,7 @@ export default function PDFViewer({
                   scale={scale}
                   selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
                   edits={edits.filter(e => e.pageNum === index + 1)}
+                  fontsLoaded={fontsLoaded}
                   onSelect={(idx) => {
                     setSelectedTextIdx(idx);
                     setActivePageNum(index + 1);

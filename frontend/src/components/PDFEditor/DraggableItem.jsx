@@ -9,6 +9,7 @@ export function DraggableItem({
   r,
   boxTop,
   boxHeight,
+  fontsLoaded = true,
   onSelect,
   updateEdit,
   children
@@ -69,6 +70,9 @@ export function DraggableItem({
   return (
     <div
       onClick={(e) => {
+        // If fonts aren't loaded yet, completely ignore the click
+        if (!fontsLoaded) return;
+        
         if (dragOffset.x === 0 && dragOffset.y === 0) {
            e.stopPropagation();
            onSelect(index);
@@ -82,7 +86,7 @@ export function DraggableItem({
         width: hasEdit && hasEdit.newStr !== item.str ? 'max-content' : r.w,
         minWidth: r.w,
         height: boxHeight,
-        cursor: isDragging ? 'grabbing' : (hasEdit ? 'grab' : 'text'),
+        cursor: fontsLoaded ? (isDragging ? 'grabbing' : (hasEdit ? 'grab' : 'text')) : 'wait',
         pointerEvents: 'all',
         backgroundColor: hasEdit || selectedIdx === index ? 'white' : 'transparent',
         display: 'flex',
