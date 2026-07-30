@@ -190,11 +190,51 @@ function enrichRangesWithOriginalMetadata(newRanges, originalRanges) {
   });
 }
 
+/**
+ * Hydrates paragraph text using PyMuPDF line structures to ensure 1:1 line matching
+ * across ALL document paragraphs without manual CSS padding tweaks.
+ * 
+ * @param {Array<string>} pdfLines - Array of lines extracted from PyMuPDF block
+ * @returns {string} - Formatted text safe for contenteditable rendering
+ */
+export function formatParagraphFromPdfLines(pdfLines) {
+  if (!pdfLines || pdfLines.length === 0) return '';
+  if (pdfLines.length === 1) return pdfLines[0];
+
+  // Join lines while binding the line-break boundary word pairs with &nbsp; (\u00A0)
+  return pdfLines.reduce((acc, currentLine, idx) => {
+    if (idx === 0) return currentLine.trim();
+
+    const lastSpaceIdx = acc.lastIndexOf(' ');
+    if (lastSpaceIdx === -1) return `${acc}\u00A0${currentLine.trim()}`;
+
+    const beforeWord = acc.substring(0, lastSpaceIdx);
+    const lastWord = acc.substring(lastSpaceIdx + 1);
+    
+    return `${beforeWord} ${lastWord}\u00A0${currentLine.trim()}`;
+  }, '');
+}
+
 export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) {
   const initialStr = existingEdit ? existingEdit.newStr : item.str;
   const initialRanges = existingEdit
     ? existingEdit.superscriptRanges || []
     : item.superscriptRanges || [];
+
+  // Clean soft hyphens and line-break artifacts on load
+  const sanitizedText = useMemo(() => {
+    const pdfLines = item.pdfLines || item.lines;
+    if (pdfLines && pdfLines.length > 1) {
+      return formatParagraphFromPdfLines(pdfLines)
+        .replace(/\u00AD/g, '')
+        .replace(/(\b[a-z]+)-\s*\n\s*([a-z]+\b)/gi, '$1$2');
+    }
+    if (!item.str && !item.text && !initialStr) return '';
+    const raw = initialStr || item.str || item.text || '';
+    return raw
+      .replace(/\u00AD/g, '') // Remove soft hyphens
+      .replace(/(\b[a-z]+)-\s*\n\s*([a-z]+\b)/gi, '$1$2'); // Clean intra-word line-break hyphens
+  }, [initialStr, item.str, item.text, item.pdfLines, item.lines]);
 
   // We no longer store text as state — the DOM IS the source of truth.
   // We only read it when the user commits.
@@ -225,21 +265,105 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
 
   const spanRef = useRef(null);
 
-  // Auto focus and place cursor at end
+  // ── Uncontrolled DOM init: inject initial content ONCE via innerHTML ────────
+  // NEVER pass children to the contentEditable span in JSX — doing so causes
+  // React to diff and mutate DOM text nodes on every render (e.g. toolbar
+  // state changes), which invalidates the browser's Selection/Range and resets
+  // the caret position after each spacebar press.
+  //
+  // Instead: build the HTML string once here, set innerHTML once on mount,
+  // and let the browser's native contenteditable engine own the DOM from
+  // that point forward. React only touches the style prop (safe — no caret
+  // impact) and reads innerHTML on commit.
   useEffect(() => {
-    if (spanRef.current) {
-      spanRef.current.focus();
-      try {
-        const range = document.createRange();
-        const sel = window.getSelection();
-        range.selectNodeContents(spanRef.current);
-        range.collapse(false);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      } catch (e) {}
+    if (!spanRef.current) return;
+
+    // Build an HTML string equivalent of buildInitialChildren
+    const displayStr = sanitizeForDisplay(sanitizedText);
+    let html = '';
+
+    const escapeHtml = (s) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const pdfLines = item.pdfLines || item.lines || (sanitizedText.includes('\n') ? sanitizedText.split('\n') : null);
+
+    if (pdfLines && pdfLines.length > 1 && (!initialRanges || initialRanges.length === 0)) {
+      const totalLines = pdfLines.length;
+      html = pdfLines.map((lineText, index) => {
+        const isLastLine = index === totalLines - 1;
+        const lineClass = isLastLine ? 'pdf-line last-pdf-line' : 'pdf-line';
+        const formattedText = escapeHtml(lineText).replace(/(\w+)\s*&lt;sup\b[^&]*&gt;(.*?)&lt;\/sup&gt;/g, 
+          '<span style="white-space: nowrap;">$1<sup style="display: inline; line-height: 0; vertical-align: super;">$2</sup></span>'
+        );
+        if (isLastLine) {
+          return `<span class="${lineClass}" style="text-align-last: left; display: inline-block; width: 100%;">${formattedText}</span>`;
+        }
+        return `<span class="${lineClass}">${formattedText}</span><br />`;
+      }).join('');
+    } else if (!initialRanges || initialRanges.length === 0) {
+      html = escapeHtml(displayStr);
+    } else {
+      const sorted = [...initialRanges].sort((a, b) => a.charStart - b.charStart);
+      let cursor = 0;
+      for (let idx = 0; idx < sorted.length; idx++) {
+        const rng = sorted[idx];
+        if (rng.charStart > cursor) {
+          let beforeText = displayStr.slice(cursor, rng.charStart);
+          beforeText = beforeText.replace(/ {2,}$/, ' ');
+          
+          // Atomic citation unit: Wrap preceding word + superscript tag in a non-breaking span
+          const lastSpaceIdx = beforeText.lastIndexOf(' ');
+          if (lastSpaceIdx !== -1) {
+            const prefix = beforeText.slice(0, lastSpaceIdx + 1);
+            const lastWord = beforeText.slice(lastSpaceIdx + 1);
+            html += escapeHtml(prefix);
+
+            const chunk = displayStr.slice(rng.charStart, rng.charEnd).trim();
+            const supColor = rng.color || color || 'inherit';
+            const tag = rng.kind === 'super' ? 'sup' : 'sub';
+            const vAlign = rng.kind === 'super' ? '0.4em' : '-0.2em';
+
+            html += `<span style="white-space:nowrap">${escapeHtml(lastWord)}<${tag} style="font-size:0.65em;line-height:0;display:inline;margin:0;padding:0;color:${escapeHtml(supColor)};vertical-align:${vAlign}">${escapeHtml(chunk)}</${tag}></span>`;
+          } else {
+            const lastWord = beforeText;
+            const chunk = displayStr.slice(rng.charStart, rng.charEnd).trim();
+            const supColor = rng.color || color || 'inherit';
+            const tag = rng.kind === 'super' ? 'sup' : 'sub';
+            const vAlign = rng.kind === 'super' ? '0.4em' : '-0.2em';
+
+            html += `<span style="white-space:nowrap">${escapeHtml(lastWord)}<${tag} style="font-size:0.65em;line-height:0;display:inline;margin:0;padding:0;color:${escapeHtml(supColor)};vertical-align:${vAlign}">${escapeHtml(chunk)}</${tag}></span>`;
+          }
+        } else {
+          const chunk = displayStr.slice(rng.charStart, rng.charEnd).trim();
+          const supColor = rng.color || color || 'inherit';
+          const tag = rng.kind === 'super' ? 'sup' : 'sub';
+          const vAlign = rng.kind === 'super' ? '0.4em' : '-0.2em';
+          html += `<${tag} style="font-size:0.65em;line-height:0;display:inline;margin:0;padding:0;color:${escapeHtml(supColor)};vertical-align:${vAlign};white-space:nowrap">${escapeHtml(chunk)}</${tag}>`;
+        }
+        cursor = rng.charEnd;
+      }
+      if (cursor < displayStr.length) {
+        let afterText = displayStr.slice(cursor);
+        afterText = afterText.replace(/^ {2,}/, ' ');
+        html += escapeHtml(afterText);
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+
+    spanRef.current.innerHTML = html;
+
+    // Place cursor at end after content is injected
+    try {
+      spanRef.current.focus();
+      const range = document.createRange();
+      const sel = window.getSelection();
+      range.selectNodeContents(spanRef.current);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (e) {}
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Empty deps: run ONCE on mount only — never re-inject while typing
+
 
   // Handle mobile keyboard
   useEffect(() => {
@@ -321,34 +445,65 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
   // Single-line items: keep scaleX geometric compression since justify has no
   // effect on a single unwrapped line and letter-spacing alone can't fill the gap.
   const [scaleX, setScaleX] = useState(1);
-  const [letterSpacing, setLetterSpacing] = useState(0); // px, applied to paragraphs only
+  const [letterSpacingEm, setLetterSpacingEm] = useState(0); // em units, scale-invariant for paragraphs
 
   useEffect(() => {
-    if (!spanRef.current || !r.w) return;
-    const measure = () => {
-      if (!spanRef.current) return;
-      const domW = spanRef.current.scrollWidth;
-      const deficit = r.w - domW; // positive = text runs short, negative = overflow
+    if (!item.isParagraph || !spanRef.current || !r.w || !r.h) return;
 
-      if (item.isParagraph) {
-        // Distribute delta across non-whitespace characters.
-        // Clamp to ±1.5px so we don't over-kern on very short paragraphs.
-        const charCount = Math.max(1, (initialStr || '').replace(/\s/g, '').length);
-        const raw = deficit / charCount;
-        setLetterSpacing(Math.max(-1.5, Math.min(1.5, raw)));
-        setScaleX(1); // never distort glyphs on paragraphs
-      } else {
-        // Single-line: geometric compression/expansion via scaleX
-        if (domW > r.w + 1) {
-          setScaleX(Math.max(0.88, r.w / domW));
-        } else {
-          setScaleX(1);
-        }
-        setLetterSpacing(0);
-      }
+    let isCancelled = false;
+
+    const measure = () => {
+      if (isCancelled || !spanRef.current) return;
+
+      // 1. Create a hidden offscreen clone to safely measure unwrapped text width
+      // This prevents layout thrashing and avoids destroying the active contenteditable caret/selection
+      const clone = spanRef.current.cloneNode(true);
+      clone.style.position = 'absolute';
+      clone.style.visibility = 'hidden';
+      clone.style.pointerEvents = 'none';
+      clone.style.whiteSpace = 'nowrap';
+      clone.style.width = 'auto';
+      clone.style.maxWidth = 'none';
+      document.body.appendChild(clone);
+
+      // 2. Measure true unwrapped width of all characters + inline superscripts combined
+      const singleLineWidth = clone.scrollWidth;
+      document.body.removeChild(clone);
+
+      // 3. Compute target total width based on PyMuPDF box height vs rendered line height
+      const currentFontSizePx = Math.max(1, (item.fontSize || 10) * scale + (fontSizeAdj || 0));
+      const estimatedLineHeight = item.lineHeight ? item.lineHeight * scale : currentFontSizePx * 1.2;
+      const targetLineCount = Math.max(1, Math.round(r.h / estimatedLineHeight));
+      const targetTotalWidth = r.w * targetLineCount;
+
+      // 4. Calculate kerning delta per non-whitespace character
+      const deficit = targetTotalWidth - singleLineWidth;
+      const rawText = spanRef.current.innerText || sanitizedText || '';
+      const nonWhitespaceChars = Math.max(1, rawText.replace(/\s/g, '').length);
+
+      const rawPxPerChar = deficit / nonWhitespaceChars;
+      const rawEm = rawPxPerChar / currentFontSizePx;
+
+      // Standard dynamic measurement clamping
+      const clampedEm = Math.max(-0.035, Math.min(0.035, rawEm));
+
+      setLetterSpacingEm(clampedEm);
+      setScaleX(1);
     };
-    requestAnimationFrame(measure);
-  }, [item.str, item.isParagraph, r.w, scale, fontSizeAdj, fontFamily, initialStr]);
+
+    // Wait for document fonts to finish loading so scrollWidth measurements are accurate
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => {
+        if (!isCancelled) requestAnimationFrame(measure);
+      });
+    } else {
+      requestAnimationFrame(measure);
+    }
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [sanitizedText, item.isParagraph, item.fontSize, item.lineHeight, r.w, r.h, scale, fontSizeAdj, fontFamily]);
 
   // ─── Fix 4: Baseline vs Bounding Box Alignment ───────────────────────────
   // PDF draws text from its BASELINE (pdfY_base). HTML positions from the TOP
@@ -400,6 +555,11 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
   // If offset < 0: pull the whole box up (can't use negative padding).
   const baselinePaddingTop = baselineOffset >= 0 ? baselineOffset : 0;
   const baselineTopAdj     = baselineOffset <  0 ? baselineOffset : 0; // negative px
+  // Calculate exact line height to fit target lines within PyMuPDF bounding box (r.h)
+  const baseFontSizePx = (item.fontSize || 10) * scale + (fontSizeAdj || 0);
+  const estimatedLineHeight = item.lineHeight ? item.lineHeight * scale : baseFontSizePx * 1.2;
+  const targetLineCount = Math.max(1, Math.round(r.h / estimatedLineHeight));
+  const exactLineHeightPx = (item.isParagraph && r.h > 0) ? (r.h / targetLineCount) : estimatedLineHeight;
   // ─────────────────────────────────────────────────────────────────────────
 
   return (
@@ -492,6 +652,13 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
             handleCommit();
           }
         }}
+        onPaste={e => {
+          e.preventDefault();
+          const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+          if (text) {
+            document.execCommand('insertText', false, text);
+          }
+        }}
         onKeyUp={e => e.stopPropagation()}
         onKeyPress={e => e.stopPropagation()}
         onPointerDown={e => e.stopPropagation()}
@@ -511,7 +678,7 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           transform: `scaleX(${scaleX}) ${keyboardOffset ? `translateY(${-keyboardOffset}px)` : ''}`,
           transformOrigin: '0% 0%',
           fontFamily: currentFontFamily,
-          fontSize: `${(item.fontSize * scale) + fontSizeAdj}px`,
+          fontSize: `${baseFontSizePx}px`,
           fontWeight: isBold ? 'bold' : 'normal',
           fontStyle: isItalic ? 'italic' : 'normal',
           color: color,
@@ -522,28 +689,37 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
           wordBreak: item.isParagraph ? 'break-word' : 'normal',
           width: `${r.w}px`,
           minWidth: `${r.w}px`,
-          height: item.isParagraph ? 'max-content' : `${r.h}px`,
+          maxWidth: `${r.w}px`,
+          height: item.isParagraph ? `${r.h}px` : `${r.h}px`,
+          maxHeight: item.isParagraph ? `${r.h}px` : undefined,
           minHeight: `${r.h}px`,
           boxSizing: 'border-box',
           display: 'block',
           cursor: 'text',
           zIndex: 100,
-          lineHeight: item.isParagraph && item.lineHeight ? `${item.lineHeight * scale}px` : `${r.h}px`,
+          lineHeight: `${exactLineHeightPx}px`,
           textAlign: item.align || (item.isParagraph ? 'justify' : 'left'),
+          textAlignLast: item.isParagraph ? 'left' : undefined, // Fixes last-line blowout and right-pushed superscripts
+          WebkitTextAlignLast: item.isParagraph ? 'left' : undefined,
           // inter-word: browser expands word gaps to fill width (mirrors PDF Tw operator)
           textJustify: item.isParagraph ? 'inter-word' : undefined,
-          // hyphens: allows the browser to break at soft-hyphen positions if present
-          hyphens: item.isParagraph ? 'auto' : undefined,
-          // letterSpacing: fine-tunes glyph advance to match PDF Tc tracking.
-          // Applied to paragraphs only (single-line items use scaleX instead).
-          letterSpacing: item.isParagraph && letterSpacing !== 0 ? `${letterSpacing.toFixed(3)}px` : undefined,
+          // Explicitly disable browser dictionary auto-hyphenation
+          hyphens: 'none',
+          WebkitHyphens: 'none',
+          msHyphens: 'none',
+          // Micro-spacing adjustments
+          letterSpacing: item.isParagraph && letterSpacingEm !== 0 ? `${letterSpacingEm.toFixed(4)}em` : undefined,
+          wordSpacing: item.isParagraph && letterSpacingEm > 0 ? `${(letterSpacingEm * 1.5).toFixed(4)}em` : undefined,
           margin: 0,
           outline: 'none',
+          overflow: item.isParagraph ? 'hidden' : 'visible',
           border: '1px dashed rgba(148, 163, 184, 0.8)',
           backgroundColor: '#ffffff',
         }}
       >
-        {buildInitialChildren(initialStr, initialRanges, color)}
+        {/* No JSX children — content is injected once via innerHTML in useEffect.
+            React must never touch this span's DOM children after mount or it
+            will invalidate the browser Selection and reset the caret. */}
       </span>
     </>
   );
