@@ -3,7 +3,7 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { TextOverlay } from './TextOverlay';
-import { InlineEditor } from './InlineEditor';
+import { CanvasInlineEditor } from './CanvasInlineEditor';
 import { DebugOverlay } from './DebugOverlay';
 import { useSyncExternalStore } from 'react';
 import { pdfEditStore, activeFileId } from '../../stores/pdfEditStore';
@@ -259,6 +259,7 @@ export default function PDFViewer({
   const [previousNumPages, setPreviousNumPages] = useState(null);
   // Track whether custom PDF fonts have been loaded and rendered by the browser
   const [fontsLoaded, setFontsLoaded] = useState(false);
+  const extractedFontsRef = useRef(false);
 
   // Developer Debug Mode (Ctrl+Shift+D)
   const [debugMode, setDebugMode] = useState(false);
@@ -281,34 +282,66 @@ export default function PDFViewer({
 
   // Fetch embedded fonts when a new PDF loads
   useEffect(() => {
-    if (!file) return;
+    if (!file) {
+      extractedFontsRef.current = false;
+      return;
+    }
     
-    // Reset fonts loaded state when a new file is loaded
+    if (extractedFontsRef.current) return;
+
+    let isCancelled = false;
     setFontsLoaded(false);
-    
-    const form = new FormData();
-    form.append('file', file);
-    
-    fetch('/api/pdf/extract-fonts', { method: 'POST', body: form })
-      .then(r => r.ok ? r.json() : {})
-      .then(async (fontsData) => {
+
+    const extractFonts = async () => {
+      try {
+        extractedFontsRef.current = true;
+        let fileBlob = null;
+        if (file instanceof Blob) {
+          fileBlob = file;
+        } else if (typeof file === 'string') {
+          const res = await fetch(file);
+          if (!res.ok) throw new Error(`Failed to fetch PDF from URL for font extraction: ${res.status}`);
+          fileBlob = await res.blob();
+        } else if (file instanceof ArrayBuffer) {
+          fileBlob = new Blob([file], { type: 'application/pdf' });
+        } else if (file && file.data) {
+          fileBlob = new Blob([file.data], { type: 'application/pdf' });
+        } else if (file) {
+          fileBlob = new Blob([file], { type: 'application/pdf' });
+        }
+
+        if (!fileBlob || !(fileBlob instanceof Blob)) {
+          throw new Error('Invalid file format for font extraction');
+        }
+
+        if (isCancelled) return;
+
+        const form = new FormData();
+        form.append('file', fileBlob, fileBlob.name || 'document.pdf');
+
+        const response = await fetch('/api/pdf/extract-fonts', { method: 'POST', body: form });
+        const fontsData = response.ok ? await response.json() : {};
+
+        if (isCancelled) return;
+
         if (fontsData && Object.keys(fontsData).length > 0) {
-          // 1. Wait for our custom font loader to finish injecting all FontFace objects
           await loadPDFFonts(fontsData);
-          // 2. Wait for the browser's rendering engine to fully recognize them
           await document.fonts.ready;
-          // 3. Update state to allow user interaction
-          setFontsLoaded(true);
-        } else {
-          // If there are no custom fonts to load, just allow interaction immediately
+        }
+      } catch (e) {
+        console.warn('font extraction failed:', e);
+      } finally {
+        if (!isCancelled) {
           setFontsLoaded(true);
         }
-      })
-      .catch(e => {
-        console.warn('font extraction failed:', e);
-        // Fail gracefully so the user isn't blocked forever if the API fails
-        setFontsLoaded(true);
-      });
+      }
+    };
+
+    extractFonts();
+
+    return () => {
+      isCancelled = true;
+    };
   }, [file]);
 
   const [pageMetadata, setPageMetadata] = useState({});
@@ -491,6 +524,13 @@ export default function PDFViewer({
             isBold: lineData.is_bold === true,
             isItalic: lineData.is_italic === true,
             fontPostScriptName: lineData.dominant_font || lineFontName,
+            chars: lineData.chars || allCharsInLine,
+            line_x0: lineData.line_x0 !== undefined ? lineData.line_x0 : lineX0,
+            line_x1: lineData.line_x1 !== undefined ? lineData.line_x1 : lineX1,
+            line_y0: lineData.line_y0 !== undefined ? lineData.line_y0 : lineY_top,
+            line_y1: lineData.line_y1 !== undefined ? lineData.line_y1 : lineY_bottom,
+            width: lineData.width !== undefined ? lineData.width : (lineX1 - lineX0),
+            space_count: lineData.space_count !== undefined ? lineData.space_count : (lineStr.match(/ /g) || []).length,
           });
         });
       });
@@ -560,6 +600,13 @@ export default function PDFViewer({
               pdfW: wordW, pdfH: wordH, fontSize: wordFontSize, fontName: wordFontName,
               hasSuperscript: wordHasSuperscript, ascender_h: ascenderH, descender_h: descenderH,
               color: wordChars[0].color || 'rgb(0, 0, 0)',
+              chars: [...wordChars],
+              line_x0: wordX0,
+              line_x1: wordX0 + wordW,
+              line_y0: wordY_top,
+              line_y1: wordY_top + wordH,
+              width: wordW,
+              space_count: (wordStr.match(/ /g) || []).length,
             };
             currentCol = wordCol;
           } else {
@@ -574,6 +621,13 @@ export default function PDFViewer({
               if (wordHasSuperscript) currentItem.hasSuperscript = true;
               if (ascenderH > currentItem.ascender_h) currentItem.ascender_h = ascenderH;
               if (descenderH > currentItem.descender_h) currentItem.descender_h = descenderH;
+              if (currentItem.chars) currentItem.chars.push(...wordChars);
+              currentItem.line_x0 = currentItem.pdfX;
+              currentItem.line_x1 = currentItem.pdfX + currentItem.pdfW;
+              currentItem.line_y0 = currentItem.pdfY_top;
+              currentItem.line_y1 = currentItem.pdfY_top + currentItem.pdfH;
+              currentItem.width = currentItem.pdfW;
+              currentItem.space_count = (currentItem.str.match(/ /g) || []).length;
             } else {
               finalItems.push(currentItem);
               currentItem = {
@@ -581,6 +635,13 @@ export default function PDFViewer({
                 pdfW: wordW, pdfH: wordH, fontSize: wordFontSize, fontName: wordFontName,
                 hasSuperscript: wordHasSuperscript, ascender_h: ascenderH, descender_h: descenderH,
                 color: wordChars[0].color || 'rgb(0, 0, 0)',
+                chars: [...wordChars],
+                line_x0: wordX0,
+                line_x1: wordX0 + wordW,
+                line_y0: wordY_top,
+                line_y1: wordY_top + wordH,
+                width: wordW,
+                space_count: (wordStr.match(/ /g) || []).length,
               };
               currentCol = wordCol;
             }
@@ -654,7 +715,10 @@ export default function PDFViewer({
 
             if (sgLines.length === 1) {
               // Single-line sub-group: emit as a plain (non-paragraph) item
-              paragraphItems.push(sgLines[0]);
+              paragraphItems.push({
+                ...sgLines[0],
+                origLines: sgLines,
+              });
               return;
             }
 
@@ -668,8 +732,11 @@ export default function PDFViewer({
               colorCounts[a] > colorCounts[b] ? a : b
             );
 
-            const pX0 = Math.min(...sgLines.map((l) => l.pdfX));
-            const pX1 = Math.max(...sgLines.map((l) => l.pdfX + l.pdfW));
+            // Use PyMuPDF line bbox coordinates (line_x0/line_x1) for block bounds.
+            // This makes r.w consistent with targetWidth in CanvasInlineEditor,
+            // preventing text from overflowing and being clipped at the right edge.
+            const pX0 = Math.min(...sgLines.map((l) => l.line_x0 ?? l.pdfX));
+            const pX1 = Math.max(...sgLines.map((l) => l.line_x1 ?? (l.pdfX + l.pdfW)));
             const pY0 = Math.min(...sgLines.map((l) => l.pdfY_top));
             const pY1 = Math.max(...sgLines.map((l) => l.pdfY_top + l.pdfH));
 
@@ -684,10 +751,11 @@ export default function PDFViewer({
               if (i === 0) {
                 pStr = l.str;
               } else {
-                // Preserve hyphenated line-endings (no separator); otherwise use
-                // a space for justified text so words flow naturally, or '\n' for
-                // non-justified text where each line is a visual unit.
-                const sep = pStr.endsWith('-') ? '' : (blockAlign === 'justify' ? ' ' : '\n');
+                // Always use '\n' as the line separator so the Canvas layout engine
+                // can map each \n-block 1:1 to the correct PyMuPDF origLine for
+                // coordinate-driven startX and targetWidth lookups.
+                // Hyphenated line-endings get no separator (word continues on next line).
+                const sep = pStr.endsWith('-') ? '' : '\n';
                 lineSeps.push(sep);
                 pStr += sep + l.str;
               }
@@ -732,11 +800,14 @@ export default function PDFViewer({
               linePitch = sgLines[0].pdfH;
             }
 
-            const firstLineIndent = sgLines[0].pdfX - pX0;
+            // Use line_x0 for indent calculation (consistent with pX0 above)
+            const firstLineIndent = (sgLines[0].line_x0 ?? sgLines[0].pdfX) - pX0;
             const textIndentPdf = firstLineIndent > 1.0 ? firstLineIndent : 0;
 
             paragraphItems.push({
               str: pStr,
+              lines: sgLines.map(l => ({ text: l.str, width: l.pdfW })),
+              rawPdfLines: sgLines.map(l => l.str),
               pdfX: pX0,
               pdfY_base: sgLines[0].pdfY_base,
               pdfY_top: pY0,
@@ -758,8 +829,10 @@ export default function PDFViewer({
             });
           });
         } else if (blockLines.length === 1) {
-          paragraphItems.push(blockLines[0]);
-
+          paragraphItems.push({
+            ...blockLines[0],
+            origLines: blockLines,
+          });
         }
       });
 
@@ -1193,7 +1266,7 @@ export default function PDFViewer({
                 {activePageNum === index + 1 && selectedTextIdx !== null && pageMetadata[index + 1].items[selectedTextIdx] && (() => {
                   const item = pageMetadata[index + 1].items[selectedTextIdx];
                   return (
-                    <InlineEditor
+                    <CanvasInlineEditor
                       key={`${activePageNum}-${selectedTextIdx}-${item.str}`}
                       item={item}
                       scale={scale}
@@ -1204,6 +1277,7 @@ export default function PDFViewer({
                           pageNum: index + 1,
                           origStr: origItem.str,
                           newStr: newVal,
+                          lines: formatOptions.lines || [],
                           origin_y: origItem.pdfY_base,
                           ascender_h: origItem.ascender_h,
                           descender_h: origItem.descender_h,
@@ -1223,8 +1297,7 @@ export default function PDFViewer({
                           isParagraph: origItem.isParagraph || false,
                           lineCount: origItem.lineCount || 1,
                           nodeIndex: selectedTextIdx,
-                          // InlineEditor produces fresh superscriptRanges
-                          // from the committed DOM tree (positions in newVal).
+                          // CanvasInlineEditor produces fresh superscriptRanges
                           superscriptRanges: newSuperscriptRanges || [],
                         });
                         setSelectedTextIdx(null);

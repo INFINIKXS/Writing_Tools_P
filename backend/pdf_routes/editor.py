@@ -17,6 +17,16 @@ from converter.font_utils import wrap_cff_in_otf
 
 logger = logging.getLogger(__name__)
 
+UNICODE_SUPER_MAP = str.maketrans({
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'
+})
+
+def normalize_pdf_text(text: str) -> str:
+    if not text:
+        return ""
+    return text.translate(UNICODE_SUPER_MAP)
+
 router = APIRouter()
 
 @router.post("/run_ocr")
@@ -84,7 +94,7 @@ async def detect_font(
                          return {
                              "font": span.get("font"),
                              "size": round(span.get("size"), 1),
-                             "text": span.get("text")
+                             "text": normalize_pdf_text(span.get("text"))
                          }
                     
                     # Otherwise map to the closest spanning block centroid
@@ -97,7 +107,7 @@ async def detect_font(
                          best_match = {
                              "font": span.get("font"),
                              "size": round(span.get("size"), 1),
-                             "text": span.get("text")
+                             "text": normalize_pdf_text(span.get("text"))
                          }
                          
     if best_match and min_dist < 100: # Ensure we didn't just match something 1000px away
@@ -328,7 +338,7 @@ def extract_page_spacing_data(page):
 
                 for ch in span.get("chars", []):
                     raw_chars.append({
-                        "c":              ch["c"],
+                        "c":              normalize_pdf_text(ch["c"]),
                         "x0":             ch["bbox"][0],
                         "x1":             ch["bbox"][2],
                         "y0":             ch["bbox"][1],
@@ -402,15 +412,27 @@ def extract_page_spacing_data(page):
             color_counts = _CounterLocal(c["color"] for c in line_chars)
             dom_color = color_counts.most_common(1)[0][0] if color_counts else "rgb(0, 0, 0)"
 
+            x0 = line["bbox"][0]
+            y0 = line["bbox"][1]
+            x1 = line["bbox"][2]
+            y1 = line["bbox"][3]
+            line_text = "".join(c["c"] for c in line_chars)
+            space_count = line_text.count(" ")
+
             block_lines.append({
-                "chars":   line_chars,
-                "gaps":    gaps,
-                "line_x0": line["bbox"][0],
-                "line_x1": line["bbox"][2],
-                "line_y0": line["bbox"][1],
-                "line_y1": line["bbox"][3],
-                "is_bold": dom_bold,
-                "is_italic": dom_italic,
+                "text":        line_text,
+                "bbox":        [x0, y0, x1, y1],
+                "width":       x1 - x0,
+                "height":      y1 - y0,
+                "space_count": space_count,
+                "chars":       line_chars,
+                "gaps":        gaps,
+                "line_x0":     x0,
+                "line_x1":     x1,
+                "line_y0":     y0,
+                "line_y1":     y1,
+                "is_bold":     dom_bold,
+                "is_italic":   dom_italic,
                 "dominant_font": dom_font,
                 "dominant_color": dom_color,
             })

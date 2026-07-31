@@ -88,3 +88,40 @@ Integrity mode: benchmark
 - [ ] Backend unittest suite runs and passes successfully: `python -m unittest backend/test_asl.py`
 - [ ] Frontend Vite build compiles with zero errors: `npm run build` inside `frontend/`
 
+## Follow-up — 2026-07-30T18:00:37+01:00
+
+Pivot the PDF inline text editor from HTML DOM (contenteditable) to an HTML5 Canvas engine (CanvasInlineEditor) for sub-pixel text rendering, caret hit testing, superscript alignment, and PyMuPDF backend export.
+
+Working directory: c:\Users\Paradox-Labs\Documents\Projects\Writing_Tools_Production
+
+Integrity mode: development
+
+## Requirements
+
+### R1. HTML5 Canvas Block Editor Component (CanvasInlineEditor.jsx)
+Build a React component to replace the existing contenteditable InlineEditor.jsx. Use an offscreen hidden <textarea> input bridge to capture keyboard input, IME, copy/paste, and selection ranges while rendering text, blue selection highlight rectangles, and a blinking caret on an HTML5 <canvas>.
+
+### R2. Layout & Measurement Engine with Superscript Support
+Implement a text measurement and line-wrapping calculator that breaks paragraph text into lines fitting PyMuPDF block width (blockData.w * scale). Correctly render inline superscripts (³¹, <sup>...</sup>) with 65% font size scaling and -0.25 font size baseline offset.
+
+### R3. Spatial Hit Testing & Selection
+Translate mouse click and drag coordinates (clickX, clickY) on the canvas into exact line and character string offsets to position the text cursor and drive text selection ranges.
+
+### R4. Viewer Integration & PyMuPDF Backend Export
+Integrate CanvasInlineEditor into Viewer.jsx and pdfEditStore. Connect edited text and line structure to backend API endpoints (backend/pdf_routes/editor.py) for PyMuPDF redaction and text re-insertion.
+
+## Acceptance Criteria
+
+### Component & Visual Fidelity
+- [ ] Canvas editor renders text lines within PyMuPDF bounding box without line reflow bugs or font size collapse.
+- [ ] Blinking caret bar (2px width) flashes smoothly when editor is focused.
+- [ ] Text selection via mouse drag or keyboard shift+arrow highlights text range in rgba(147, 197, 253, 0.6).
+
+### Input & Superscript Parity
+- [ ] Typing, backspace, enter, arrow key navigation, and copy/paste work seamlessly via hidden <textarea> bridge.
+- [ ] Superscripts (citations like al³¹) stay bound to words and shift baselines without causing newline line breaks.
+
+### Backend Integration
+- [ ] Exporting/saving edited text triggers PyMuPDF redaction on backend and produces a clean PDF match.
+
+

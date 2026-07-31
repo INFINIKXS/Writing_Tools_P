@@ -368,6 +368,16 @@ def _find_change_range(orig: str, new: str):
     return prefix_len, orig_end, new_end
 
 
+def _get_fallback_font_name(fontname) -> str:
+    """Return 'times-roman' for Baskerville/Serif fonts, otherwise 'helv'."""
+    if not isinstance(fontname, str):
+        fontname = str(fontname) if fontname is not None else ""
+    fname_lower = fontname.lower()
+    if "baskerville" in fname_lower or "times" in fname_lower or "serif" in fname_lower:
+        return "times-roman"
+    return "helv"
+
+
 @router.post("/apply-edits")
 async def apply_edits(
     file:  UploadFile = File(...),
@@ -413,9 +423,41 @@ async def apply_edits(
             fontsize = edit.get("origFontSize", 11) + edit.get("fontSizeAdj", 0)
             fontsize = max(4.0, fontsize)  # MuPDF minimum
 
+            # ── Font resolution ──────────────────────────────────────────────────
+            edit["fontName"] = _resolve_font_name(page, edit, x0, y0, x1_frontend, y1)
+            font_result = get_font_for_edit(doc, page, edit)
+
+            if font_result.fallback_used:
+                warning_entry = {
+                    "pageNum":  edit["pageNum"],
+                    "origStr":  orig_text,
+                    "reason":   font_result.fallback_reason,
+                }
+                if font_result.missing_glyphs:
+                    warning_entry["missingGlyphs"] = font_result.missing_glyphs
+                warnings.append(warning_entry)
+                logger.warning(
+                    f"Page {edit['pageNum']}: font fallback used. "
+                    f"Reason: {font_result.fallback_reason}"
+                )
+
+            # ── Determine insert color ───────────────────────────────────────────
+            insert_color = _resolve_color(page, edit, x0, y0, x1_frontend, y1)
+
+            lines = edit.get("lines", [])
+            plan = {
+                "erase_rects": [],
+                "insert_chars": [],
+                "font_registrations": {},
+                "super_ranges": edit.get("superscriptRanges", []) or [],
+                "new_text": new_text,
+                "lines": lines,
+            }
+
             # ── Paragraph-Block Edit Handling (PDFgear / WPS Office Parity) ──────
             is_paragraph_edit = edit.get("isParagraph", False) or "\n" in new_text or (edit.get("lineCount", 1) > 1)
             if is_paragraph_edit:
+                paragraph_text = "\n".join(lines) if lines else new_text
                 logger.info(
                     f"PARAGRAPH EDIT: page {edit['pageNum']}, "
                     f"rect=[{x0:.1f}, {y0:.1f}, {edit['rect']['w']:.1f}, {edit['rect']['h']:.1f}], "
@@ -429,9 +471,9 @@ async def apply_edits(
                 plan["is_paragraph_op"] = True
                 plan["paragraph_rect"] = fitz.Rect(
                     x0, y0,
-                    x0 + edit["rect"]["w"], y0 + max(edit["rect"]["h"], 400)
+                    x0 + edit["rect"]["w"], y0 + edit["rect"]["h"] + 10
                 )
-                plan["paragraph_text"] = new_text
+                plan["paragraph_text"] = paragraph_text
                 plan["fontname"] = font_result.fontname
                 plan["fontsize"] = fontsize
                 plan["color"] = insert_color
@@ -476,13 +518,6 @@ async def apply_edits(
                     f"Reason: {font_result.fallback_reason}"
                 )
 
-            # Register the font with this page so insert_text can find it
-            if font_result.font_buffer:
-                page.insert_font(
-                    fontname=font_result.fontname,
-                    fontbuffer=font_result.font_buffer,
-                )
-
             # ── Determine insert color ───────────────────────────────────────────
             insert_color = _resolve_color(page, edit, x0, y0, x1_frontend, y1)
 
@@ -517,6 +552,7 @@ async def apply_edits(
                 "font_registrations": {},
                 "super_ranges": edit.get("superscriptRanges", []) or [],
                 "new_text": new_text,
+                "lines": lines,
             }
 
             # ── Whole-line bypass for super/sub lines ─────────────────────
@@ -537,7 +573,7 @@ async def apply_edits(
             raw_text = "".join(ch.get("c", "") for ch in rawdict_chars)
             used_minimal_diff = False
 
-            if raw_text and rawdict_chars:
+            if raw_text and rawdict_chars and not has_script_ranges:
                 prefix_len, raw_end, new_end = _find_change_range(raw_text, new_text)
                 changed_orig = raw_text[prefix_len:raw_end]
                 changed_new = new_text[prefix_len:new_end]
@@ -1180,12 +1216,27 @@ async def apply_edits(
         # previously registered embedded fonts become unavailable.
         # Re-register every unique font we plan to use.
         registered_fonts = set()
+        font_tag_map = {}
         for plan in edit_plans:
-            for fontname, font_buffer in plan["font_registrations"].items():
+            for fontname, font_buffer in list(plan["font_registrations"].items()):
                 if fontname not in registered_fonts:
-                    page.insert_font(fontname=fontname, fontbuffer=font_buffer)
-                    registered_fonts.add(fontname)
-                    logger.info(f"Re-registered font '{fontname}' after redaction")
+                    try:
+                        font_key = page.insert_font(fontname=fontname, fontbuffer=font_buffer)
+                        font_tag_map[fontname] = font_key
+                        registered_fonts.add(fontname)
+                        logger.info(f"Registered font '{fontname}' -> tag '{font_key}'")
+                    except Exception as e:
+                        fallback = _get_fallback_font_name(fontname)
+                        font_tag_map[fontname] = fallback
+                        registered_fonts.add(fontname)
+
+        # Map registered font tags into edit plans and ops
+        for plan in edit_plans:
+            if plan.get("fontname") in font_tag_map:
+                plan["fontname"] = font_tag_map[plan["fontname"]]
+            for op in plan.get("insert_chars", []):
+                if op.get("fontname") in font_tag_map:
+                    op["fontname"] = font_tag_map[op["fontname"]]
 
         # ── Phase 3.5: Apply super/sub baseline adjustments ──
         # For each plan's super_ranges, we need to: erase the chars that
@@ -1208,18 +1259,59 @@ async def apply_edits(
         # reduces fragmentation in the resulting PDF).
         for plan in edit_plans:
             if plan.get("is_paragraph_op"):
+                lines = plan.get("lines", [])
+                if lines:
+                    paragraph_text = "\n".join(lines)
+                else:
+                    paragraph_text = plan.get("paragraph_text", plan.get("new_text", ""))
                 logger.info(
-                    f"EXECUTING PARAGRAPH INSERT: text='{plan['paragraph_text'][:40]}...', "
+                    f"EXECUTING PARAGRAPH INSERT: text='{paragraph_text[:40]}...', "
                     f"fontsize={plan['fontsize']:.1f}"
                 )
-                page.insert_textbox(
-                    plan["paragraph_rect"],
-                    plan["paragraph_text"],
-                    fontname=plan["fontname"],
-                    fontsize=plan["fontsize"],
-                    color=plan["color"],
-                    align=fitz.TEXT_ALIGN_LEFT,
-                )
+                font_name_arg = plan.get("fontname", "helv")
+                if not isinstance(font_name_arg, str):
+                    font_name_arg = str(font_name_arg) if font_name_arg is not None else "helv"
+                try:
+                    page.insert_textbox(
+                        plan["paragraph_rect"],
+                        paragraph_text,
+                        fontname=font_name_arg,
+                        fontsize=plan["fontsize"],
+                        color=plan["color"],
+                        align=fitz.TEXT_ALIGN_JUSTIFY,
+                    )
+                except Exception as e:
+                    fallback_font = _get_fallback_font_name(font_name_arg)
+                    logger.warning(
+                        f"insert_textbox failed for font '{font_name_arg}' ({e}). "
+                        f"Retrying with fallback font '{fallback_font}'."
+                    )
+                    try:
+                        page.insert_textbox(
+                            plan["paragraph_rect"],
+                            paragraph_text,
+                            fontname=fallback_font,
+                            fontsize=plan["fontsize"],
+                            color=plan["color"],
+                            align=fitz.TEXT_ALIGN_JUSTIFY,
+                        )
+                    except Exception as e2:
+                        logger.error(
+                            f"insert_textbox retry with '{fallback_font}' failed ({e2}). "
+                            f"Retrying with 'helv'."
+                        )
+                        if fallback_font != "helv":
+                            try:
+                                page.insert_textbox(
+                                    plan["paragraph_rect"],
+                                    paragraph_text,
+                                    fontname="helv",
+                                    fontsize=plan["fontsize"],
+                                    color=plan["color"],
+                                    align=fitz.TEXT_ALIGN_JUSTIFY,
+                                )
+                            except Exception as e3:
+                                logger.error(f"insert_textbox final retry with 'helv' failed: {e3}")
                 continue
 
             ops = plan["insert_chars"]
@@ -1230,14 +1322,40 @@ async def apply_edits(
             while i < len(ops):
                 op = ops[i]
                 op_text = op["text"]
+                font_name_arg = op.get("fontname", "helv")
+                if not isinstance(font_name_arg, str):
+                    font_name_arg = str(font_name_arg) if font_name_arg is not None else "helv"
 
                 # Multi-char or morphed ops emit solo (no coalescing needed)
                 if len(op_text) > 1 or op["morph"] is not None:
-                    page.insert_text(
-                        op["pos"], op_text,
-                        fontname=op["fontname"], fontsize=op["fontsize"],
-                        color=op["color"], morph=op["morph"],
-                    )
+                    try:
+                        page.insert_text(
+                            op["pos"], op_text,
+                            fontname=font_name_arg, fontsize=op["fontsize"],
+                            color=op["color"], morph=op["morph"],
+                        )
+                    except Exception as e:
+                        fallback_font = _get_fallback_font_name(font_name_arg)
+                        logger.warning(
+                            f"insert_text failed for font '{font_name_arg}' ({e}). "
+                            f"Retrying with fallback font '{fallback_font}'."
+                        )
+                        try:
+                            page.insert_text(
+                                op["pos"], op_text,
+                                fontname=fallback_font, fontsize=op["fontsize"],
+                                color=op["color"], morph=op["morph"],
+                            )
+                        except Exception as e2:
+                            if fallback_font != "helv":
+                                try:
+                                    page.insert_text(
+                                        op["pos"], op_text,
+                                        fontname="helv", fontsize=op["fontsize"],
+                                        color=op["color"], morph=op["morph"],
+                                    )
+                                except Exception as e3:
+                                    logger.error(f"insert_text final retry with 'helv' failed: {e3}")
                     i += 1
                     continue
 
@@ -1258,11 +1376,34 @@ async def apply_edits(
                     else:
                         break
 
-                page.insert_text(
-                    op["pos"], group_text,
-                    fontname=op["fontname"], fontsize=op["fontsize"],
-                    color=op["color"],
-                )
+                try:
+                    page.insert_text(
+                        op["pos"], group_text,
+                        fontname=font_name_arg, fontsize=op["fontsize"],
+                        color=op["color"],
+                    )
+                except Exception as e:
+                    fallback_font = _get_fallback_font_name(font_name_arg)
+                    logger.warning(
+                        f"insert_text grouped failed for font '{font_name_arg}' ({e}). "
+                        f"Retrying with fallback font '{fallback_font}'."
+                    )
+                    try:
+                        page.insert_text(
+                            op["pos"], group_text,
+                            fontname=fallback_font, fontsize=op["fontsize"],
+                            color=op["color"],
+                        )
+                    except Exception as e2:
+                        if fallback_font != "helv":
+                            try:
+                                page.insert_text(
+                                    op["pos"], group_text,
+                                    fontname="helv", fontsize=op["fontsize"],
+                                    color=op["color"],
+                                )
+                            except Exception as e3:
+                                logger.error(f"insert_text grouped final retry with 'helv' failed: {e3}")
                 logger.info(
                     f"Grouped {j - i} char(s) into single insert: '{group_text[:40]}'"
                 )
