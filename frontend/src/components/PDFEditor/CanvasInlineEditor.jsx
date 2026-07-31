@@ -411,19 +411,23 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    */
   const getOrigLineBounds = useCallback((origLine, lineIdx) => {
     let x0 = null;
-    let x1 = null;
     if (origLine && typeof origLine === 'object') {
       x0 = origLine.line_x0 ?? origLine.pdfX ?? (Array.isArray(origLine.bbox) ? origLine.bbox[0] : null);
-      x1 = origLine.line_x1 ?? (origLine.pdfW != null ? ((origLine.pdfX ?? x0) + origLine.pdfW) : (origLine.width != null ? ((origLine.pdfX ?? x0) + origLine.width) : (Array.isArray(origLine.bbox) ? origLine.bbox[2] : null)));
     }
     if (x0 == null) {
       x0 = item.pdfX + (lineIdx === 0 && item.textIndent ? item.textIndent : 0);
     }
-    if (x1 == null) {
-      x1 = item.pdfX + (item.pdfW || r.w / scale);
+    // Exact right boundary drawn by the backend container box:
+    let containerRightX = item.pdfX + (item.pdfW || (r.w / scale));
+    if (Array.isArray(item.bbox) && item.bbox[2] != null) {
+      containerRightX = Math.max(containerRightX, item.bbox[2]);
     }
-    return { line_x0: x0, line_x1: x1 };
-  }, [item.pdfX, item.pdfW, item.textIndent, r.w, scale]);
+    if (item.blockData && Array.isArray(item.blockData.bbox) && item.blockData.bbox[2] != null) {
+      containerRightX = Math.max(containerRightX, item.blockData.bbox[2]);
+    }
+
+    return { line_x0: x0, line_x1: containerRightX };
+  }, [item.pdfX, item.pdfW, item.bbox, item.blockData, item.textIndent, r.w, scale]);
 
   /**
    * Layout Engine: Breaks text into lines, applies Atomic Citation Unit binding,
@@ -577,28 +581,42 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         }
 
         let prefixMatchCount = 0;
-        for (let w = 0; w < lineWords.length && w < pdfWords.length; w++) {
-          if (lineWords[w] === pdfWords[w]) {
-            prefixMatchCount += pdfWordCharCounts[w];
+        let linePrefixStartWordIdx = 0;
+        if (pdfWords.length > 0) {
+          const matchIdx = lineWords.indexOf(pdfWords[0]);
+          if (matchIdx >= 0) {
+            linePrefixStartWordIdx = matchIdx;
+          }
+        }
+
+        let pdfWIdx = 0;
+        for (let w = linePrefixStartWordIdx; w < lineWords.length && pdfWIdx < pdfWords.length; w++) {
+          if (lineWords[w] === pdfWords[pdfWIdx]) {
+            prefixMatchCount += pdfWordCharCounts[pdfWIdx];
+            pdfWIdx++;
           } else {
             break;
           }
         }
 
         // Match trailing non-space characters (suffix) to preserve original PDF trailing kerning shifted by deltaX
+        // Disable suffix matching on reflowed lines (lines with overflow from previous lines) to avoid invalid negative shifts
         let suffixMatchCount = 0;
-        while (
-          suffixMatchCount < (pdfNonSpaceChars.length - prefixMatchCount) &&
-          suffixMatchCount < (lineNonSpaceChars.length - prefixMatchCount)
-        ) {
-          const pdfIdx = pdfNonSpaceChars.length - 1 - suffixMatchCount;
-          const lineIdx2 = lineNonSpaceChars.length - 1 - suffixMatchCount;
-          const pdfChar = pdfNonSpaceChars[pdfIdx]?.c ?? pdfNonSpaceChars[pdfIdx]?.char ?? '';
-          const lineChar = lineNonSpaceChars[lineIdx2]?.origChar ?? '';
-          if (pdfChar === lineChar && pdfChar.length > 0) {
-            suffixMatchCount++;
-          } else {
-            break;
+        const isReflowedLine = allUnitsForLine.length > lineUnits.length;
+        if (!isReflowedLine) {
+          while (
+            suffixMatchCount < (pdfNonSpaceChars.length - prefixMatchCount) &&
+            suffixMatchCount < (lineNonSpaceChars.length - prefixMatchCount)
+          ) {
+            const pdfIdx = pdfNonSpaceChars.length - 1 - suffixMatchCount;
+            const lineIdx2 = lineNonSpaceChars.length - 1 - suffixMatchCount;
+            const pdfChar = pdfNonSpaceChars[pdfIdx]?.c ?? pdfNonSpaceChars[pdfIdx]?.char ?? '';
+            const lineChar = lineNonSpaceChars[lineIdx2]?.origChar ?? '';
+            if (pdfChar === lineChar && pdfChar.length > 0) {
+              suffixMatchCount++;
+            } else {
+              break;
+            }
           }
         }
 
@@ -609,34 +627,89 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           (item.isParagraph && blockAlign === 'justify') || (origLines && origLines.length > 1));
         const spaceCount = lineChars.filter(cm => cm.origChar === ' ' || cm.origChar === '\u00A0').length;
 
+        const firstSuffixPdfIdx = suffixMatchCount > 0
+          ? pdfNonSpaceChars.length - suffixMatchCount
+          : -1;
+        const suffixStartNonSpaceIdx = lineNonSpaceChars.length - suffixMatchCount;
+
         let extraPerSpace = 0;
         if (!usePdfCoords && shouldJustify && !isLastLineOfParagraph && spaceCount > 0) {
-          let rawLineWidth = 0;
-          for (const cm of lineChars) {
-            ctx.font = (cm.kind === 'super' || cm.kind === 'sub') ? superFont : baseFont;
-            rawLineWidth += ctx.measureText(cm.displayChar).width;
+          // Dry-run measurement: compute un-justified right edge of lineChars
+          let testX = pStartX;
+          let testPdfCharIdx = 0;
+          let testDeltaX = 0;
+          let testDeltaXComputed = false;
+          let testNonSpaceCounter = 0;
+          let testExtraSpaceShift = 0;
+          let testPrevWasSpace = false;
+
+          for (let i = 0; i < lineChars.length; i++) {
+            const cm = lineChars[i];
+            const isSpace = cm.origChar === ' ' || cm.origChar === '\u00A0';
+            const isSuper = cm.kind === 'super' || cm.kind === 'sub';
+
+            if (!isSpace && testPdfCharIdx < prefixMatchCount) {
+              const pdfCh = pdfNonSpaceChars[testPdfCharIdx];
+              if (linePrefixStartWordIdx > 0 && !testDeltaXComputed && testPdfCharIdx === 0) {
+                const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX) * scale;
+                testDeltaX = testX - firstPrefixPdfX0;
+                testDeltaXComputed = true;
+              }
+              testX = (pdfCh.x1 - item.pdfX) * scale + testDeltaX + testExtraSpaceShift;
+              testPdfCharIdx++;
+              testPrevWasSpace = false;
+            } else if (isSpace && testPdfCharIdx > 0 && testPdfCharIdx < prefixMatchCount) {
+              if (!testPrevWasSpace) {
+                const nextPdfCh = pdfNonSpaceChars[testPdfCharIdx];
+                testX = (nextPdfCh.x0 - item.pdfX) * scale + testDeltaX + testExtraSpaceShift;
+              } else {
+                ctx.font = isSuper ? superFont : baseFont;
+                const extraW = ctx.measureText(cm.displayChar).width;
+                testExtraSpaceShift += extraW;
+                testX += extraW;
+              }
+              testPrevWasSpace = true;
+            } else if (!isSpace && testNonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
+              if (!testDeltaXComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
+                const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX) * scale;
+                testDeltaX = testX - firstSuffixPdfX0;
+                testDeltaXComputed = true;
+              }
+              const suffixPdfIdx = pdfNonSpaceChars.length - (lineNonSpaceChars.length - testNonSpaceCounter);
+              if (suffixPdfIdx >= 0 && suffixPdfIdx < pdfNonSpaceChars.length) {
+                const pdfCh = pdfNonSpaceChars[suffixPdfIdx];
+                testX = (pdfCh.x1 - item.pdfX) * scale + testDeltaX;
+              } else {
+                ctx.font = isSuper ? superFont : baseFont;
+                testX += ctx.measureText(cm.displayChar).width;
+              }
+              testPrevWasSpace = false;
+            } else {
+              if (i === 0) testX = pStartX;
+              ctx.font = isSuper ? superFont : baseFont;
+              testX += ctx.measureText(cm.displayChar).width;
+              testPrevWasSpace = isSpace;
+            }
+            if (!isSpace) testNonSpaceCounter++;
           }
-          const deficit = pLineTargetW - rawLineWidth;
-          if (deficit > 0) extraPerSpace = deficit / spaceCount;
+
+          const deficit = (pStartX + pLineTargetW) - testX;
+          if (deficit > 0 && deficit < pLineTargetW * 0.45) {
+            extraPerSpace = deficit / spaceCount;
+          }
         }
 
         const charXPositions = [];
         let accumX = pStartX;
         let pdfCharIdx = 0;
 
-        // Zero-Snap Architecture:
-        // deltaXShift is computed lazily on the FIRST suffix char we encounter.
-        // At that point, accumX already holds the correct canvas X after the
-        // edited word AND its trailing space (via fallback branch). We simply
-        // compare that to the PDF x0 of the first suffix char to get the exact shift.
         let deltaXShift = 0;
         let deltaXShiftComputed = false;
-        const firstSuffixPdfIdx = suffixMatchCount > 0
-          ? pdfNonSpaceChars.length - suffixMatchCount
-          : -1;
 
-        const suffixStartNonSpaceIdx = lineNonSpaceChars.length - suffixMatchCount;
         let nonSpaceCounter = 0;
+        let spacesEncountered = 0;
+        let extraSpaceShift = 0;
+        let prevWasSpace = false;
 
         for (let i = 0; i < lineChars.length; i++) {
           const cm = lineChars[i];
@@ -644,23 +717,38 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const isSuper = cm.kind === 'super' || cm.kind === 'sub';
 
           if (!isSpace && pdfCharIdx < prefixMatchCount) {
-            // ── PREFIX REGION: exact PDF coordinates, zero movement ──
+            // ── PREFIX REGION: exact PDF coordinates + deltaXShift + extraSpaceShift ──
             const pdfCh = pdfNonSpaceChars[pdfCharIdx];
-            const pdfX0 = (pdfCh.x0 - item.pdfX) * scale;
-            const pdfX1 = (pdfCh.x1 - item.pdfX) * scale;
+            if (linePrefixStartWordIdx > 0 && !deltaXShiftComputed && pdfCharIdx === 0 && pdfNonSpaceChars.length > 0) {
+              const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX) * scale;
+              deltaXShift = accumX - firstPrefixPdfX0;
+              deltaXShiftComputed = true;
+            }
+            const pdfX0 = (pdfCh.x0 - item.pdfX) * scale + deltaXShift + extraSpaceShift;
+            const pdfX1 = (pdfCh.x1 - item.pdfX) * scale + deltaXShift + extraSpaceShift;
             charXPositions.push(pdfX0);
             accumX = pdfX1;
             pdfCharIdx++;
+            prevWasSpace = false;
           } else if (isSpace && pdfCharIdx > 0 && pdfCharIdx < prefixMatchCount) {
-            // ── PREFIX SPACE: advance accumX to next PDF word's x0 ──
-            const nextPdfCh = pdfNonSpaceChars[pdfCharIdx];
-            const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) * scale;
-            charXPositions.push(accumX);
-            accumX = nextPdfX0;
+            // ── PREFIX SPACE ──
+            if (!prevWasSpace) {
+              const nextPdfCh = pdfNonSpaceChars[pdfCharIdx];
+              const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) * scale + deltaXShift;
+              charXPositions.push(accumX);
+              accumX = nextPdfX0 + extraSpaceShift + (spacesEncountered * extraPerSpace);
+            } else {
+              // Extra space bar hit! Shift all subsequent words rightward
+              charXPositions.push(accumX);
+              ctx.font = isSuper ? superFont : baseFont;
+              const extraW = ctx.measureText(cm.displayChar).width + extraPerSpace;
+              extraSpaceShift += extraW;
+              accumX += extraW;
+            }
+            spacesEncountered++;
+            prevWasSpace = true;
           } else if (!isSpace && nonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
-            // ── SUFFIX REGION: PDF x0 + ΔX ──
-            // Compute ΔX lazily on first suffix char: accumX already includes
-            // the space between the edited word and this suffix word.
+            // ── SUFFIX REGION: PDF x0 + ΔX + justification offset ──
             if (!deltaXShiftComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
               const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX) * scale;
               deltaXShift = accumX - firstSuffixPdfX0;
@@ -678,19 +766,43 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
               ctx.font = isSuper ? superFont : baseFont;
               accumX += ctx.measureText(cm.displayChar).width;
             }
+            prevWasSpace = false;
           } else {
             // ── MIDDLE / EDITED WORD / SPACES / FALLBACK: canvas-measured accumulation ──
             if (i === 0) accumX = pStartX;
             charXPositions.push(accumX);
             ctx.font = isSuper ? superFont : baseFont;
             let w = ctx.measureText(cm.displayChar).width;
-            if (isSpace && extraPerSpace > 0) w += extraPerSpace;
+            if (isSpace) {
+              w += extraPerSpace;
+              spacesEncountered++;
+            }
             accumX += w;
+            prevWasSpace = isSpace;
           }
 
           if (!isSpace) nonSpaceCounter++;
         }
         charXPositions.push(accumX);
+
+        if (unitsToPush.length > 1 && accumX > pStartX + pLineTargetW + 1.5) {
+          const trimmedUnits = unitsToPush.slice(0, unitsToPush.length - 1);
+          const poppedUnit = unitsToPush[unitsToPush.length - 1];
+
+          // Ensure inter-word space is preserved between popped unit and next line's units
+          const lastPoppedChar = poppedUnit.chars[poppedUnit.chars.length - 1]?.origChar;
+          const firstOverflowChar = overflowUnitsFromPrevLine[0]?.chars[0]?.origChar;
+          if (lastPoppedChar !== ' ' && lastPoppedChar !== '\u00A0' &&
+              firstOverflowChar && firstOverflowChar !== ' ' && firstOverflowChar !== '\u00A0') {
+            const spaceMeta = { origChar: ' ', displayChar: ' ', kind: 'normal', charIndex: -1 };
+            const spaceUnit = { chars: [spaceMeta], width: ctx.measureText(' ').width };
+            overflowUnitsFromPrevLine = [poppedUnit, spaceUnit, ...overflowUnitsFromPrevLine];
+          } else {
+            overflowUnitsFromPrevLine = [poppedUnit, ...overflowUnitsFromPrevLine];
+          }
+
+          return pushLine(trimmedUnits, isLastCanvasLineOfBlock);
+        }
 
         const yTop = lineIdx * lineHeightPx;
         const yBaseline = yTop + ascenderPx;
@@ -737,46 +849,56 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     // ── Build 100% Strict Global Spatial Character Map (Array length MUST = text.length + 1) ──
     const globalCharMap = new Array(text.length + 1);
-    let globalStrIndex = 0;
 
     lines.forEach((lineObj, lineIdx) => {
       const lineChars = lineObj.chars || [];
       const charXPositions = lineObj.charXPositions || [];
 
-      // Map each character in the current line
+      // Map each character in the current line using its authoritative cm.charIndex
       lineChars.forEach((cm, localIdx) => {
-        if (globalStrIndex < text.length) {
+        if (cm && cm.charIndex >= 0 && cm.charIndex < text.length) {
           const xPos = charXPositions[localIdx] != null ? charXPositions[localIdx] : lineObj.startX;
-          globalCharMap[globalStrIndex] = {
+          globalCharMap[cm.charIndex] = {
             x: xPos,
             yTop: lineObj.yTop,
             yBaseline: lineObj.yBaseline,
             lineHeightPx: lineObj.lineHeightPx,
             lineIndex: lineIdx
           };
-          globalStrIndex++;
         }
       });
 
-      // Handle line boundary / trailing space / newline index mapping
-      if (globalStrIndex < text.length) {
+      // Handle line end boundary / newline index mapping
+      if (lineChars.length > 0) {
         const endX = charXPositions[lineChars.length] != null 
           ? charXPositions[lineChars.length] 
           : lineObj.startX + lineObj.width;
 
-        // If text at globalStrIndex is a newline '\n', map its spatial position to end of current line
-        if (text[globalStrIndex] === '\n') {
-          globalCharMap[globalStrIndex] = {
-            x: endX,
-            yTop: lineObj.yTop,
-            yBaseline: lineObj.yBaseline,
-            lineHeightPx: lineObj.lineHeightPx,
-            lineIndex: lineIdx
-          };
-          globalStrIndex++;
+        const lastCm = lineChars[lineChars.length - 1];
+        if (lastCm && lastCm.charIndex >= 0) {
+          const endCharIdx = lastCm.charIndex + 1;
+          if (endCharIdx <= text.length && !globalCharMap[endCharIdx]) {
+            globalCharMap[endCharIdx] = {
+              x: endX,
+              yTop: lineObj.yTop,
+              yBaseline: lineObj.yBaseline,
+              lineHeightPx: lineObj.lineHeightPx,
+              lineIndex: lineIdx
+            };
+          }
         }
       }
     });
+
+    // Fill any missing unmapped indices by interpolating from adjacent mapped indices
+    let lastValidPos = { x: 0, yTop: 0, yBaseline: ascenderPx, lineHeightPx, lineIndex: 0 };
+    for (let idx = 0; idx <= text.length; idx++) {
+      if (globalCharMap[idx]) {
+        lastValidPos = globalCharMap[idx];
+      } else {
+        globalCharMap[idx] = { ...lastValidPos };
+      }
+    }
 
     // Map final cursor position (after last character of text)
     const lastLine = lines[lines.length - 1];
@@ -923,17 +1045,36 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const layout = canvas._layout;
     if (!layout.lines || layout.lines.length === 0) return 0;
 
-    // Line lookup
-    const rawLineIdx = Math.floor(clickY / layout.lineHeightPx);
-    const lineIdx = Math.max(0, Math.min(layout.lines.length - 1, rawLineIdx));
-    const targetLine = layout.lines[lineIdx];
+    // Exact vertical line bounding box lookup (yMin to yMax)
+    let targetLine = layout.lines[0];
+    for (let l = 0; l < layout.lines.length; l++) {
+      const line = layout.lines[l];
+      const yMin = line.yTop;
+      const yMax = line.yTop + line.lineHeightPx;
+      if (clickY >= yMin && clickY < yMax) {
+        targetLine = line;
+        break;
+      }
+      if (clickY >= yMax) {
+        targetLine = line;
+      }
+    }
 
     // Horizontal char position lookup
     const charX = targetLine.charXPositions;
+    const lineChars = targetLine.chars || [];
     const len = targetLine.text.length;
 
-    if (clickX <= charX[0]) return targetLine.charStartOffset;
-    if (clickX >= charX[len]) return targetLine.charEndOffset;
+    if (len === 0) return targetLine.charStartOffset;
+
+    const firstCm = lineChars[0];
+    const firstOffset = (firstCm && firstCm.charIndex >= 0) ? firstCm.charIndex : targetLine.charStartOffset;
+
+    const lastCm = lineChars[len - 1];
+    const lastOffset = (lastCm && lastCm.charIndex >= 0) ? lastCm.charIndex + 1 : targetLine.charEndOffset;
+
+    if (clickX <= charX[0]) return firstOffset;
+    if (clickX >= charX[len]) return lastOffset;
 
     for (let i = 0; i < len; i++) {
       const xLeft = charX[i];
@@ -941,10 +1082,11 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       const xMid = (xLeft + xRight) / 2;
 
       if (clickX < xMid) {
-        return targetLine.charStartOffset + i;
+        const cm = lineChars[i];
+        return (cm && cm.charIndex >= 0) ? cm.charIndex : (targetLine.charStartOffset + i);
       }
     }
-    return targetLine.charEndOffset;
+    return lastOffset;
   }, [text.length]);
 
   /**
