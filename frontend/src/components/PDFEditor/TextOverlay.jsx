@@ -48,7 +48,7 @@ function ScaledTextSpan({ text, origText, fontFamily, fontSize, fontWeight, font
   );
 }
 
-export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], fontsLoaded = true }) {
+export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], fontsLoaded = true, activeBlockShift = null }) {
   if (!items || items.length === 0) return null;
 
   return (
@@ -57,9 +57,15 @@ export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], f
         if (!item.str || item.str.trim() === '') return null;
 
         const r = pdfToScreen(item, scale);
-        const boxTop = r.y;
-        const boxHeight = r.h;
         const hasEdit = edits.find(e => e.nodeIndex === i);
+
+        let shiftY = 0;
+        if (activeBlockShift && activeBlockShift.deltaH > 0 && item.pdfY > activeBlockShift.activePdfY) {
+          shiftY = activeBlockShift.deltaH;
+        }
+
+        const boxTop = r.y + shiftY;
+        const boxHeight = r.h;
 
         return (
           <DraggableItem

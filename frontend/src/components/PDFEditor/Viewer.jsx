@@ -263,6 +263,8 @@ export default function PDFViewer({
 
   // Developer Debug Mode (Ctrl+Shift+D)
   const [debugMode, setDebugMode] = useState(false);
+  // Dynamic block vertical cascade shift state
+  const [activeBlockShift, setActiveBlockShift] = useState(null);
 
   const [fileGeneration, setFileGeneration] = useState(0);
   const scrollContainerRef = useRef(null);
@@ -1100,7 +1102,11 @@ export default function PDFViewer({
     <div
       ref={scrollContainerRef}
       className="flex flex-col items-center overflow-auto bg-[#000000] p-8 border border-white/5 rounded-xl h-full relative"
-      onClick={() => {
+      onClick={(e) => {
+        // Do not clear selection if click originated inside an inline editor or canvas
+        if (e.target && e.target.closest && (e.target.closest('.canvas-inline-editor') || e.target.closest('canvas'))) {
+          return;
+        }
         annotations.forEach(a => { if (a.isEditing) onUpdateAnnotation({ ...a, isEditing: false }) });
         setSelectedTextIdx(null);
       }}
@@ -1257,6 +1263,7 @@ export default function PDFViewer({
                   selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
                   edits={edits.filter(e => e.pageNum === index + 1)}
                   fontsLoaded={fontsLoaded}
+                  activeBlockShift={activePageNum === index + 1 ? activeBlockShift : null}
                   onSelect={(idx) => {
                     setSelectedTextIdx(idx);
                     setActivePageNum(index + 1);
@@ -1271,6 +1278,9 @@ export default function PDFViewer({
                       item={item}
                       scale={scale}
                       existingEdit={edits.find(e => e.pageNum === index + 1 && e.nodeIndex === selectedTextIdx)}
+                      onHeightChange={(activePdfY, deltaH) => {
+                        setActiveBlockShift({ pageNum: index + 1, activePdfY, deltaH });
+                      }}
                       onCommit={(newVal, formatOptions, newSuperscriptRanges) => {
                         const origItem = pageMetadata[index + 1].items[selectedTextIdx];
                         pdfEditStore.commitEdit(activeFileId, {
@@ -1301,9 +1311,13 @@ export default function PDFViewer({
                           superscriptRanges: newSuperscriptRanges || [],
                         });
                         setSelectedTextIdx(null);
+                        setActiveBlockShift(null);
                         if (onLivePreview) setTimeout(onLivePreview, 0);
                       }}
-                      onCancel={() => setSelectedTextIdx(null)}
+                      onCancel={() => {
+                        setSelectedTextIdx(null);
+                        setActiveBlockShift(null);
+                      }}
                     />
                   );
                 })()}

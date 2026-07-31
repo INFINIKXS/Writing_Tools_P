@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import { pdfToScreen } from '../../utils/pdfCoords';
-import { SUPER_MAP, UNICODE_SUPER_MAP, UNICODE_SUB_MAP, normalizeText } from './superscriptUtils';
+import { SUPER_MAP, UNICODE_SUPER_MAP, UNICODE_SUB_MAP } from './superscriptUtils';
 
 const rgbToHex = (colorStr) => {
   if (!colorStr) return '#000000';
@@ -59,7 +59,45 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
   const cleanChars = [];
 
   if (backendChars.length > 0) {
-    let bIdx = 0;
+    const rawNonSpace = [];
+    for (let i = 0; i < rawText.length; i++) {
+      if (!/\s/.test(rawText[i])) rawNonSpace.push({ char: rawText[i], rawIdx: i });
+    }
+
+    const backendNonSpace = [];
+    for (let b = 0; b < backendChars.length; b++) {
+      const c = backendChars[b].c ?? backendChars[b].char ?? '';
+      if (!/\s/.test(c)) backendNonSpace.push({ char: c, bIdx: b, meta: backendChars[b] });
+    }
+
+    let prefixCount = 0;
+    while (
+      prefixCount < rawNonSpace.length &&
+      prefixCount < backendNonSpace.length &&
+      rawNonSpace[prefixCount].char === backendNonSpace[prefixCount].char
+    ) {
+      prefixCount++;
+    }
+
+    let suffixCount = 0;
+    while (
+      suffixCount < (rawNonSpace.length - prefixCount) &&
+      suffixCount < (backendNonSpace.length - prefixCount) &&
+      rawNonSpace[rawNonSpace.length - 1 - suffixCount].char === backendNonSpace[backendNonSpace.length - 1 - suffixCount].char
+    ) {
+      suffixCount++;
+    }
+
+    const rawToBackendMap = new Map();
+    for (let p = 0; p < prefixCount; p++) {
+      rawToBackendMap.set(rawNonSpace[p].rawIdx, backendNonSpace[p].meta);
+    }
+    for (let s = 0; s < suffixCount; s++) {
+      const rawIdx = rawNonSpace[rawNonSpace.length - 1 - s].rawIdx;
+      const bMeta = backendNonSpace[backendNonSpace.length - 1 - s].meta;
+      rawToBackendMap.set(rawIdx, bMeta);
+    }
+
     for (let i = 0; i < rawText.length; i++) {
       const rawCh = rawText[i];
       if (/\s/.test(rawCh)) {
@@ -71,19 +109,15 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
           color: undefined,
           charIndex: i
         });
-        // If backendChars[bIdx] is also whitespace, advance bIdx
-        if (bIdx < backendChars.length && /\s/.test(backendChars[bIdx].c)) {
-          bIdx++;
-        }
         continue;
       }
 
-      if (bIdx < backendChars.length) {
-        const ch = backendChars[bIdx];
-        const kind = ch.is_superscript ? 'super' : (ch.is_subscript ? 'sub' : 'normal');
-        const displayChar = SUPER_MAP[ch.c] || ch.c;
-        const origChar = SUPER_MAP[ch.c] || ch.c;
-        const color = ch.color || undefined;
+      const bMeta = rawToBackendMap.get(i);
+      if (bMeta) {
+        const kind = bMeta.is_superscript ? 'super' : (bMeta.is_subscript ? 'sub' : 'normal');
+        const displayChar = SUPER_MAP[bMeta.c] || bMeta.c;
+        const origChar = SUPER_MAP[bMeta.c] || bMeta.c;
+        const color = bMeta.color || undefined;
 
         cleanChars.push(origChar);
         charMeta.push({
@@ -93,7 +127,6 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
           color,
           charIndex: i
         });
-        bIdx++;
       } else {
         let kind = 'normal';
         let displayChar = rawCh;
@@ -226,7 +259,7 @@ function extractRangesFromCharMeta(charMeta) {
   return ranges;
 }
 
-export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel }) {
+export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange }) {
   const getInitialText = useCallback(() => {
     if (existingEdit && existingEdit.newStr) return existingEdit.newStr;
     if (item.lines && item.lines.length > 0) {
@@ -236,26 +269,12 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     return item.str || item.text || '';
   }, [existingEdit, item]);
 
-  // Extract spans from item or blockData if available
-  const spans = useMemo(() => {
-    if (item.spans && Array.isArray(item.spans) && item.spans.length > 0) return item.spans;
-    if (item.blockData?.spans && Array.isArray(item.blockData.spans) && item.blockData.spans.length > 0) return item.blockData.spans;
-    if (item.lines && Array.isArray(item.lines)) {
-      const res = [];
-      for (const l of item.lines) {
-        if (l && typeof l === 'object' && Array.isArray(l.spans)) {
-          res.push(...l.spans);
-        }
-      }
-      if (res.length > 0) return res;
-    }
-    return null;
-  }, [item]);
-
   const rawInitialStr = getInitialText();
-  const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
   const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
-  const initialParsed = useMemo(() => parseCharMetadata(rawInitialStr, rawInitialRanges, origLines), [rawInitialStr, rawInitialRanges, origLines]);
+  const initialParsed = useMemo(() => {
+    const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
+    return parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
+  }, [rawInitialStr, existingEdit, item, origLines]);
   const initialStr = initialParsed.cleanText;
   const initialRanges = useMemo(() => extractRangesFromCharMeta(initialParsed.charMeta), [initialParsed.charMeta]);
 
@@ -263,7 +282,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const [text, setText] = useState(initialStr);
   const [selection, setSelection] = useState(() => ({ start: initialStr.length, end: initialStr.length }));
   const [isFocused, setIsFocused] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
+  const [_isComposing, setIsComposing] = useState(false);
   const [caretVisible, setCaretVisible] = useState(true);
 
   // Formatting state
@@ -275,10 +294,17 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
   const [keyboardOffset, setKeyboardOffset] = useState(0);
 
+  const textRef = useRef(initialStr);
+  const selectionRef = useRef({ start: initialStr.length, end: initialStr.length });
+  const isTypingRef = useRef(false);
+
   const canvasRef = useRef(null);
   const textareaRef = useRef(null);
+  const editorContainerRef = useRef(null); // wraps all editor DOM elements
+  const handleCommitRef = useRef(null);    // stable ref to latest handleCommit
   const isDraggingRef = useRef(false);
   const dragAnchorRef = useRef(0);
+  const isProgrammaticSelectionRef = useRef(false);
 
   const r = pdfToScreen(item, scale);
   const baseFontSizePx = Math.max(8, Math.round(item.fontSize * scale) + fontSizeAdj);
@@ -330,6 +356,43 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
   }, []);
 
+  // Sync initial text value to DOM element on mount or prop change
+  useEffect(() => {
+    if (textareaRef.current && textareaRef.current.value !== textRef.current) {
+      textareaRef.current.value = textRef.current;
+    }
+  }, [initialStr]);
+
+  // Synchronize native textarea selection range with React selection state immediately after DOM updates
+  useLayoutEffect(() => {
+    if (textareaRef.current && isFocused) {
+      try {
+        textareaRef.current.setSelectionRange(selection.start, selection.end);
+      } catch {
+        /* ignore selection range errors when unfocused */
+      }
+    }
+  }, [selection.start, selection.end, text, isFocused]);
+
+  // ── Document-level mousedown: industry-standard "click outside" commit ──────────────
+  // ProseMirror, Fabric.js, Konva.js all use this pattern instead of onBlur.
+  // Reason: clicking the canvas (non-focusable) fires blur with relatedTarget=null,
+  // making it impossible to distinguish a caret reposition from a true exit.
+  // document mousedown (capture phase) fires BEFORE focus changes, giving us
+  // reliable containment checks while keeping the textarea focused.
+  useEffect(() => {
+    const handleDocMouseDown = (e) => {
+      const container = editorContainerRef.current;
+      if (!container) return;
+      // If click is inside any editor element, keep editing
+      if (container.contains(e.target)) return;
+      // Click is outside — commit and exit
+      if (handleCommitRef.current) handleCommitRef.current();
+    };
+    document.addEventListener('mousedown', handleDocMouseDown, true /* capture */);
+    return () => document.removeEventListener('mousedown', handleDocMouseDown, true);
+  }, []); // empty deps: stable via handleCommitRef
+
   // Blinking Caret Timer (500ms cycle)
   useEffect(() => {
     if (!isFocused || selection.start !== selection.end) {
@@ -367,55 +430,11 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    * measures character X offsets, and calculates dual-baseline vertical positions.
    */
   const computeLineLayout = useCallback((ctx) => {
-    const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
     const { charMeta } = parseCharMetadata(text, initialRanges, origLines);
-    const boxWidth = Math.max(1, r.w);
-
+    
     // Font specs
     const baseFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${baseFontSizePx}px ${currentFontFamily}`;
     const superFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${Math.round(baseFontSizePx * 0.65)}px ${currentFontFamily}`;
-
-    // Map character index to span info if spans exist
-    const pdfX = item.pdfX ?? (item.bbox ? item.bbox[0] : 0);
-    const charSpanMap = new Array(text.length).fill(null);
-
-    if (spans && spans.length > 0) {
-      let searchPos = 0;
-      for (const span of spans) {
-        const spanTxt = span.text || span.str || '';
-        if (!spanTxt) continue;
-
-        let idx = text.indexOf(spanTxt, searchPos);
-        if (idx === -1) {
-          idx = text.toLowerCase().indexOf(spanTxt.toLowerCase(), searchPos);
-        }
-
-        if (idx !== -1) {
-          const spanBboxX0 = Array.isArray(span.bbox) ? span.bbox[0] : (span.x0 ?? null);
-          const relX = spanBboxX0 != null ? (spanBboxX0 - pdfX) * scale : null;
-          const isSuper = Boolean(
-            (span.flags && (span.flags & 1) !== 0) ||
-            span.is_superscript === true ||
-            span.kind === 'super' ||
-            span.kind === 'sup'
-          );
-
-          for (let k = 0; k < spanTxt.length; k++) {
-            const charIdx = idx + k;
-            if (charIdx < text.length) {
-              charSpanMap[charIdx] = {
-                span,
-                relX,
-                isFirstInSpan: k === 0,
-                isSuper,
-                fontSize: span.size || span.fontSize
-              };
-            }
-          }
-          searchPos = idx + spanTxt.length;
-        }
-      }
-    }
 
     // Measure HTML ascender
     ctx.font = baseFont;
@@ -427,25 +446,31 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       } else if (m.actualBoundingBoxAscent != null && !isNaN(m.actualBoundingBoxAscent)) {
         ascenderPx = m.actualBoundingBoxAscent;
       }
-    } catch (e) {}
+    } catch {
+      // Fall back to default ascender estimate if font metrics unavailable
+    }
 
-    // Calculate line height
-    const estimatedLineHeight = item.lineHeight ? item.lineHeight * scale : baseFontSizePx * 1.2;
-    const targetLineCount = Math.max(1, Math.round(r.h / estimatedLineHeight));
-    const lineHeightPx = (item.isParagraph && r.h > 0) ? (r.h / targetLineCount) : estimatedLineHeight;
-
-    // Hard paragraph line breaks
+    // Hard line breaks matching original PDF line structure (text.split('\n'))
     const rawLinesText = text.split('\n');
     const lines = [];
-    let globalCharOffset = 0;
 
-    for (let pIdx = 0; pIdx < rawLinesText.length; pIdx++) {
-      const pText = rawLinesText[pIdx];
+    // Calculate line height using ACTUAL PDF-derived line height.
+    const pdfLineHeight = item.lineHeight
+      ? item.lineHeight * scale
+      : (r.h > 0 && origLines && origLines.length > 0)
+        ? r.h / origLines.length
+        : baseFontSizePx * 1.2;
+    const lineHeightPx = pdfLineHeight;
+
+    let globalCharOffset = 0;
+    let overflowUnitsFromPrevLine = [];
+
+    for (let pIdx = 0; pIdx < rawLinesText.length || overflowUnitsFromPrevLine.length > 0; pIdx++) {
+      const pText = pIdx < rawLinesText.length ? rawLinesText[pIdx] : '';
       const pMeta = charMeta.slice(globalCharOffset, globalCharOffset + pText.length);
 
-      // Tokenize paragraph into words / whitespace / superscripts
-      // Atomic Citation Unit: A word + immediately following superscript chars are bound together
-      const units = [];
+      // Extract current line units from pMeta
+      const lineUnits = [];
       let currentUnitChars = [];
 
       for (let i = 0; i < pMeta.length; i++) {
@@ -458,19 +483,16 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         const currIsCJK = isCJKChar(cm.origChar);
         const nextIsCJK = !isLastInP && isCJKChar(pMeta[i + 1].origChar);
 
-        // Break unit if at end of paragraph, whitespace, next char is whitespace, or CJK boundary
         if (isLastInP || currIsSpace || nextIsSpace || currIsCJK || nextIsCJK) {
-          // If current char is NOT a space, and next char is super, keep super bound to anchor word/character
           if (!currIsSpace && !isLastInP && pMeta[i + 1].kind === 'super') {
             continue;
           }
-          // Compute unit width
           let unitWidth = 0;
           for (const ucm of currentUnitChars) {
             ctx.font = (ucm.kind === 'super' || ucm.kind === 'sub') ? superFont : baseFont;
             unitWidth += ctx.measureText(ucm.displayChar).width;
           }
-          units.push({ chars: currentUnitChars, width: unitWidth });
+          lineUnits.push({ chars: currentUnitChars, width: unitWidth });
           currentUnitChars = [];
         }
       }
@@ -481,64 +503,110 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           ctx.font = (ucm.kind === 'super' || ucm.kind === 'sub') ? superFont : baseFont;
           unitWidth += ctx.measureText(ucm.displayChar).width;
         }
-        units.push({ chars: currentUnitChars, width: unitWidth });
+        lineUnits.push({ chars: currentUnitChars, width: unitWidth });
       }
 
-      // ── Per-pIdx PyMuPDF line bounds ──────────────────────────────────────────
-      // Compute bounds ONCE for this paragraph block (pIdx). With \n separators,
-      // pIdx maps 1:1 to origLines[pIdx]. ALL canvas lines produced within this
-      // pIdx block use pStartX and pTargetWidth from this origLine, guaranteeing
-      // that the correct PyMuPDF coordinates drive both wrapping and justification.
-      const isLastPdfLine = pIdx === rawLinesText.length - 1;
-      const pOrigLine = (origLines && Array.isArray(origLines) && origLines[pIdx]) ? origLines[pIdx] : null;
-      const { line_x0: pLX0, line_x1: pLX1 } = getOrigLineBounds(pOrigLine, pIdx);
-      const pLineTargetW = Math.max(1, (pLX1 - pLX0) * scale);
-      const pStartX = (pLX0 - item.pdfX) * scale;
+      // Combine overflow units from previous line with current line units
+      const allUnitsForLine = [...overflowUnitsFromPrevLine, ...lineUnits];
+      overflowUnitsFromPrevLine = [];
 
-      // Line wrapping algorithm
+      const pOrigLine = (origLines && Array.isArray(origLines) && origLines[pIdx]) ? origLines[pIdx] : null;
+      const { line_x0, line_x1 } = getOrigLineBounds(pOrigLine, pIdx);
+      const pLineTargetW = Math.max(1, (line_x1 - line_x0) * scale);
+      const pStartX = (line_x0 - item.pdfX) * scale;
+
       let currentLineUnits = [];
       let currentLineWidth = 0;
-      let lineCharStart = globalCharOffset;
 
-      const pushLine = (lineUnits, isLastCanvasLineOfBlock = false) => {
-        const lineChars = lineUnits.flatMap(u => u.chars);
+      const pushLine = (unitsToPush, isLastCanvasLineOfBlock = false) => {
+        const lineChars = unitsToPush.flatMap(u => u.chars);
         const lineStr = lineChars.map(c => c.origChar).join('');
-        const lineIndex = lines.length;
+        const lineIdx = lines.length;
 
-        // All canvas lines within this pIdx block share the same startX and targetWidth
-        // derived from origLines[pIdx] — the authoritative PyMuPDF coordinate.
-        const startX = pStartX;
-        const targetWidth = pLineTargetW;
+        const isLastLineOfParagraph = (pIdx >= rawLinesText.length - 1) && isLastCanvasLineOfBlock;
 
-        // Justify all canvas lines EXCEPT the very last line of the entire paragraph
-        // (isLastPdfLine && isLastCanvasLineOfBlock). Intermediate PDF lines are always
-        // justified — even if they are the last canvas line of their \n-block.
-        const isLastLineOfParagraph = isLastPdfLine && isLastCanvasLineOfBlock;
-
-        // ── Direct PyMuPDF char coordinate approach ─────────────────────────────
-        // When pOrigLine.chars is available and the non-space character count matches
-        // lineChars, we use PyMuPDF's exact x0/x1 per-character coordinates directly.
-        // This gives pixel-perfect positioning matching the PDF for all lines,
-        // including the last line where browser font metrics would otherwise cause
-        // the text to fall short of the right edge (superscripts, last words, etc.).
         const pdfChars = pOrigLine?.chars || [];
-        // PyMuPDF includes space glyphs in some lines (e.g. between citation spans
-        // like "³³ ³⁵ ³⁶"). Filter them out so the count comparison matches
-        // nonSpaceCount, otherwise usePdfCoords would incorrectly be false for
-        // those lines and fall back to browser measurement (which is too narrow).
         const pdfNonSpaceChars = pdfChars.filter(ch => {
           const c = ch.c ?? ch.char ?? '';
           return c !== ' ' && c !== '\u00A0' && c.length > 0;
         });
-        const nonSpaceCount = lineChars.filter(
-          cm => cm.origChar !== ' ' && cm.origChar !== '\u00A0'
-        ).length;
-        const usePdfCoords = pdfNonSpaceChars.length > 0 && pdfNonSpaceChars.length === nonSpaceCount;
 
-        // Build extraPerSpace only when NOT using direct PDF coordinates.
-        // When usePdfCoords=true, justification is already encoded in the char x0 positions.
+        // Match leading non-space characters in lineChars against pdfNonSpaceChars
+        const lineNonSpaceChars = lineChars.filter(
+          cm => cm.origChar !== ' ' && cm.origChar !== '\u00A0'
+        );
+
+        // Word-boundary prefix matching: stop matching at the first edited word
+        const lineWords = [];
+        let curLineWord = '';
+        for (const cm of lineChars) {
+          const c = cm.origChar;
+          if (c === ' ' || c === '\u00A0') {
+            if (curLineWord.length > 0) {
+              lineWords.push(curLineWord);
+              curLineWord = '';
+            }
+          } else {
+            curLineWord += c;
+          }
+        }
+        if (curLineWord.length > 0) lineWords.push(curLineWord);
+
+        const pdfWords = [];
+        const pdfWordCharCounts = [];
+        let curPdfWord = '';
+        let curPdfCharCount = 0;
+
+        for (const ch of pdfChars) {
+          const c = ch.c ?? ch.char ?? '';
+          if (c === ' ' || c === '\u00A0' || c.length === 0) {
+            if (curPdfWord.length > 0) {
+              pdfWords.push(curPdfWord);
+              pdfWordCharCounts.push(curPdfCharCount);
+              curPdfWord = '';
+              curPdfCharCount = 0;
+            }
+          } else {
+            curPdfWord += c;
+            curPdfCharCount++;
+          }
+        }
+        if (curPdfWord.length > 0) {
+          pdfWords.push(curPdfWord);
+          pdfWordCharCounts.push(curPdfCharCount);
+        }
+
+        let prefixMatchCount = 0;
+        for (let w = 0; w < lineWords.length && w < pdfWords.length; w++) {
+          if (lineWords[w] === pdfWords[w]) {
+            prefixMatchCount += pdfWordCharCounts[w];
+          } else {
+            break;
+          }
+        }
+
+        // Match trailing non-space characters (suffix) to preserve original PDF trailing kerning shifted by deltaX
+        let suffixMatchCount = 0;
+        while (
+          suffixMatchCount < (pdfNonSpaceChars.length - prefixMatchCount) &&
+          suffixMatchCount < (lineNonSpaceChars.length - prefixMatchCount)
+        ) {
+          const pdfIdx = pdfNonSpaceChars.length - 1 - suffixMatchCount;
+          const lineIdx2 = lineNonSpaceChars.length - 1 - suffixMatchCount;
+          const pdfChar = pdfNonSpaceChars[pdfIdx]?.c ?? pdfNonSpaceChars[pdfIdx]?.char ?? '';
+          const lineChar = lineNonSpaceChars[lineIdx2]?.origChar ?? '';
+          if (pdfChar === lineChar && pdfChar.length > 0) {
+            suffixMatchCount++;
+          } else {
+            break;
+          }
+        }
+
+        const isPurePrefixOrUnedited = (prefixMatchCount === pdfNonSpaceChars.length);
+        const usePdfCoords = pdfNonSpaceChars.length > 0 && isPurePrefixOrUnedited;
+
         const shouldJustify = (item.align === 'justify' || item.isJustified ||
-          (item.isParagraph && blockAlign === 'justify'));
+          (item.isParagraph && blockAlign === 'justify') || (origLines && origLines.length > 1));
         const spaceCount = lineChars.filter(cm => cm.origChar === ' ' || cm.origChar === '\u00A0').length;
 
         let extraPerSpace = 0;
@@ -548,115 +616,184 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             ctx.font = (cm.kind === 'super' || cm.kind === 'sub') ? superFont : baseFont;
             rawLineWidth += ctx.measureText(cm.displayChar).width;
           }
-          const deficit = targetWidth - rawLineWidth;
+          const deficit = pLineTargetW - rawLineWidth;
           if (deficit > 0) extraPerSpace = deficit / spaceCount;
         }
 
-        // ── Build charXPositions ─────────────────────────────────────────────────
-        // charXPositions[i] = canvas X of the start of char i
-        // charXPositions[N] = canvas X after the last char
         const charXPositions = [];
-        let accumX = startX;
+        let accumX = pStartX;
         let pdfCharIdx = 0;
+
+        // Zero-Snap Architecture:
+        // deltaXShift is computed lazily on the FIRST suffix char we encounter.
+        // At that point, accumX already holds the correct canvas X after the
+        // edited word AND its trailing space (via fallback branch). We simply
+        // compare that to the PDF x0 of the first suffix char to get the exact shift.
+        let deltaXShift = 0;
+        let deltaXShiftComputed = false;
+        const firstSuffixPdfIdx = suffixMatchCount > 0
+          ? pdfNonSpaceChars.length - suffixMatchCount
+          : -1;
+
+        const suffixStartNonSpaceIdx = lineNonSpaceChars.length - suffixMatchCount;
+        let nonSpaceCounter = 0;
 
         for (let i = 0; i < lineChars.length; i++) {
           const cm = lineChars[i];
           const isSpace = cm.origChar === ' ' || cm.origChar === '\u00A0';
           const isSuper = cm.kind === 'super' || cm.kind === 'sub';
 
-          if (usePdfCoords && !isSpace && pdfCharIdx < pdfNonSpaceChars.length) {
-            // ── Direct PDF coordinate path ───────────────────────────────────────
+          if (!isSpace && pdfCharIdx < prefixMatchCount) {
+            // ── PREFIX REGION: exact PDF coordinates, zero movement ──
             const pdfCh = pdfNonSpaceChars[pdfCharIdx];
             const pdfX0 = (pdfCh.x0 - item.pdfX) * scale;
             const pdfX1 = (pdfCh.x1 - item.pdfX) * scale;
-            charXPositions.push(pdfX0);  // exact PDF start position
-            accumX = pdfX1;              // advance to PDF end position
+            charXPositions.push(pdfX0);
+            accumX = pdfX1;
             pdfCharIdx++;
+          } else if (isSpace && pdfCharIdx > 0 && pdfCharIdx < prefixMatchCount) {
+            // ── PREFIX SPACE: advance accumX to next PDF word's x0 ──
+            const nextPdfCh = pdfNonSpaceChars[pdfCharIdx];
+            const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) * scale;
+            charXPositions.push(accumX);
+            accumX = nextPdfX0;
+          } else if (!isSpace && nonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
+            // ── SUFFIX REGION: PDF x0 + ΔX ──
+            // Compute ΔX lazily on first suffix char: accumX already includes
+            // the space between the edited word and this suffix word.
+            if (!deltaXShiftComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
+              const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX) * scale;
+              deltaXShift = accumX - firstSuffixPdfX0;
+              deltaXShiftComputed = true;
+            }
+            const suffixPdfIdx = pdfNonSpaceChars.length - (lineNonSpaceChars.length - nonSpaceCounter);
+            if (suffixPdfIdx >= 0 && suffixPdfIdx < pdfNonSpaceChars.length) {
+              const pdfCh = pdfNonSpaceChars[suffixPdfIdx];
+              const shiftedX0 = (pdfCh.x0 - item.pdfX) * scale + deltaXShift;
+              const shiftedX1 = (pdfCh.x1 - item.pdfX) * scale + deltaXShift;
+              charXPositions.push(shiftedX0);
+              accumX = shiftedX1;
+            } else {
+              charXPositions.push(accumX);
+              ctx.font = isSuper ? superFont : baseFont;
+              accumX += ctx.measureText(cm.displayChar).width;
+            }
           } else {
-            // ── Fallback: browser measurement path ───────────────────────────────
-            // Used for space chars, edited text, or when PDF coords aren't available.
-            // For the first char of a line, anchor to startX.
-            if (i === 0) accumX = startX;
+            // ── MIDDLE / EDITED WORD / SPACES / FALLBACK: canvas-measured accumulation ──
+            if (i === 0) accumX = pStartX;
             charXPositions.push(accumX);
             ctx.font = isSuper ? superFont : baseFont;
             let w = ctx.measureText(cm.displayChar).width;
             if (isSpace && extraPerSpace > 0) w += extraPerSpace;
             accumX += w;
           }
-        }
-        charXPositions.push(accumX); // position after last char
 
-        const yTop = lineIndex * lineHeightPx;
+          if (!isSpace) nonSpaceCounter++;
+        }
+        charXPositions.push(accumX);
+
+        const yTop = lineIdx * lineHeightPx;
         const yBaseline = yTop + ascenderPx;
 
         lines.push({
-          lineIndex,
+          lineIndex: lineIdx,
           text: lineStr,
           chars: lineChars,
-          charStartOffset: lineCharStart,
-          charEndOffset: lineCharStart + lineChars.length,
+          charStartOffset: lineChars[0]?.charIndex ?? 0,
+          charEndOffset: (lineChars[lineChars.length - 1]?.charIndex ?? 0) + 1,
           charXPositions,
-          startX,
-          targetWidth,
+          startX: pStartX,
+          targetWidth: pLineTargetW,
           extraPerSpace,
-          width: accumX - startX,
+          width: accumX - pStartX,
           yTop,
           yBaseline,
           lineHeightPx
         });
-
-        lineCharStart += lineChars.length;
       };
 
-      for (const unit of units) {
-        if (!item.isParagraph) {
-          // Single line item does not wrap
+      for (let uIdx = 0; uIdx < allUnitsForLine.length; uIdx++) {
+        const unit = allUnitsForLine[uIdx];
+        const isFirstInLine = currentLineUnits.length === 0;
+
+        if (currentLineWidth + unit.width <= pLineTargetW || isFirstInLine) {
           currentLineUnits.push(unit);
           currentLineWidth += unit.width;
         } else {
-          // Paragraph item wraps at pIdx's PyMuPDF line width
-          if (currentLineWidth + unit.width <= pLineTargetW) {
-            currentLineUnits.push(unit);
-            currentLineWidth += unit.width;
-          } else if (unit.width <= pLineTargetW) {
-            if (currentLineUnits.length > 0) {
-              pushLine(currentLineUnits, false);
-            }
-            currentLineUnits = [unit];
-            currentLineWidth = unit.width;
-          } else {
-            // Unit exceeds line target width: split token across character boundaries
-            for (const cm of unit.chars) {
-              ctx.font = (cm.kind === 'super' || cm.kind === 'sub') ? superFont : baseFont;
-              const charW = ctx.measureText(cm.displayChar).width;
-
-              if (currentLineWidth + charW <= pLineTargetW || currentLineUnits.length === 0) {
-                currentLineUnits.push({ chars: [cm], width: charW });
-                currentLineWidth += charW;
-              } else {
-                pushLine(currentLineUnits, false);
-                currentLineUnits = [{ chars: [cm], width: charW }];
-                currentLineWidth = charW;
-              }
-            }
-          }
+          // Unit exceeds target width of current line — push remaining units to overflow for next line!
+          overflowUnitsFromPrevLine = allUnitsForLine.slice(uIdx);
+          break;
         }
       }
 
-      if (currentLineUnits.length > 0 || units.length === 0) {
-        // isLastCanvasLineOfBlock = true; justification skipped only for the last PDF line
-        pushLine(currentLineUnits, true);
+      if (currentLineUnits.length > 0 || allUnitsForLine.length === 0) {
+        pushLine(currentLineUnits, overflowUnitsFromPrevLine.length === 0);
       }
 
-      // Account for the '\n' character itself between paragraph blocks
-      globalCharOffset += pText.length;
-      if (pIdx < rawLinesText.length - 1) {
-        globalCharOffset += 1;
+      if (pIdx < rawLinesText.length) {
+        globalCharOffset += pText.length + 1; // +1 for \n
       }
     }
 
-    return { lines, baseFont, superFont, ascenderPx, lineHeightPx };
-  }, [text, initialRanges, r.w, r.h, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, item, spans, blockAlign, getOrigLineBounds]);
+    // ── Build 100% Strict Global Spatial Character Map (Array length MUST = text.length + 1) ──
+    const globalCharMap = new Array(text.length + 1);
+    let globalStrIndex = 0;
+
+    lines.forEach((lineObj, lineIdx) => {
+      const lineChars = lineObj.chars || [];
+      const charXPositions = lineObj.charXPositions || [];
+
+      // Map each character in the current line
+      lineChars.forEach((cm, localIdx) => {
+        if (globalStrIndex < text.length) {
+          const xPos = charXPositions[localIdx] != null ? charXPositions[localIdx] : lineObj.startX;
+          globalCharMap[globalStrIndex] = {
+            x: xPos,
+            yTop: lineObj.yTop,
+            yBaseline: lineObj.yBaseline,
+            lineHeightPx: lineObj.lineHeightPx,
+            lineIndex: lineIdx
+          };
+          globalStrIndex++;
+        }
+      });
+
+      // Handle line boundary / trailing space / newline index mapping
+      if (globalStrIndex < text.length) {
+        const endX = charXPositions[lineChars.length] != null 
+          ? charXPositions[lineChars.length] 
+          : lineObj.startX + lineObj.width;
+
+        // If text at globalStrIndex is a newline '\n', map its spatial position to end of current line
+        if (text[globalStrIndex] === '\n') {
+          globalCharMap[globalStrIndex] = {
+            x: endX,
+            yTop: lineObj.yTop,
+            yBaseline: lineObj.yBaseline,
+            lineHeightPx: lineObj.lineHeightPx,
+            lineIndex: lineIdx
+          };
+          globalStrIndex++;
+        }
+      }
+    });
+
+    // Map final cursor position (after last character of text)
+    const lastLine = lines[lines.length - 1];
+    const finalX = (lastLine && lastLine.charXPositions)
+      ? (lastLine.charXPositions[lastLine.chars.length] || lastLine.startX + lastLine.width)
+      : 0;
+
+    globalCharMap[text.length] = {
+      x: finalX,
+      yTop: lastLine ? lastLine.yTop : 0,
+      yBaseline: lastLine ? lastLine.yBaseline : 0,
+      lineHeightPx: lastLine ? lastLine.lineHeightPx : lineHeightPx,
+      lineIndex: lines.length - 1
+    };
+
+    return { lines, baseFont, superFont, ascenderPx, lineHeightPx, globalCharMap };
+  }, [text, initialRanges, origLines, item, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h]);
 
   /**
    * Sequential X-Advance Tracking & Superscript Y-Elevation rendering per line
@@ -690,33 +827,51 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
   }, []);
 
+  const coverageRef = useRef(null);
+
   /**
-   * Main Render Loop
+   * Render Canvas Loop with Dynamic Height Auto-Expansion
    */
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
+    if (!ctx) return;
 
+    // 1. Temporary Layout Pass to determine total required height
+    const initialLayout = computeLineLayout(ctx);
+    const requiredHeightPx = Math.max(r.h, initialLayout.lines.length * initialLayout.lineHeightPx);
+    const deltaH = requiredHeightPx - r.h;
+
+    if (onHeightChange) {
+      onHeightChange(item.pdfY, deltaH);
+    }
+
+    const dpr = window.devicePixelRatio || 1;
     const canvasW = Math.max(1, Math.round(r.w * dpr));
-    const canvasH = Math.max(1, Math.round(r.h * dpr));
+    const canvasH = Math.max(1, Math.round(requiredHeightPx * dpr));
+
     canvas.width = canvasW;
     canvas.height = canvasH;
     canvas.style.width = `${r.w}px`;
-    canvas.style.height = `${r.h}px`;
+    canvas.style.height = `${requiredHeightPx}px`;
+
+    if (coverageRef.current) {
+      coverageRef.current.style.height = `${requiredHeightPx}px`;
+    }
 
     ctx.scale(dpr, dpr);
 
-    // 1. Solid White Background Fill
-    ctx.clearRect(0, 0, r.w, r.h);
+    // 2. Clear & Fill Solid White Background Fill
+    ctx.clearRect(0, 0, r.w, requiredHeightPx);
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, r.w, r.h);
+    ctx.fillRect(0, 0, r.w, requiredHeightPx);
 
-    // 2. Compute Layout
+    // 3. Compute Final Layout
     const layout = computeLineLayout(ctx);
+    canvas._layout = layout;
 
-    // 3. Selection Highlight Rectangles (rgba(147, 197, 253, 0.6))
+    // 4. Selection Highlight Rectangles (rgba(147, 197, 253, 0.6))
     if (selection.start !== selection.end) {
       const minSel = Math.min(selection.start, selection.end);
       const maxSel = Math.max(selection.start, selection.end);
@@ -735,35 +890,24 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       }
     }
 
-    // 4. Formatted Line Text & Dual-Baseline Superscripts
+    // 5. Formatted Line Text & Dual-Baseline Superscripts
     for (const line of layout.lines) {
       drawCanvasLine(ctx, line, layout, baseFontSizePx, color);
     }
 
-    // 5. 2px Smooth Blinking Caret Bar
+    // 6. 2px Smooth Blinking Caret Bar via Global Spatial Character Map
     if (isFocused && selection.start === selection.end && caretVisible) {
       const targetOffset = selection.start;
-      let caretLine = layout.lines[0];
+      const caretPos = (layout.globalCharMap && layout.globalCharMap[targetOffset])
+        ? layout.globalCharMap[targetOffset]
+        : (layout.globalCharMap ? layout.globalCharMap[layout.globalCharMap.length - 1] : null);
 
-      for (const line of layout.lines) {
-        if (targetOffset >= line.charStartOffset && targetOffset <= line.charEndOffset) {
-          caretLine = line;
-          break;
-        }
-      }
-
-      if (caretLine) {
-        const localIdx = Math.max(0, Math.min(caretLine.text.length, targetOffset - caretLine.charStartOffset));
-        const caretX = caretLine.charXPositions[localIdx] || 0;
-
+      if (caretPos) {
         ctx.fillStyle = color || '#000000';
-        ctx.fillRect(Math.floor(caretX), caretLine.yTop, 2, caretLine.lineHeightPx);
+        ctx.fillRect(Math.floor(caretPos.x), caretPos.yTop, 2, caretPos.lineHeightPx);
       }
     }
-
-    // Store layout on canvas element for spatial hit testing
-    canvas._layout = layout;
-  }, [r.w, r.h, selection, isFocused, caretVisible, color, baseFontSizePx, computeLineLayout, drawCanvasLine]);
+  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, baseFontSizePx, color, isFocused, caretVisible, item.pdfY, onHeightChange]);
 
   useEffect(() => {
     renderCanvas();
@@ -808,6 +952,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    */
   const handlePointerDown = (e) => {
     e.preventDefault();
+    e.stopPropagation();
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -823,8 +968,18 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     setCaretVisible(true);
 
     if (textareaRef.current) {
-      textareaRef.current.focus();
-      textareaRef.current.setSelectionRange(offset, offset);
+      isProgrammaticSelectionRef.current = true;
+      // setTimeout(0): defer focus() until AFTER the mousedown event cycle.
+      // This is the standard pattern used by ProseMirror/Fabric.js to prevent
+      // the browser from firing blur on the textarea due to the canvas click.
+      setTimeout(() => {
+        if (textareaRef.current) {
+          textareaRef.current.focus();
+          textareaRef.current.setSelectionRange(offset, offset);
+        }
+        // Clear suppression flag after focus has settled
+        setTimeout(() => { isProgrammaticSelectionRef.current = false; }, 100);
+      }, 0);
     }
   };
 
@@ -937,8 +1092,19 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     );
   };
 
+  // Keep handleCommitRef pointing at the latest handleCommit (avoid stale closure in document listener)
+  useEffect(() => { handleCommitRef.current = handleCommit; });
+
   return (
-    <>
+    // Zero-footprint wrapper div: needed so document.mousedown outside-click
+    // detection can use container.contains(e.target) for all editor children.
+    // display:contents makes the div invisible to CSS layout (no positioning
+    // context created), so children remain positioned relative to the Viewer
+    // page container — exactly as they were in the Fragment.
+    <div
+      ref={editorContainerRef}
+      style={{ display: 'contents' }}
+    >
       {/* Floating Toolbar Controls */}
       <div
         style={{
@@ -1046,6 +1212,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       {/* Solid White Coverage Rectangle hiding underlying PDF text */}
       <div
+        ref={coverageRef}
         style={{
           position: 'absolute',
           left: r.x,
@@ -1061,6 +1228,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       {/* HTML5 Canvas Surface */}
       <canvas
         ref={canvasRef}
+        className="canvas-inline-editor"
+        onClick={e => e.stopPropagation()}
+        onMouseDown={e => e.stopPropagation()}
         style={{
           position: 'absolute',
           left: r.x,
@@ -1081,28 +1251,56 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       {/* Hidden Offscreen Textarea Bridge */}
       <textarea
         ref={textareaRef}
-        value={text}
+        defaultValue={textRef.current}
         onChange={e => {
-          setText(e.target.value);
-          setSelection({ start: e.target.selectionStart, end: e.target.selectionEnd });
+          isTypingRef.current = true;
+          const newText = e.target.value;
+          const newStart = e.target.selectionStart;
+          const newEnd = e.target.selectionEnd;
+
+          textRef.current = newText;
+          selectionRef.current = { start: newStart, end: newEnd };
+
+          setText(newText);
+          setSelection({ start: newStart, end: newEnd });
           setCaretVisible(true);
+
+          requestAnimationFrame(() => {
+            isTypingRef.current = false;
+          });
         }}
         onSelect={e => {
-          setSelection({ start: e.target.selectionStart, end: e.target.selectionEnd });
+          if (isTypingRef.current || isProgrammaticSelectionRef.current) return;
+          const newStart = e.target.selectionStart;
+          const newEnd = e.target.selectionEnd;
+
+          selectionRef.current = { start: newStart, end: newEnd };
+
+          setSelection({ start: newStart, end: newEnd });
           setCaretVisible(true);
         }}
         onKeyDown={handleKeyDown}
         onCompositionStart={() => setIsComposing(true)}
         onCompositionEnd={() => setIsComposing(false)}
         onFocus={() => setIsFocused(true)}
-        onBlur={e => {
-          // If blurring outside the editor container, commit edit
+        onBlur={(e) => {
+          // If a programmatic click-to-reposition is in progress, ignore blur entirely.
+          if (isProgrammaticSelectionRef.current) return;
+          // For keyboard-triggered focus loss (Tab, Alt+Tab): relatedTarget is non-null.
+          // Check if focus moved to another editor element (toolbar button etc.).
           const related = e.relatedTarget;
-          const container = canvasRef.current?.parentElement;
-          if (!container || !related || !container.contains(related)) {
+          const container = editorContainerRef.current;
+          if (related && container && container.contains(related)) return;
+          // True focus exit via keyboard — commit.
+          // Mouse-triggered exits are handled by the document mousedown listener above.
+          if (related !== null) {
             setIsFocused(false);
             handleCommit();
           }
+          // related === null means a canvas click triggered this blur.
+          // The document mousedown listener will handle commit if needed.
+          // Just update visual state.
+          setIsFocused(false);
         }}
         autoCapitalize="off"
         autoComplete="off"
@@ -1120,6 +1318,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           pointerEvents: 'none',
         }}
       />
-    </>
+    </div>
   );
 }
