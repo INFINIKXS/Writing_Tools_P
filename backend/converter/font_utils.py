@@ -852,11 +852,12 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
         if pages_to_scan and basefont_name:
             logger.info(f"Attempting Trace CID Recovery for: {basefont_name} (scanning {len(pages_to_scan)} pages)")
             try:
+                _warned_conflicts = set()
                 target_short = basefont_name.split("+")[-1].lower().replace(" ", "").replace("-", "")
                 for pg in pages_to_scan:
                     for span in pg.get_texttrace():
                         span_font = span.get("font", "").split("+")[-1].lower().replace(" ", "").replace("-", "")
-                        if target_short in span_font or span_font in target_short:
+                        if target_short == span_font:
                             chars_list = span.get("chars", [])
                             for idx, ch in enumerate(chars_list):
                                 if len(ch) == 4:
@@ -873,7 +874,10 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                                             if len(next_ch) == 4 and next_ch[1] == -1:
                                                 continue  # skip ligature first-component
                                         if ucp in unicode_to_gid and unicode_to_gid[ucp] != gid:
-                                            logger.warning(f"Conflicting GID for U+{ucp:04X} across pages: {unicode_to_gid[ucp]} vs {gid} — keeping first seen")
+                                            key = (ucp, unicode_to_gid[ucp], gid)
+                                            if key not in _warned_conflicts:
+                                                _warned_conflicts.add(key)
+                                                logger.warning(f"Conflicting GID for U+{ucp:04X} across pages: {unicode_to_gid[ucp]} vs {gid} — keeping first seen")
                                             continue
                                         unicode_to_gid[ucp] = gid
                                     
