@@ -1092,8 +1092,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       if (!isBold) {
         const glyphFontSizePx = (isSuper || isSub) ? fontSizePx * 0.65 : fontSizePx;
         const stemVwRatio = getFontStemVwRatio(currentFontFamily);
-        console.log('[stem-darkening]', currentFontFamily, 'ratio:', stemVwRatio,
-          'font-loaded:', document.fonts.check(`${fontSizePx}px "NewBaskerville-Roman"`));
         const darken = getStemDarkeningPx(glyphFontSizePx, stemVwRatio);
         if (darken > 0) {
           ctx.lineWidth = darken;

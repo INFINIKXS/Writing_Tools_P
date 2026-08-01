@@ -848,31 +848,34 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
         unicode_to_gid = {}
         trace_has_data = False
         
-        # ALWAYS run trace recovery if page is available. It is the only reliable way
-        # to map UCP->GID when ToUnicode is missing or CIDToGIDMap is Identity.
-        if page and basefont_name:
-            logger.info(f"Attempting Trace CID Recovery for: {basefont_name}")
+        pages_to_scan = doc if doc is not None else ([page] if page else [])
+        if pages_to_scan and basefont_name:
+            logger.info(f"Attempting Trace CID Recovery for: {basefont_name} (scanning {len(pages_to_scan)} pages)")
             try:
                 target_short = basefont_name.split("+")[-1].lower().replace(" ", "").replace("-", "")
-                for span in page.get_texttrace():
-                    span_font = span.get("font", "").split("+")[-1].lower().replace(" ", "").replace("-", "")
-                    if target_short in span_font or span_font in target_short:
-                        chars_list = span.get("chars", [])
-                        for idx, ch in enumerate(chars_list):
-                            if len(ch) == 4:
-                                ucp, gid, _, _ = ch
-                                if ucp > 0 and gid > 0 and ucp != 0xFFFD:
-                                    # Skip ligature first-components: if the NEXT char
-                                    # has gid == -1, that means THIS char is the first
-                                    # component of a ligature (e.g. 'f' in 'fi').
-                                    # The gid we'd record is the ligature glyph's GID,
-                                    # which has a double-width advance — wrong for
-                                    # standalone 'f'. Skip it.
-                                    if idx + 1 < len(chars_list):
-                                        next_ch = chars_list[idx + 1]
-                                        if len(next_ch) == 4 and next_ch[1] == -1:
-                                            continue  # skip ligature first-component
-                                    unicode_to_gid[ucp] = gid
+                for pg in pages_to_scan:
+                    for span in pg.get_texttrace():
+                        span_font = span.get("font", "").split("+")[-1].lower().replace(" ", "").replace("-", "")
+                        if target_short in span_font or span_font in target_short:
+                            chars_list = span.get("chars", [])
+                            for idx, ch in enumerate(chars_list):
+                                if len(ch) == 4:
+                                    ucp, gid, _, _ = ch
+                                    if ucp > 0 and gid > 0 and ucp != 0xFFFD:
+                                        # Skip ligature first-components: if the NEXT char
+                                        # has gid == -1, that means THIS char is the first
+                                        # component of a ligature (e.g. 'f' in 'fi').
+                                        # The gid we'd record is the ligature glyph's GID,
+                                        # which has a double-width advance — wrong for
+                                        # standalone 'f'. Skip it.
+                                        if idx + 1 < len(chars_list):
+                                            next_ch = chars_list[idx + 1]
+                                            if len(next_ch) == 4 and next_ch[1] == -1:
+                                                continue  # skip ligature first-component
+                                        if ucp in unicode_to_gid and unicode_to_gid[ucp] != gid:
+                                            logger.warning(f"Conflicting GID for U+{ucp:04X} across pages: {unicode_to_gid[ucp]} vs {gid} — keeping first seen")
+                                            continue
+                                        unicode_to_gid[ucp] = gid
                                     
                 trace_has_data = len(unicode_to_gid) > 0
                 logger.info(f"Trace extracted {len(unicode_to_gid)} unique (UCP -> GID) pairs.")
@@ -908,7 +911,14 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
             elif ucp in font_cmap_gids:
                 gid = font_cmap_gids[ucp]
             else:
-                gid = cid  # true last resort identity fallback
+                # No reliable source (explicit CIDToGIDMap, trace recovery, or the
+                # font's own existing cmap) covers this character. Glyph index has no
+                # guaranteed relationship to character code in a subsetted font, so
+                # guessing gid = cid risks a WRONG-BUT-VALID glyph (e.g. '%' silently
+                # rendering as 'J') rather than a visibly-missing one. Leave unmapped —
+                # better to show a visible .notdef box than a confident wrong letter.
+                logger.warning(f"No reliable GID for U+{ucp:04X} ({uchar!r}) — leaving unmapped rather than guessing.")
+                continue
             if 0 < gid < n_glyphs:
                 unicode_to_glyph[ucp] = glyph_order[gid]
                 
@@ -946,7 +956,10 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
 
         # BUG 4 FIX: Diagnostic logging for commonly-broken codepoints
         logger.info(f"Generated unicode_to_glyph with {len(unicode_to_glyph)} entries")
-        _SUSPECT_CHARS = {'f': 0x66, 'l': 0x6C, 'k': 0x6B, 'i': 0x69, ' ': 0x20}
+        _SUSPECT_CHARS = {
+            'f': 0x66, 'l': 0x6C, 'k': 0x6B, 'i': 0x69, ' ': 0x20,
+            '9': 0x39, '%': 0x25
+        }
         for label, ucp in _SUSPECT_CHARS.items():
             if ucp in unicode_to_glyph:
                 logger.info(f"  DIAG: U+{ucp:04X} '{label}' → glyph '{unicode_to_glyph[ucp]}'")
