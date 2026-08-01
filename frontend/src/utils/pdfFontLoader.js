@@ -10,13 +10,36 @@
 
 const installedStyleElements = new Set();
 const loadedFontNames = new Set();
+const fontStemRatios = new Map();
+
+/**
+ * Retrieve stem_vw_ratio (StdVW / units_per_em) for a given font family name or font stack string.
+ */
+export function getFontStemVwRatio(fontFamilyName) {
+  if (!fontFamilyName) return null;
+  const names = fontFamilyName.split(',').map(s => s.trim().replace(/^["']|["']$/g, ''));
+  for (const name of names) {
+    if (fontStemRatios.has(name)) return fontStemRatios.get(name);
+    const stripped = name.replace(/^[A-Z]{6}\+/, '');
+    if (fontStemRatios.has(stripped)) return fontStemRatios.get(stripped);
+    const sanitized = name.replace(/\s*-\s*/g, '-');
+    if (fontStemRatios.has(sanitized)) return fontStemRatios.get(sanitized);
+  }
+  return null;
+}
 
 export async function loadPDFFonts(fontsData) {
-  // fontsData shape: { "NBUDXT+MetaProLight-Regular": { data, format, postscript_name, subset_tag } }
+  // fontsData shape: { "NBUDXT+MetaProLight-Regular": { data, format, postscript_name, subset_tag, stem_vw_ratio } }
   
   for (const [basename, meta] of Object.entries(fontsData)) {
     const psName = meta.postscript_name || basename;
     
+    // Track stem_vw_ratio if present
+    if (meta.stem_vw_ratio != null && typeof meta.stem_vw_ratio === 'number') {
+      fontStemRatios.set(psName, meta.stem_vw_ratio);
+      fontStemRatios.set(basename, meta.stem_vw_ratio);
+    }
+
     // Skip if already loaded (can happen with multi-page PDFs referencing same font)
     if (loadedFontNames.has(psName)) continue;
     loadedFontNames.add(psName);
@@ -33,6 +56,12 @@ export async function loadPDFFonts(fontsData) {
     const familyNames = [psName];
     if (basename !== psName) familyNames.push(basename);
     
+    for (const familyName of familyNames) {
+      if (meta.stem_vw_ratio != null && typeof meta.stem_vw_ratio === 'number') {
+        fontStemRatios.set(familyName, meta.stem_vw_ratio);
+      }
+    }
+
     // Use the FontFace API for reliable async loading & readiness detection.
     const src = `url(data:font/${meta.format};base64,${meta.data}) format('${mimeFormat}')`;
     
@@ -42,7 +71,7 @@ export async function loadPDFFonts(fontsData) {
         const loaded = await fontFace.load();
         document.fonts.add(loaded);
       }
-      console.log(`[pdfFontLoader] Loaded font: ${psName}`);
+      console.log(`[pdfFontLoader] Loaded font: ${psName} (stem_vw_ratio: ${meta.stem_vw_ratio ?? 'none'})`);
     } catch (e) {
       console.warn(`[pdfFontLoader] Failed to load ${psName}:`, e);
     }
@@ -56,7 +85,5 @@ export function unloadPDFFonts() {
   }
   installedStyleElements.clear();
   loadedFontNames.clear();
-  // Note: document.fonts entries added via .add() remain. Calling
-  // document.fonts.delete(fontFace) would require tracking each FontFace.
-  // In practice, loading a new PDF's fonts overwrites by family name.
+  fontStemRatios.clear();
 }

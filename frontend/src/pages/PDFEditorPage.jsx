@@ -4,6 +4,7 @@ import RightPanel from '../components/PDFEditor/RightPanel';
 import PDFViewer from '../components/PDFEditor/Viewer';
 import { applyTextAnnotations } from '../utils/pdfModifier';
 import { pdfEditStore, activeFileId } from '../stores/pdfEditStore';
+import { pdfTypographyStore } from '../stores/pdfTypographyStore';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────────
 class PDFErrorBoundary extends React.Component {
@@ -107,7 +108,11 @@ export default function PDFEditorPage({ initialToolId = null }) {
       const fd = new FormData();
       fd.append('file', file, 'document.pdf');
       const res = await fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', { method: 'POST', body: fd });
-      if (res.ok) { const payload = await res.json(); setSpacingData(payload); }
+      if (res.ok) {
+        const payload = await res.json();
+        setSpacingData(payload);
+        pdfTypographyStore.setTypographyData(activeFileId, payload);
+      }
     } catch (e) { console.error('extract-spacing error:', e); }
   };
 
@@ -146,17 +151,22 @@ export default function PDFEditorPage({ initialToolId = null }) {
       objectUrlRef.current = newUrl;
       pdfEditStore.clear(activeFileId);
       setSpacingData(null);
+      pdfTypographyStore.setTypographyData(activeFileId, null);
       try {
         const spacingFd = new FormData();
         spacingFd.append('file', blob, 'document.pdf');
         const spacingRes = await fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', { method: 'POST', body: spacingFd });
-        if (spacingRes.ok) { const payload = await spacingRes.json(); setSpacingData(payload); }
+        if (spacingRes.ok) {
+          const payload = await spacingRes.json();
+          setSpacingData(payload);
+          pdfTypographyStore.setTypographyData(activeFileId, payload);
+        }
       } catch (e) { console.error('Failed to re-extract spacing after bake:', e); }
       setCurrentFile(newUrl);
       setFileBytes(bakedBytes);
       setLivePreviewUrl(null);
     } catch (err) { console.error('Live preview error:', err); } finally { setIsLiveBaking(false); }
-  }, [currentFile, fileBytes]);
+  }, [currentFile]);
 
   const handleAddText = () => {
     const newId = Date.now().toString() + Math.random().toString().slice(2, 6);
@@ -166,7 +176,7 @@ export default function PDFEditorPage({ initialToolId = null }) {
     }]);
   };
 
-  const handleAddRedaction = () => {
+  const _handleAddRedaction = () => {
     const newId = Date.now().toString() + Math.random().toString().slice(2, 6);
     setAnnotations(prev => [...prev, { id: newId, type: 'redact', x: 50, y: 100, width: 150, height: 24, pageIndex: 0 }]);
   };

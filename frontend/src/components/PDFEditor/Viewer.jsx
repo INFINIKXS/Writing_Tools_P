@@ -7,6 +7,7 @@ import { CanvasInlineEditor } from './CanvasInlineEditor';
 import { DebugOverlay } from './DebugOverlay';
 import { useSyncExternalStore } from 'react';
 import { pdfEditStore, activeFileId } from '../../stores/pdfEditStore';
+import { pdfTypographyStore } from '../../stores/pdfTypographyStore';
 import { loadPDFFonts } from '../../utils/pdfFontLoader';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -263,6 +264,7 @@ export default function PDFViewer({
 
   // Developer Debug Mode (Ctrl+Shift+D)
   const [debugMode, setDebugMode] = useState(false);
+  const [debugFontWeightCompare, setDebugFontWeightCompare] = useState(false);
   // Dynamic block vertical cascade shift state
   const [activeBlockShift, setActiveBlockShift] = useState(null);
 
@@ -806,6 +808,12 @@ export default function PDFViewer({
             const firstLineIndent = (sgLines[0].line_x0 ?? sgLines[0].pdfX) - pX0;
             const textIndentPdf = firstLineIndent > 1.0 ? firstLineIndent : 0;
 
+            const pFontFamily = blockData.font_family || sgLines[0].fontName || 'Helvetica';
+            const pFontSize = blockData.font_size || dominantFontSize;
+            const pColor = blockData.hex_color || blockData.font_color || dominantColor;
+            const pAlign = blockData.align || 'left';
+            const pId = blockData.paragraph_id || `p_${index}_${blockData.block_number || paragraphItems.length}`;
+
             paragraphItems.push({
               str: pStr,
               lines: sgLines.map(l => ({ text: l.str, width: l.pdfW })),
@@ -821,19 +829,54 @@ export default function PDFViewer({
               isBold: sgLines[0].isBold,
               isItalic: sgLines[0].isItalic,
               isParagraph: true,
-              align: blockData.align || 'left',
+              align: pAlign,
               lineCount: sgLines.length,
               lineHeight: linePitch,
               textIndent: textIndentPdf,
               hasSuperscript: pSuperscriptRanges.length > 0,
               superscriptRanges: pSuperscriptRanges,
               origLines: sgLines,
+              paragraph_id: pId,
+              paragraph_font_size: pFontSize,
+              paragraph_font_family: pFontFamily,
+              paragraph_color: pColor,
+              paragraph_align: pAlign,
+              paragraph_text: pStr,
+              paragraphTypography: {
+                font_size: pFontSize,
+                font_family: pFontFamily,
+                color: pColor,
+                align: pAlign,
+                paragraph_id: pId,
+                text: pStr,
+              },
             });
           });
         } else if (blockLines.length === 1) {
+          const l0 = blockLines[0];
+          const pFontFamily = blockData.font_family || l0.fontName || 'Helvetica';
+          const pFontSize = blockData.font_size || l0.fontSize;
+          const pColor = blockData.hex_color || blockData.font_color || l0.color;
+          const pAlign = blockData.align || 'left';
+          const pId = blockData.paragraph_id || `p_${index}_${blockData.block_number || paragraphItems.length}`;
+
           paragraphItems.push({
-            ...blockLines[0],
+            ...l0,
             origLines: blockLines,
+            paragraph_id: pId,
+            paragraph_font_size: pFontSize,
+            paragraph_font_family: pFontFamily,
+            paragraph_color: pColor,
+            paragraph_align: pAlign,
+            paragraph_text: l0.str || l0.text || '',
+            paragraphTypography: {
+              font_size: pFontSize,
+              font_family: pFontFamily,
+              color: pColor,
+              align: pAlign,
+              paragraph_id: pId,
+              text: l0.str || l0.text || '',
+            },
           });
         }
       });
@@ -853,6 +896,7 @@ export default function PDFViewer({
   }, [spacingData, pageMetadata]);
 
   const edits = useSyncExternalStore(pdfEditStore.subscribe, () => pdfEditStore.getEdits(activeFileId));
+  const _typographyData = useSyncExternalStore(pdfTypographyStore.subscribe, () => pdfTypographyStore.getTypographyData(activeFileId));
 
   // ─── Color sampling + span width measurement useEffect ────────────────────
   // This runs AFTER render, so the canvas and text layer spans are guaranteed
@@ -868,15 +912,9 @@ export default function PDFViewer({
       if (!canvas) return;
 
       let ctx = null;
-      try { ctx = canvas.getContext('2d', { willReadFrequently: true }); } catch (e) { }
+      try { ctx = canvas.getContext('2d', { willReadFrequently: true }); } catch { /* ignore */ }
       if (!ctx) return;
 
-      const canvasW = canvas.width;
-      const canvasH = canvas.height;
-      const displayW = canvas.clientWidth || 1;
-      const displayH = canvas.clientHeight || 1;
-      const pixelRatioX = canvasW / displayW;
-      const pixelRatioY = canvasH / displayH;
       const currentScale = scale;
 
       // Collect pdfjs text spans from the DOM text layer
@@ -1254,6 +1292,7 @@ export default function PDFViewer({
                     items={pageMetadata[index + 1].items}
                     scale={scale}
                     selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
+                    debugFontWeightCompare={debugFontWeightCompare}
                   />
                 )}
 
@@ -1484,12 +1523,17 @@ export default function PDFViewer({
             <span>🛠️</span> Debugger Active
           </span>
           <span className="text-gray-600">|</span>
-          <span className="flex items-center gap-1.5 text-red-400">
-            <span className="w-3 h-0.5 bg-red-500 inline-block rounded-full" /> Red: PyMuPDF Baseline
-          </span>
-          <span className="flex items-center gap-1.5 text-blue-400">
-            <span className="w-3 h-0.5 border-t border-dashed border-blue-400 inline-block" /> Blue: DOM Baseline
-          </span>
+          <button
+            onClick={() => setDebugFontWeightCompare(prev => !prev)}
+            className={`px-3 py-1 rounded-lg text-xs font-bold transition-all shadow-md flex items-center gap-1.5 ${
+              debugFontWeightCompare
+                ? 'bg-purple-600 hover:bg-purple-500 text-white ring-2 ring-purple-400'
+                : 'bg-purple-950/90 hover:bg-purple-900 text-purple-300 border border-purple-700/70'
+            }`}
+          >
+            <span>{debugFontWeightCompare ? '⚡' : '🔍'}</span>
+            <span>{debugFontWeightCompare ? 'DOM Font A/B Active' : 'Enable DOM vs Canvas A/B'}</span>
+          </button>
           <span className="text-gray-600">|</span>
           <span className="font-mono text-gray-300 bg-gray-800 px-1.5 py-0.5 rounded text-[11px]">Ctrl+Shift+D</span>
           <button

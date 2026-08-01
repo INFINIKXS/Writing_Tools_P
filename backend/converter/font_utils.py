@@ -192,6 +192,32 @@ def _synthesize_required_otf_tables(otf: TTFont, cff_reader):
     hmtx.metrics = metrics
     otf['hmtx'] = hmtx
 
+
+def _ensure_browser_required_tables(tt: TTFont):
+    """
+    PDF-embedded font subsets (especially raw TrueType, which skips the
+    CFF->OTF wrapping path entirely) often omit tables that PDF rendering
+    doesn't need but browser font sanitizers require. Patch in minimal
+    versions of anything missing, idempotently — safe to call on any font.
+    """
+    from fontTools.ttLib import newTable
+
+    if 'post' not in tt:
+        post = newTable('post')
+        post.formatType = 3.0  # no glyph names stored — valid & minimal
+        post.italicAngle = 0
+        post.underlinePosition = -75
+        post.underlineThickness = 50
+        post.isFixedPitch = 0
+        post.minMemType42 = post.maxMemType42 = 0
+        post.minMemType1 = post.maxMemType1 = 0
+        tt['post'] = post
+
+    if 'name' not in tt:
+        name = newTable('name')
+        name.names = []
+        tt['name'] = name
+
 def wrap_cff_in_otf(cff_bytes: bytes) -> Optional[bytes]:
     """Wraps bare CFF bytes into an OTF (SFNT) shell."""
     try:
@@ -218,6 +244,65 @@ def wrap_cff_in_otf(cff_bytes: bytes) -> Optional[bytes]:
     except Exception as e:
         logger.warning(f"CFF wrapping failed: {e}")
         return None
+
+
+def get_stem_darkening_ratio(cff_font):
+    """
+    Returns StdVW normalized to em-units (0-1 range), or None if the font
+    doesn't define it (common in TrueType-outline fonts, or minimal subsets).
+    """
+    try:
+        top_dict = None
+        if hasattr(cff_font, "cff") and hasattr(cff_font.cff, "topDictIndex") and len(cff_font.cff.topDictIndex) > 0:
+            top_dict = cff_font.cff.topDictIndex[0]
+        elif hasattr(cff_font, "topDictIndex") and len(cff_font.topDictIndex) > 0:
+            top_dict = cff_font.topDictIndex[0]
+        elif hasattr(cff_font, "Private"):
+            top_dict = cff_font
+        elif hasattr(cff_font, "fontNames") and len(cff_font.fontNames) > 0:
+            top_dict = cff_font[cff_font.fontNames[0]]
+        elif isinstance(cff_font, (list, tuple)) and len(cff_font) > 0:
+            top_dict = cff_font[0]
+            
+        if top_dict is None:
+            return None
+
+        private = getattr(top_dict, 'Private', None)
+        if private is None and hasattr(top_dict, 'FDArray') and len(top_dict.FDArray) > 0:
+            private = getattr(top_dict.FDArray[0], 'Private', None)
+        if private is None:
+            return None
+
+        std_vw = getattr(private, 'StdVW', None)
+        if std_vw is None:
+            return None
+
+        font_matrix = getattr(top_dict, 'FontMatrix', None)
+        units_per_em_val = 1 / font_matrix[0] if font_matrix and len(font_matrix) > 0 and font_matrix[0] != 0 else 1000
+        return float(std_vw / units_per_em_val)
+    except Exception:
+        return None
+
+
+def extract_stem_vw_ratio(buffer: bytes, ext: str) -> Optional[float]:
+    """
+    Extract stem_vw_ratio (StdVW / units_per_em) from a CFF or OTF/TTF buffer.
+    """
+    try:
+        from fontTools import cffLib, ttLib
+        if ext == "cff":
+            cff_set = cffLib.CFFFontSet()
+            cff_set.decompile(io.BytesIO(buffer), otFont=None, isCFF2=False)
+            return get_stem_darkening_ratio(cff_set)
+        elif ext in ("otf", "ttf", "woff", "woff2"):
+            ttf = ttLib.TTFont(io.BytesIO(buffer))
+            if 'CFF ' in ttf:
+                return get_stem_darkening_ratio(ttf['CFF '])
+            elif 'CFF2' in ttf:
+                return get_stem_darkening_ratio(ttf['CFF2'])
+    except Exception as e:
+        logger.debug(f"Could not extract stem_vw_ratio: {e}")
+    return None
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
@@ -601,7 +686,8 @@ def _extract_cidtogidmap(doc: fitz.Document, font_xref: int) -> Optional[dict]:
         logger.debug(f"CIDToGIDMap extraction failed: {e}")
         return None
 
-def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optional[fitz.Page] = None, basefont_name: str = "") -> bytes:
+def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optional[fitz.Page] = None,
+                  basefont_name: str = "", skip_cmap: bool = SKIP_CMAP_INJECTION_KEEP_HMTX) -> Optional[bytes]:
     """
     Subverts PyMuPDF's failure to natively render Identity-H subsets by wrapping the
     raw extracted font block in fontTools, parsing the PDF's /ToUnicode byte stream,
@@ -613,7 +699,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
     # When True, we skip the cmap-table writing (which corrupts re-extract)
     # but still run the hmtx advance-width sync (essential for correct
     # character spacing in inserted text).
-    if SKIP_CMAP_INJECTION_KEEP_HMTX:
+    if skip_cmap:
         try:
             logger.info(
                 f"==== HMTX-ONLY PATH for '{basefont_name}' "
@@ -709,6 +795,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                     )
 
             # Serialize and return — NO cmap manipulation
+            _ensure_browser_required_tables(tt)
             out = io.BytesIO()
             tt.save(out)
             logger.info(f"==== HMTX-ONLY PATH SUCCESS ====")
@@ -947,21 +1034,21 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
         cmap_table.tables = [t for t in cmap_table.tables if not (t.platformID == 3 and t.platEncID == 1)]
         cmap_table.tables.append(new_subtable)
         
+        _ensure_browser_required_tables(tt)
         out = io.BytesIO()
         tt.save(out)
         out_bytes = out.getvalue()
 
-        # Post-serialization validation: ensure fontTools didn't silently
-        # drop the cmap table during save (happens with some non-compliant fonts).
+        # Post-serialization validation: ensure fontTools created a valid cmap table
         try:
             verify_tt = TTFont(io.BytesIO(out_bytes))
-            verify_cmap = verify_tt.getBestCmap()
-            if not verify_cmap:
-                logger.warning("CMAP WAS DROPPED during fontTools serialization! Returning original font_bytes.")
-                return font_bytes
-            logger.info(f"Post-serialization cmap validated: {len(verify_cmap)} entries")
+            if 'cmap' not in verify_tt or not verify_tt.getBestCmap():
+                logger.error(f"Refusing to serve '{basefont_name}' — no valid cmap table produced!")
+                return None
+            logger.info(f"Post-serialization cmap validated: {len(verify_tt.getBestCmap())} entries")
         except Exception as e:
-            logger.warning(f"Post-serialization cmap validation failed: {e} — continuing anyway")
+            logger.error(f"Refusing to serve '{basefont_name}' — font validation error: {e}")
+            return None
 
         logger.info(f"==== INJECT_CMAP SUCCESS. Injected ToUnicode CMap matrix + hmtx patch into {len(unicode_to_glyph)} subsets. ====")
         return out_bytes

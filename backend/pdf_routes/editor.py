@@ -13,9 +13,27 @@ from fastapi.responses import FileResponse, JSONResponse
 from pypdf import PdfReader, PdfWriter
 import logging
 import base64
-from converter.font_utils import wrap_cff_in_otf
+import hashlib
+from collections import Counter
+from converter.font_utils import wrap_cff_in_otf, extract_stem_vw_ratio, _inject_cmap
 
 logger = logging.getLogger(__name__)
+
+TYPOGRAPHY_CACHE = {}
+
+def parse_color(color_val):
+    if isinstance(color_val, (tuple, list)):
+        if len(color_val) == 3:
+            r = int(color_val[0] * 255) if isinstance(color_val[0], float) and color_val[0] <= 1.0 else int(color_val[0])
+            g = int(color_val[1] * 255) if isinstance(color_val[1], float) and color_val[1] <= 1.0 else int(color_val[1])
+            b = int(color_val[2] * 255) if isinstance(color_val[2], float) and color_val[2] <= 1.0 else int(color_val[2])
+            return f"rgb({r}, {g}, {b})", f"#{r:02x}{g:02x}{b:02x}"
+    elif isinstance(color_val, int):
+        r = (color_val >> 16) & 0xFF
+        g = (color_val >> 8) & 0xFF
+        b = color_val & 0xFF
+        return f"rgb({r}, {g}, {b})", f"#{r:02x}{g:02x}{b:02x}"
+    return "rgb(0, 0, 0)", "#000000"
 
 UNICODE_SUPER_MAP = str.maketrans({
     '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
@@ -304,24 +322,44 @@ def _line_font_flags(spans):
     return font_details[dom_font]["is_bold"], font_details[dom_font]["is_italic"], dom_font
 
 
-def extract_page_spacing_data(page):
+def extract_page_spacing_data(page, page_idx: int = None):
     """
-    Extract per-character spatial data from a page.
+    Extract per-character spatial data and paragraph typography metadata from a page.
 
-    Returns a list of blocks, each with lines, each with:
-      - chars: per-char data (c, x0, x1, y0, y1, origin_x, origin_y, font, size, is_superscript)
-      - gaps: inter-character gaps (length = len(chars) - 1)
-      - line_x0, line_x1, line_y0, line_y1: line bbox
-      - is_bold, is_italic, dominant_font: authoritative style info from PyMuPDF
+    Returns a list of blocks (paragraphs), each containing:
+      - paragraph_id: string e.g. "p_{page_idx}_{block_number}"
+      - font_size: float (dominant font size in pt)
+      - font_family: string (dominant postscript font name)
+      - font_color: string (CSS "rgb(r,g,b)")
+      - hex_color: string ("#RRGGBB")
+      - is_bold: boolean
+      - is_italic: boolean
+      - align: string ("left", "center", "right", "justify")
+      - bbox: list [x0, y0, x1, y1]
+      - text: full string content of the paragraph
+      - line_count: int
+      - spans: list of text span objects
+      - lines: list of line objects with line text, bbox, size, font, color, bold, italic, chars
     """
+    if page_idx is None:
+        page_idx = getattr(page, 'number', 0)
+
     data = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
     blocks_out = []
 
-    for block in data.get("blocks", []):
+    for b_idx, block in enumerate(data.get("blocks", [])):
         if block.get("type", -1) != 0:
             continue  # skip image blocks
 
+        block_num = block.get("number", b_idx)
         block_lines = []
+        block_spans = []
+        all_block_fonts = Counter()
+        all_block_sizes = Counter()
+        all_block_colors = Counter()
+        all_block_bolds = Counter()
+        all_block_italics = Counter()
+
         for line in block.get("lines", []):
             # ── Pass 1: collect all chars with span-level metadata ──────────
             raw_chars = []
@@ -330,48 +368,70 @@ def extract_page_spacing_data(page):
 
             for span in spans:
                 is_superscript_flag = bool(span.get("flags", 0) & fitz.TEXT_FONT_SUPERSCRIPT)
-                span_color_int = span.get("color", 0)
-                span_r = (span_color_int >> 16) & 0xFF
-                span_g = (span_color_int >> 8) & 0xFF
-                span_b = span_color_int & 0xFF
-                span_color_css = f"rgb({span_r}, {span_g}, {span_b})"
+                span_font = span.get("font", "")
+                span_size = span.get("size", 0.0)
+                span_flags = span.get("flags", 0)
+                
+                span_bold = bool(span_flags & 16) or "Bold" in span_font or "bold" in span_font.lower()
+                span_italic = bool(span_flags & 2) or "Italic" in span_font or "Oblique" in span_font or "italic" in span_font.lower()
+                
+                span_color_css, span_hex = parse_color(span.get("color", 0))
+                
+                span_text = normalize_pdf_text(span.get("text", ""))
+                if not span_text and "chars" in span:
+                    span_text = "".join(normalize_pdf_text(ch.get("c", "")) for ch in span.get("chars", []))
+
+                block_spans.append({
+                    "text": span_text,
+                    "font": span_font,
+                    "size": round(span_size, 1),
+                    "color": span_color_css,
+                    "hex_color": span_hex,
+                    "is_bold": span_bold,
+                    "is_italic": span_italic,
+                })
 
                 for ch in span.get("chars", []):
+                    ch_text = normalize_pdf_text(ch.get("c", ""))
                     raw_chars.append({
-                        "c":              normalize_pdf_text(ch["c"]),
+                        "c":              ch_text,
                         "x0":             ch["bbox"][0],
                         "x1":             ch["bbox"][2],
                         "y0":             ch["bbox"][1],
                         "y1":             ch["bbox"][3],
                         "origin_x":       ch["origin"][0],
                         "origin_y":       ch["origin"][1],
-                        "font":           span["font"],
-                        "size":           span["size"],
+                        "font":           span_font,
+                        "size":           span_size,
                         "is_superscript_flag": is_superscript_flag,
                         "color":          span_color_css,
+                        "hex_color":      span_hex,
+                        "is_bold":        span_bold,
+                        "is_italic":      span_italic,
                     })
+                    if ch_text.strip():
+                        all_block_fonts[span_font] += 1
+                        all_block_sizes[round(span_size, 1)] += 1
+                        all_block_colors[(span_color_css, span_hex)] += 1
+                        all_block_bolds[span_bold] += 1
+                        all_block_italics[span_italic] += 1
 
             if not raw_chars:
                 continue
 
             # ── Pass 2: compute dominant baseline & size for subscript detection ──
-            # The dominant baseline is the most common origin_y among characters
-            # that are NOT flagged as superscript (to avoid skewing the baseline).
-            from collections import Counter as _C
             normal_origins = [ch["origin_y"] for ch in raw_chars if not ch["is_superscript_flag"]]
             if not normal_origins:
                 normal_origins = [ch["origin_y"] for ch in raw_chars]
-            # Round to 0.5pt buckets for stable mode calculation
             bucketed = [round(y * 2) / 2 for y in normal_origins]
-            dom_baseline = _C(bucketed).most_common(1)[0][0]
+            dom_baseline = Counter(bucketed).most_common(1)[0][0]
 
             normal_sizes = [ch["size"] for ch in raw_chars if not ch["is_superscript_flag"]]
             if not normal_sizes:
                 normal_sizes = [ch["size"] for ch in raw_chars]
-            dom_size = _C(normal_sizes).most_common(1)[0][0]
+            dom_line_size = Counter(normal_sizes).most_common(1)[0][0]
 
-            # Subscript threshold: origin_y more than 15% of dom_size below the baseline
-            sub_threshold = dom_size * 0.15
+            sub_threshold = dom_line_size * 0.15
 
             # ── Pass 3: tag each char with final is_superscript / is_subscript ──
             line_chars = []
@@ -380,7 +440,7 @@ def extract_page_spacing_data(page):
                 is_sub = (
                     not is_sup
                     and ch["origin_y"] > dom_baseline + sub_threshold
-                    and ch["size"] < dom_size - 0.5
+                    and ch["size"] < dom_line_size - 0.5
                 )
                 line_chars.append({
                     "c":              ch["c"],
@@ -405,12 +465,8 @@ def extract_page_spacing_data(page):
                 gap = line_chars[i]["x0"] - line_chars[i - 1]["x1"]
                 gaps.append(gap)
 
-            # Line-level dominant color: mode of per-char colors.
-            # Hyperlinked runs will have their own color; the most-common color
-            # is the line's body text color.
-            from collections import Counter as _CounterLocal
-            color_counts = _CounterLocal(c["color"] for c in line_chars)
-            dom_color = color_counts.most_common(1)[0][0] if color_counts else "rgb(0, 0, 0)"
+            line_color_counts = Counter(c["color"] for c in line_chars)
+            dom_color = line_color_counts.most_common(1)[0][0] if line_color_counts else "rgb(0, 0, 0)"
 
             x0 = line["bbox"][0]
             y0 = line["bbox"][1]
@@ -435,17 +491,26 @@ def extract_page_spacing_data(page):
                 "is_italic":   dom_italic,
                 "dominant_font": dom_font,
                 "dominant_color": dom_color,
+                "size":        round(dom_line_size, 1),
+                "font":        dom_font,
+                "color":       dom_color,
+                "bold":        dom_bold,
+                "italic":      dom_italic,
             })
 
         if block_lines:
             # Determine block alignment authoritatively from line coordinates
             block_align = "left"
-            if len(block_lines) > 1:
-                b_x0s = [l["line_x0"] for l in block_lines]
-                b_x1s = [l["line_x1"] for l in block_lines]
-                block_x0 = min(b_x0s)
-                block_x1 = max(b_x1s)
+            b_x0s = [l["line_x0"] for l in block_lines]
+            b_x1s = [l["line_x1"] for l in block_lines]
+            b_y0s = [l["line_y0"] for l in block_lines]
+            b_y1s = [l["line_y1"] for l in block_lines]
+            block_x0 = min(b_x0s)
+            block_x1 = max(b_x1s)
+            block_y0 = min(b_y0s)
+            block_y1 = max(b_y1s)
 
+            if len(block_lines) > 1:
                 justified_count = 0
                 for l in block_lines[:-1]:  # exclude final line
                     touches_left = abs(l["line_x0"] - block_x0) < 5.0
@@ -463,27 +528,66 @@ def extract_page_spacing_data(page):
                     elif all(abs(l["line_x1"] - block_x1) < 5.0 for l in block_lines):
                         block_align = "right"
 
+            # Dominant block font properties
+            dom_font_family = all_block_fonts.most_common(1)[0][0] if all_block_fonts else (block_lines[0]["dominant_font"] if block_lines else "Helvetica")
+            dom_font_size = all_block_sizes.most_common(1)[0][0] if all_block_sizes else (block_lines[0]["size"] if block_lines else 12.0)
+            dom_color_pair = all_block_colors.most_common(1)[0][0] if all_block_colors else ("rgb(0, 0, 0)", "#000000")
+            dom_rgb, dom_hex = dom_color_pair
+            dom_block_bold = all_block_bolds.most_common(1)[0][0] if all_block_bolds else False
+            dom_block_italic = all_block_italics.most_common(1)[0][0] if all_block_italics else False
+
+            paragraph_text = "\n".join(l["text"] for l in block_lines)
+            paragraph_id = f"p_{page_idx}_{block_num}"
+
             blocks_out.append({
-                "block_number": block.get("number", 0),
+                "paragraph_id": paragraph_id,
+                "block_number": block_num,
+                "font_size": dom_font_size,
+                "font_family": dom_font_family,
+                "font_color": dom_rgb,
+                "hex_color": dom_hex,
+                "is_bold": dom_block_bold,
+                "is_italic": dom_block_italic,
                 "align": block_align,
+                "bbox": [block_x0, block_y0, block_x1, block_y1],
+                "text": paragraph_text,
+                "line_count": len(block_lines),
+                "spans": block_spans,
                 "lines": block_lines,
             })
 
     return blocks_out
 
 
-def get_pdf_spacing_payload(pdf_bytes):
+def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
     """
-    Process a PDF byte-string and return a per-page spacing payload.
+    Process a PDF byte-string and return a per-page spacing and typography payload.
     Each entry: {"page": int, "blocks": [...], "columns": [[xL, xR], ...]}
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     payload = []
+    total_paragraphs = 0
+
+    logger.info("=" * 70)
+    logger.info(f"   [TYPOGRAPHY ENGINE] START: Extracting typography for PDF ({len(doc)} pages)")
+    logger.info("=" * 70)
 
     for page_index in range(len(doc)):
         page = doc[page_index]
-        page_blocks = extract_page_spacing_data(page)
+        page_blocks = extract_page_spacing_data(page, page_idx=page_index)
         column_boundaries = _get_column_boundaries(page)
+
+        for p_idx, blk in enumerate(page_blocks):
+            total_paragraphs += 1
+            preview = blk["text"].replace("\n", " ")
+            if len(preview) > 40:
+                preview = preview[:40] + "..."
+            logger.info(
+                f"[INFO] [TYPOGRAPHY] Page P{page_index + 1} | Paragraph #{p_idx + 1} ({blk['paragraph_id']}) | "
+                f"Font: {blk['font_family']} ({blk['font_size']}pt) | Color: {blk['font_color']}/{blk['hex_color']} | "
+                f"Align: {blk['align']} | Text: \"{preview}\""
+            )
+
         payload.append({
             "page": page_index,
             "blocks": page_blocks,
@@ -491,7 +595,53 @@ def get_pdf_spacing_payload(pdf_bytes):
         })
 
     doc.close()
+
+    logger.info("=" * 70)
+    logger.info(f"   [TYPOGRAPHY ENGINE] SUCCESS: Extracted {total_paragraphs} paragraphs across {len(payload)} pages")
+    logger.info("=" * 70)
+
     return payload
+
+
+@router.post("/extract-typography")
+async def extract_typography(file: UploadFile = File(...), doc_id: str = Form(None)):
+    """
+    Extracts rich paragraph typography payload from PDF and caches it in memory.
+    """
+    try:
+        content = await file.read()
+        if not doc_id:
+            doc_id = hashlib.sha256(content).hexdigest()[:16]
+
+        payload = get_pdf_spacing_payload(content, doc_id=doc_id)
+
+        cached_result = {
+            "doc_id": doc_id,
+            "total_pages": len(payload),
+            "total_paragraphs": sum(len(p["blocks"]) for p in payload),
+            "pages": payload,
+        }
+        TYPOGRAPHY_CACHE[doc_id] = cached_result
+        return JSONResponse(status_code=200, content=cached_result)
+    except Exception as e:
+        logger.error(f"extract-typography failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to extract typography: {str(e)}"},
+        )
+
+
+@router.get("/typography/{doc_id}")
+async def get_cached_typography(doc_id: str):
+    """
+    Retrieves cached typography payload for doc_id.
+    """
+    if doc_id in TYPOGRAPHY_CACHE:
+        return JSONResponse(status_code=200, content=TYPOGRAPHY_CACHE[doc_id])
+    return JSONResponse(
+        status_code=404,
+        content={"error": f"Typography metadata for doc_id '{doc_id}' not found in cache"},
+    )
 
 
 @router.post("/extract-spacing")
@@ -500,10 +650,21 @@ async def extract_spacing(file: UploadFile = File(...)):
     Extract per-character spacing data and column boundaries for every page.
     Used by the frontend to build editing boxes that correctly handle
     multi-column layouts and post-bake text positioning.
+    Enriched with rich paragraph typography metadata for backwards compatibility.
     """
     try:
         content = await file.read()
-        payload = get_pdf_spacing_payload(content)
+        doc_id = hashlib.sha256(content).hexdigest()[:16]
+        payload = get_pdf_spacing_payload(content, doc_id=doc_id)
+
+        cached_result = {
+            "doc_id": doc_id,
+            "total_pages": len(payload),
+            "total_paragraphs": sum(len(p["blocks"]) for p in payload),
+            "pages": payload,
+        }
+        TYPOGRAPHY_CACHE[doc_id] = cached_result
+
         return JSONResponse(status_code=200, content=payload)
     except Exception as e:
         logger.error(f"extract-spacing failed: {e}")
@@ -588,11 +749,28 @@ async def extract_fonts(file: UploadFile = File(...)):
                         logger.info(f"Skipping font {basename} with unsupported ext '{ext}'")
                         continue
                     
+                    # Inject valid cmap subtable for browser font preview loading (skip_cmap=False)
+                    try:
+                        injected_buffer = _inject_cmap(
+                            buffer, doc, xref, page=page, basefont_name=basename, skip_cmap=False
+                        )
+                        if injected_buffer:
+                            buffer = injected_buffer
+                        else:
+                            logger.warning(f"cmap injection returned None for {basename} — skipping font")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"cmap injection failed for {basename}: {e} — skipping font")
+                        continue
+
+                    stem_vw_ratio = extract_stem_vw_ratio(buffer, ext)
+                    
                     fonts_out[basename] = {
                         "data": base64.b64encode(buffer).decode("ascii"),
                         "format": ext,
                         "postscript_name": postscript_name,
                         "subset_tag": subset_tag,
+                        "stem_vw_ratio": stem_vw_ratio,
                     }
                     logger.info(f"Extracted font {basename} ({len(buffer)} bytes, {ext})")
                 except Exception as e:

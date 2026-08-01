@@ -1,13 +1,71 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, useSyncExternalStore } from 'react';
 import { pdfToScreen } from '../../utils/pdfCoords';
 import { SUPER_MAP, UNICODE_SUPER_MAP, UNICODE_SUB_MAP } from './superscriptUtils';
+import { pdfTypographyStore } from '../../stores/pdfTypographyStore';
+import { activeFileId } from '../../stores/pdfEditStore';
+import { getFontStemVwRatio } from '../../utils/pdfFontLoader';
 
 const rgbToHex = (colorStr) => {
-  if (!colorStr) return '#000000';
+  if (colorStr == null) return '#000000';
+  if (typeof colorStr === 'number') {
+    const hex = colorStr.toString(16).padStart(6, '0');
+    return `#${hex}`;
+  }
+  if (Array.isArray(colorStr)) {
+    const [r, g, b] = colorStr.map(c => Math.round(c <= 1 ? c * 255 : c).toString(16).padStart(2, '0'));
+    return `#${r}${g}${b}`;
+  }
+  if (typeof colorStr !== 'string') return '#000000';
   if (colorStr.startsWith('#')) return colorStr;
   const match = colorStr.match(/\d+/g);
   if (!match || match.length < 3) return '#000000';
-  return '#' + match.slice(0, 3).map(x => parseInt(x).toString(16).padStart(2, '0')).join('');
+  return '#' + match.slice(0, 3).map(x => parseInt(x, 10).toString(16).padStart(2, '0')).join('');
+};
+
+const SUPERSAMPLE_FACTOR = 2; // extra sharpness multiplier beyond native devicePixelRatio
+const MAX_EFFECTIVE_DPR = 4;  // hard cap to bound memory/CPU on already-high-DPR devices
+
+// FALLBACK: used when the font has no derivable StdVW — TrueType-outline fonts,
+// CFF subsets that stripped it, or PDFs using non-embedded base-14 fonts (in which
+// case the browser is substituting a system font anyway, not the PDF's real glyphs,
+// so a visually-tuned curve is actually the *correct* tool here, not just a compromise).
+const getStemDarkeningPxHeuristic = (fontSizePx) => {
+  const SMALL_PX = 11;
+  const LARGE_PX = 22;
+  const MAX_DARKEN = 0.18; // calibrated down from 0.35 to prevent overshooting body text
+  if (fontSizePx <= SMALL_PX) return MAX_DARKEN;
+  if (fontSizePx >= LARGE_PX) return 0;
+  const t = (fontSizePx - SMALL_PX) / (LARGE_PX - SMALL_PX);
+  return MAX_DARKEN * (1 - t);
+};
+
+// PRIMARY: real per-font metric extracted from the embedded CFF's Private dict.
+const FT_DARKENING_CURVE = [
+  [0.5, 0.4],
+  [1.0, 0.275],
+  [1.667, 0.275],
+  [2.333, 0.0],
+];
+
+const freeTypeStemDarkeningPx = (stemWidthPx) => {
+  const pts = FT_DARKENING_CURVE;
+  if (stemWidthPx <= pts[0][0]) return pts[0][1];
+  if (stemWidthPx >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+    if (stemWidthPx >= x0 && stemWidthPx <= x1) {
+      const t = (stemWidthPx - x0) / (x1 - x0);
+      return y0 + t * (y1 - y0);
+    }
+  }
+  return 0;
+};
+
+// Single entry point drawCanvasLine actually calls.
+const getStemDarkeningPx = (fontSizePx, stemVwRatio) => {
+  if (stemVwRatio == null) return getStemDarkeningPxHeuristic(fontSizePx);
+  const stemWidthPx = stemVwRatio * fontSizePx;
+  return freeTypeStemDarkeningPx(stemWidthPx);
 };
 
 const FONTS = ['Original', 'Arial', 'Times New Roman', 'Courier', 'Verdana', 'Georgia'];
@@ -259,6 +317,29 @@ function extractRangesFromCharMeta(charMeta) {
   return ranges;
 }
 
+const detectBold = (item) => {
+  if (item?.isBold === true) return true;
+  const name = (item?.fontPostScriptName || item?.fontName || '').toLowerCase();
+  if (/bold|heavy|black|w[6-9]|semibold/.test(name)) return true;
+  if (typeof item?.flags === 'number' && (item.flags & 2)) return true;
+  return false;
+};
+
+const detectItalic = (item) => {
+  if (item?.isItalic === true) return true;
+  const name = (item?.fontPostScriptName || item?.fontName || '').toLowerCase();
+  if (/italic|oblique/.test(name)) return true;
+  if (typeof item?.flags === 'number' && (item.flags & 1)) return true;
+  return false;
+};
+
+const extractColor = (item) => {
+  if (item?.color) return rgbToHex(item.color);
+  const firstChar = item?.origLines?.[0]?.chars?.[0] || item?.lines?.[0]?.chars?.[0];
+  if (firstChar?.color) return rgbToHex(firstChar.color);
+  return '#000000';
+};
+
 export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange }) {
   const getInitialText = useCallback(() => {
     if (existingEdit && existingEdit.newStr) return existingEdit.newStr;
@@ -287,10 +368,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
   // Formatting state
   const [fontSizeAdj, setFontSizeAdj] = useState(existingEdit ? existingEdit.fontSizeAdj : 0);
-  const [color, setColor] = useState(() => existingEdit?.color || rgbToHex(item.color) || '#000000');
+  const [color, setColor] = useState(() => existingEdit?.color || extractColor(item));
   const [fontFamily, setFontFamily] = useState(() => existingEdit?.customFontFamily || 'Original');
-  const [isBold, setIsBold] = useState(() => (existingEdit ? existingEdit.isBold : item.isBold === true));
-  const [isItalic, setIsItalic] = useState(() => (existingEdit ? existingEdit.isItalic : item.isItalic === true));
+  const [isBold, setIsBold] = useState(() => (existingEdit ? existingEdit.isBold : detectBold(item)));
+  const [isItalic, setIsItalic] = useState(() => (existingEdit ? existingEdit.isItalic : detectItalic(item)));
 
   const [keyboardOffset, setKeyboardOffset] = useState(0);
 
@@ -306,24 +387,80 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const dragAnchorRef = useRef(0);
   const isProgrammaticSelectionRef = useRef(false);
 
-  const r = pdfToScreen(item, scale);
-  const baseFontSizePx = Math.max(8, Math.round(item.fontSize * scale) + fontSizeAdj);
-  // Authoritative block alignment from PyMuPDF (passed through Viewer.jsx → item.align)
-  const blockAlign = item.align || 'left';
+  // Connect to pdfTypographyStore for reactive typography updates
+  useSyncExternalStore(
+    pdfTypographyStore.subscribe,
+    () => pdfTypographyStore.getTypographyData(activeFileId)
+  );
 
-  // Build Font Stack
+  const paragraphTypography = useMemo(() => {
+    if (item?.paragraphTypography) return item.paragraphTypography;
+    if (item?.paragraph_id) {
+      return {
+        font_size: item.paragraph_font_size || item.fontSize,
+        font_family: item.paragraph_font_family || item.fontName || 'Helvetica',
+        color: item.paragraph_color || item.color || '#000000',
+        align: item.paragraph_align || item.align || 'left',
+        paragraph_id: item.paragraph_id,
+        text: item.paragraph_text || item.str || item.text || '',
+      };
+    }
+    const pageIndex = (item?.pageNum != null ? item.pageNum : 1) - 1;
+    const storeP = pdfTypographyStore.getParagraphAt(
+      activeFileId,
+      pageIndex,
+      item?.pdfX ?? 0,
+      item?.pdfY_top ?? item?.pdfY_base ?? 0
+    );
+    if (storeP) {
+      return {
+        font_size: storeP.font_size,
+        font_family: storeP.font_family,
+        color: storeP.hex_color || storeP.font_color,
+        align: storeP.align || 'left',
+        paragraph_id: storeP.paragraph_id,
+        text: storeP.text,
+      };
+    }
+    return {
+      font_size: item?.fontSize || 12,
+      font_family: item?.fontPostScriptName || item?.fontName || 'Helvetica',
+      color: item?.color || '#000000',
+      align: item?.align || 'left',
+      paragraph_id: null,
+      text: item?.str || item?.text || '',
+    };
+  }, [item]);
+
+  const r = pdfToScreen(item, scale);
+  const baseFontSizePx = Math.max(8, (item.fontSize * scale) + fontSizeAdj);
+  // Authoritative block alignment from PyMuPDF or paragraphTypography
+  const blockAlign = paragraphTypography.align || item.align || 'left';
+
+  const firstCharFont = origLines?.[0]?.chars?.[0]?.font || item?.lines?.[0]?.chars?.[0]?.font;
+
+  // Build Comprehensive Font Stack
   const fontCandidates = [
     item.fontPostScriptName,
     stripSubset(item.fontPostScriptName),
     item.fontName,
     stripSubset(item.fontName),
+    item.font,
+    stripSubset(item.font),
+    firstCharFont,
+    stripSubset(firstCharFont),
   ].filter(Boolean);
   const uniqueCandidates = [...new Set(fontCandidates)];
   const sanitizedCandidates = uniqueCandidates.map(sanitizeFontName);
   const realFontStack = sanitizedCandidates.map(n => `"${n}"`).join(', ');
 
+  const isSans = sanitizedCandidates.some(n => /helvetica|arial|sans|gothic|verdana|tahoma|trebuchet|roboto/i.test(n));
+  const fallbackStack = isSans
+    ? 'sans-serif, Arial, "Helvetica Neue", Helvetica'
+    : 'serif, "Times New Roman", Georgia';
+
   const currentFontFamily = fontFamily === 'Original'
-    ? (item.renderedFontFamily || `${realFontStack}, "Times New Roman", Georgia, serif`)
+    ? (item.renderedFontFamily || (realFontStack ? `${realFontStack}, ${fallbackStack}` : fallbackStack))
     : fontFamily;
 
   const isFontEmbeddedAndActive = useMemo(() => {
@@ -914,7 +1051,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       lineIndex: lines.length - 1
     };
 
-    return { lines, baseFont, superFont, ascenderPx, lineHeightPx, globalCharMap };
+    const nativeDpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+    return { lines, baseFont, superFont, ascenderPx, lineHeightPx, globalCharMap, dpr };
   }, [text, initialRanges, origLines, item, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h]);
 
   /**
@@ -922,6 +1061,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    */
   const drawCanvasLine = useCallback((ctx, line, layout, fontSizePx, defaultColor) => {
     let currentX = line.startX || 0;
+    const dpr = layout?.dpr || Math.min((window.devicePixelRatio || 1) * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+
     for (let i = 0; i < line.chars.length; i++) {
       const cm = line.chars[i];
       const isSuper = cm.kind === 'super';
@@ -940,14 +1081,32 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         yPos = line.yBaseline + (0.15 * fontSizePx);
       }
 
-      const curX = (line.charXPositions && line.charXPositions[i] != null) ? line.charXPositions[i] : currentX;
-      ctx.fillText(cm.displayChar, curX, yPos);
+      const rawX = (line.charXPositions && line.charXPositions[i] != null) ? line.charXPositions[i] : currentX;
+      
+      // Snap to exact device pixel boundary for crystal-clear, non-blurry text rendering
+      const crispX = Math.round(rawX * dpr) / dpr;
+      const crispY = Math.round(yPos * dpr) / dpr;
+
+      ctx.fillText(cm.displayChar, crispX, crispY);
+
+      if (!isBold) {
+        const glyphFontSizePx = (isSuper || isSub) ? fontSizePx * 0.65 : fontSizePx;
+        const stemVwRatio = getFontStemVwRatio(currentFontFamily);
+        console.log('[stem-darkening]', currentFontFamily, 'ratio:', stemVwRatio,
+          'font-loaded:', document.fonts.check(`${fontSizePx}px "NewBaskerville-Roman"`));
+        const darken = getStemDarkeningPx(glyphFontSizePx, stemVwRatio);
+        if (darken > 0) {
+          ctx.lineWidth = darken;
+          ctx.strokeStyle = cm.color || defaultColor || '#000000';
+          ctx.strokeText(cm.displayChar, crispX, crispY);
+        }
+      }
 
       const charW = ctx.measureText(cm.displayChar).width;
       const extra = (line.extraPerSpace && (cm.origChar === ' ' || cm.origChar === '\u00A0')) ? line.extraPerSpace : 0;
-      currentX = curX + charW + extra;
+      currentX = rawX + charW + extra;
     }
-  }, []);
+  }, [isBold, currentFontFamily]);
 
   const coverageRef = useRef(null);
 
@@ -969,7 +1128,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       onHeightChange(item.pdfY, deltaH);
     }
 
-    const dpr = window.devicePixelRatio || 1;
+    const nativeDpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
     const canvasW = Math.max(1, Math.round(r.w * dpr));
     const canvasH = Math.max(1, Math.round(requiredHeightPx * dpr));
 
@@ -983,6 +1143,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
 
     ctx.scale(dpr, dpr);
+    ctx.textRendering = 'geometricPrecision';
 
     // 2. Clear & Fill Solid White Background Fill
     ctx.clearRect(0, 0, r.w, requiredHeightPx);
@@ -991,7 +1152,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     // 3. Compute Final Layout
     const layout = computeLineLayout(ctx);
-    canvas._layout = layout;
+    canvas._layout = { ...layout, dpr };
 
     // 4. Selection Highlight Rectangles (rgba(147, 197, 253, 0.6))
     if (selection.start !== selection.end) {
