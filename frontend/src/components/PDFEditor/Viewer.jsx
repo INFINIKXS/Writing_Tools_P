@@ -1318,7 +1318,17 @@ export default function PDFViewer({
                       scale={scale}
                       existingEdit={edits.find(e => e.pageNum === index + 1 && e.nodeIndex === selectedTextIdx)}
                       onHeightChange={(activePdfY, deltaH) => {
-                        setActiveBlockShift({ pageNum: index + 1, activePdfY, deltaH });
+                        setActiveBlockShift(prev => {
+                          if (
+                            prev &&
+                            prev.pageNum === index + 1 &&
+                            prev.activePdfY === activePdfY &&
+                            Math.abs(prev.deltaH - deltaH) < 0.5
+                          ) {
+                            return prev; // bail out — same reference, no re-render triggered
+                          }
+                          return { pageNum: index + 1, activePdfY, deltaH };
+                        });
                       }}
                       onCommit={(newVal, formatOptions, newSuperscriptRanges) => {
                         const origItem = pageMetadata[index + 1].items[selectedTextIdx];

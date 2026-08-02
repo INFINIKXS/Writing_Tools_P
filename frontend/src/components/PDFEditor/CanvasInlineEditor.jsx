@@ -61,11 +61,109 @@ const freeTypeStemDarkeningPx = (stemWidthPx) => {
   return 0;
 };
 
-// Single entry point drawCanvasLine actually calls.
-const getStemDarkeningPx = (fontSizePx, stemVwRatio) => {
-  if (stemVwRatio == null) return getStemDarkeningPxHeuristic(fontSizePx);
-  const stemWidthPx = stemVwRatio * fontSizePx;
-  return freeTypeStemDarkeningPx(stemWidthPx);
+const nativeStemWidthCache = new Map();
+
+if (typeof window !== 'undefined') {
+  const clearCache = () => nativeStemWidthCache.clear();
+  window.addEventListener('resize', clearCache);
+  if (document.fonts) {
+    document.fonts.ready.then(clearCache);
+  }
+}
+
+/**
+ * Measures the font face's authentic native vertical stem ratio using
+ * FreeType's vertical stem benchmark suite (['l', 'I', 'H', 'n']).
+ */
+function measureNativeStemWidthPx(fontString, dpr = 1) {
+  const cacheKey = `${fontString}__dpr${dpr.toFixed(2)}`;
+  if (nativeStemWidthCache.has(cacheKey)) return nativeStemWidthCache.get(cacheKey);
+
+  // Lowercase-only, full-ascender-height characters: guaranteed single clean
+  // vertical stroke, same glyph class (no uppercase stem-weight difference),
+  // and tall enough to reliably hit the fixed sampling row (unlike x-height-only
+  // letters like 'n', which can fail to reach the row entirely and silently drop
+  // out of the measurement — biasing the result toward whatever survives).
+  const stemChars = ['l', 'i', 't'];
+  const probeSize = 256; // large + fixed, so measurement precision doesn't depend on the real render size
+  const probe = document.createElement('canvas');
+  probe.width = probeSize;
+  probe.height = probeSize;
+  const pctx = probe.getContext('2d');
+
+  const probeFont = fontString.replace(/[\d.]+px/, `${probeSize * 0.5}px`);
+  pctx.imageSmoothingEnabled = true;
+  pctx.imageSmoothingQuality = 'high';
+  pctx.font = probeFont;
+  pctx.fillStyle = '#000';
+  pctx.textBaseline = 'alphabetic';
+
+  const measurements = []; // {ch, ratio} pairs, kept together through sorting
+  const midY = Math.round(probeSize * 0.5);
+
+  for (const ch of stemChars) {
+    pctx.clearRect(0, 0, probeSize, probeSize);
+    pctx.fillText(ch, 10, probeSize * 0.75);
+
+    const row = pctx.getImageData(0, midY, probeSize, 1).data;
+
+    let start = -1, end = -1;
+    for (let x = 0; x < probeSize; x++) {
+      if (row[x * 4 + 3] > 127) { // 50% coverage — standard anti-aliased edge boundary, not a tuning knob
+        if (start === -1) start = x;
+        end = x;
+      }
+    }
+    if (start >= 0) {
+      measurements.push({ ch, ratio: (end - start + 1) / (probeSize * 0.5) });
+    }
+  }
+
+  if (measurements.length === 0) return 0;
+
+  measurements.sort((a, b) => a.ratio - b.ratio);
+  const medianEntry = measurements[Math.floor(measurements.length / 2)];
+  const medianRatio = medianEntry.ratio;
+
+  console.log(
+    `[stem-probe] font="${fontString}" ` +
+    measurements.map(m => `${m.ch}=${m.ratio.toFixed(4)}`).join(' ') +
+    ` | median(${medianEntry.ch})=${medianRatio.toFixed(4)}`
+  );
+
+  // ONLY cache if font is confirmed loaded in browser memory,
+  // preventing premature fallback measurements from permanently corrupting the cache.
+  const isFontLoaded = typeof document !== 'undefined' && document.fonts && document.fonts.check(probeFont);
+  if (isFontLoaded) {
+    nativeStemWidthCache.set(cacheKey, medianRatio);
+  }
+
+  return medianRatio;
+}
+
+// Replaces getStemDarkeningPx entirely:
+const getStemDarkeningPx = (fontString, fontSizePx, stemVwRatio, dpr = 1) => {
+  // TrueType / Base-14 fonts (stemVwRatio is null) use native browser bytecode grid-fitting;
+  // do not add synthetic stem darkening offset.
+  if (stemVwRatio == null) return 0;
+
+  const targetStemWidthPx = stemVwRatio * fontSizePx;
+  const nativeStemRatio = measureNativeStemWidthPx(fontString, dpr);
+  const nativeStemWidthPx = nativeStemRatio * fontSizePx;
+  const result = Math.max(0, targetStemWidthPx - nativeStemWidthPx);
+
+  const logKey = `${fontString}__${fontSizePx.toFixed(1)}`;
+  if (!getStemDarkeningPx._loggedKeys) getStemDarkeningPx._loggedKeys = new Set();
+  if (!getStemDarkeningPx._loggedKeys.has(logKey)) {
+    getStemDarkeningPx._loggedKeys.add(logKey);
+    console.log(
+      `[stem-darken] font="${fontString}" size=${fontSizePx.toFixed(2)}px ` +
+      `stemVwRatio=${stemVwRatio.toFixed(4)} target=${targetStemWidthPx.toFixed(3)}px ` +
+      `native=${nativeStemWidthPx.toFixed(3)}px result=${result.toFixed(3)}px`
+    );
+  }
+
+  return result;
 };
 
 const FONTS = ['Original', 'Arial', 'Times New Roman', 'Courier', 'Verdana', 'Georgia'];
@@ -386,6 +484,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const isDraggingRef = useRef(false);
   const dragAnchorRef = useRef(0);
   const isProgrammaticSelectionRef = useRef(false);
+  const lastReportedDeltaHRef = useRef(null);
 
   // Connect to pdfTypographyStore for reactive typography updates
   useSyncExternalStore(
@@ -647,8 +746,26 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         lineUnits.push({ chars: currentUnitChars, width: unitWidth });
       }
 
-      // Combine overflow units from previous line with current line units
-      const allUnitsForLine = [...overflowUnitsFromPrevLine, ...lineUnits];
+      // Combine overflow units from previous line with current line units.
+      // If content is carrying over from the PREVIOUS original PDF line (pIdx-1)
+      // into THIS one, that boundary was a hard newline in the source — not a real
+      // space character. Insert a synthetic space unless the previous line ended in
+      // a hyphen (genuine word-break continuation, e.g. "prac-" + "tice"), where
+      // direct concatenation is correct and no space should be added.
+      let allUnitsForLine = [...overflowUnitsFromPrevLine, ...lineUnits];
+      if (overflowUnitsFromPrevLine.length > 0 && lineUnits.length > 0) {
+        const lastOverflowUnit = overflowUnitsFromPrevLine[overflowUnitsFromPrevLine.length - 1];
+        const lastOverflowChar = lastOverflowUnit?.chars?.[lastOverflowUnit.chars.length - 1]?.origChar;
+        const firstNewChar = lineUnits[0]?.chars?.[0]?.origChar;
+        const isHyphenContinuation = lastOverflowChar === '-' || lastOverflowChar === '\u00AD';
+        const alreadyHasSpace = lastOverflowChar === ' ' || lastOverflowChar === '\u00A0' ||
+                                 firstNewChar === ' ' || firstNewChar === '\u00A0';
+        if (!isHyphenContinuation && !alreadyHasSpace) {
+          const spaceMeta = { origChar: ' ', displayChar: ' ', kind: 'normal', charIndex: -1 };
+          const spaceUnit = { chars: [spaceMeta], width: ctx.measureText(' ').width };
+          allUnitsForLine = [...overflowUnitsFromPrevLine, spaceUnit, ...lineUnits];
+        }
+      }
       overflowUnitsFromPrevLine = [];
 
       const pOrigLine = (origLines && Array.isArray(origLines) && origLines[pIdx]) ? origLines[pIdx] : null;
@@ -717,29 +834,30 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           pdfWordCharCounts.push(curPdfCharCount);
         }
 
+        const isReflowedLine = allUnitsForLine.length > lineUnits.length;
+
         let prefixMatchCount = 0;
         let linePrefixStartWordIdx = 0;
-        if (pdfWords.length > 0) {
+        if (!isReflowedLine && pdfWords.length > 0) {
           const matchIdx = lineWords.indexOf(pdfWords[0]);
           if (matchIdx >= 0) {
             linePrefixStartWordIdx = matchIdx;
           }
-        }
 
-        let pdfWIdx = 0;
-        for (let w = linePrefixStartWordIdx; w < lineWords.length && pdfWIdx < pdfWords.length; w++) {
-          if (lineWords[w] === pdfWords[pdfWIdx]) {
-            prefixMatchCount += pdfWordCharCounts[pdfWIdx];
-            pdfWIdx++;
-          } else {
-            break;
+          let pdfWIdx = 0;
+          for (let w = linePrefixStartWordIdx; w < lineWords.length && pdfWIdx < pdfWords.length; w++) {
+            if (lineWords[w] === pdfWords[pdfWIdx]) {
+              prefixMatchCount += pdfWordCharCounts[pdfWIdx];
+              pdfWIdx++;
+            } else {
+              break;
+            }
           }
         }
 
         // Match trailing non-space characters (suffix) to preserve original PDF trailing kerning shifted by deltaX
         // Disable suffix matching on reflowed lines (lines with overflow from previous lines) to avoid invalid negative shifts
         let suffixMatchCount = 0;
-        const isReflowedLine = allUnitsForLine.length > lineUnits.length;
         if (!isReflowedLine) {
           while (
             suffixMatchCount < (pdfNonSpaceChars.length - prefixMatchCount) &&
@@ -922,7 +1040,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         }
         charXPositions.push(accumX);
 
-        if (unitsToPush.length > 1 && accumX > pStartX + pLineTargetW + 1.5) {
+        if (unitsToPush.length > 1 && accumX > pStartX + pLineTargetW + (1.5 * scale)) {
           const trimmedUnits = unitsToPush.slice(0, unitsToPush.length - 1);
           const poppedUnit = unitsToPush[unitsToPush.length - 1];
 
@@ -961,11 +1079,12 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         });
       };
 
+      const OUTER_OVERFLOW_TOLERANCE_PX = 1.5 * scale;
       for (let uIdx = 0; uIdx < allUnitsForLine.length; uIdx++) {
         const unit = allUnitsForLine[uIdx];
         const isFirstInLine = currentLineUnits.length === 0;
 
-        if (currentLineWidth + unit.width <= pLineTargetW || isFirstInLine) {
+        if (currentLineWidth + unit.width <= pLineTargetW + OUTER_OVERFLOW_TOLERANCE_PX || isFirstInLine) {
           currentLineUnits.push(unit);
           currentLineWidth += unit.width;
         } else {
@@ -1092,11 +1211,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       if (!isBold) {
         const glyphFontSizePx = (isSuper || isSub) ? fontSizePx * 0.65 : fontSizePx;
         const stemVwRatio = getFontStemVwRatio(currentFontFamily);
-        const darken = getStemDarkeningPx(glyphFontSizePx, stemVwRatio);
-        if (darken > 0) {
-          ctx.lineWidth = darken;
-          ctx.strokeStyle = cm.color || defaultColor || '#000000';
-          ctx.strokeText(cm.displayChar, crispX, crispY);
+        const darken = getStemDarkeningPx(ctx.font, glyphFontSizePx, stemVwRatio, dpr);
+        if (darken > 0.05) {
+          // Single subtle top-up offset pass only if native font rendering is genuinely deficient
+          ctx.fillText(cm.displayChar, crispX + darken, crispY);
         }
       }
 
@@ -1122,7 +1240,13 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const requiredHeightPx = Math.max(r.h, initialLayout.lines.length * initialLayout.lineHeightPx);
     const deltaH = requiredHeightPx - r.h;
 
-    if (onHeightChange) {
+    const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise from font metric rounding
+    if (
+      onHeightChange &&
+      (lastReportedDeltaHRef.current === null ||
+        Math.abs(deltaH - lastReportedDeltaHRef.current) > HEIGHT_CHANGE_THRESHOLD)
+    ) {
+      lastReportedDeltaHRef.current = deltaH;
       onHeightChange(item.pdfY, deltaH);
     }
 
@@ -1142,6 +1266,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     ctx.scale(dpr, dpr);
     ctx.textRendering = 'geometricPrecision';
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
 
     // 2. Clear & Fill Solid White Background Fill
     ctx.clearRect(0, 0, r.w, requiredHeightPx);

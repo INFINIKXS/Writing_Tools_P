@@ -772,7 +772,7 @@ async def extract_fonts(file: UploadFile = File(...)):
                         "subset_tag": subset_tag,
                         "stem_vw_ratio": stem_vw_ratio,
                     }
-                    logger.info(f"Extracted font {basename} ({len(buffer)} bytes, {ext})")
+                    logger.info(f"Extracted font {basename} ({len(buffer)} bytes, {ext}, stem_vw_ratio: {stem_vw_ratio})")
                 except Exception as e:
                     logger.warning(f"Failed to extract font {basename}: {e}")
         

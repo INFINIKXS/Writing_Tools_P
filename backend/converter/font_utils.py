@@ -273,13 +273,52 @@ def get_stem_darkening_ratio(cff_font):
         if private is None:
             return None
 
+        source = "StdVW"
         std_vw = getattr(private, 'StdVW', None)
+        if std_vw is None:
+            # Fallback 1: StemSnapV array (FreeType cffload.c)
+            stem_snap_v = getattr(private, 'StemSnapV', None)
+            if stem_snap_v and len(stem_snap_v) > 0:
+                std_vw = stem_snap_v[0]
+                source = "StemSnapV[0]"
+
+        if std_vw is None:
+            # Fallback 2: Inspect CFF CharStrings for median vstem hint width
+            char_strings = getattr(top_dict, 'CharStrings', None)
+            if char_strings and hasattr(char_strings, 'values'):
+                vstem_widths = []
+                for cs in list(char_strings.values())[:50]:
+                    try:
+                        if hasattr(cs, 'decompile'):
+                            cs.decompile()
+                        program = getattr(cs, 'program', None)
+                        if program:
+                            for i, op in enumerate(program):
+                                if op in ('hstem', 'vstem', 'hstemhm', 'vstemhm') and i >= 2:
+                                    w = abs(program[i-1]) if isinstance(program[i-1], (int, float)) else None
+                                    if w and 10 < w < 300:
+                                        vstem_widths.append(w)
+                    except Exception:
+                        continue
+                if vstem_widths:
+                    vstem_widths.sort()
+                    std_vw = vstem_widths[len(vstem_widths) // 2]
+                    source = "CharStrings vstem median"
+
         if std_vw is None:
             return None
 
         font_matrix = getattr(top_dict, 'FontMatrix', None)
-        units_per_em_val = 1 / font_matrix[0] if font_matrix and len(font_matrix) > 0 and font_matrix[0] != 0 else 1000
-        return float(std_vw / units_per_em_val)
+        if font_matrix and len(font_matrix) > 0 and font_matrix[0] != 0:
+            units_per_em_val = 1 / font_matrix[0]
+        elif hasattr(cff_font, 'head') and hasattr(cff_font['head'], 'unitsPerEm') and cff_font['head'].unitsPerEm > 0:
+            units_per_em_val = cff_font['head'].unitsPerEm
+        else:
+            units_per_em_val = 1000
+
+        ratio = float(std_vw / units_per_em_val)
+        logger.info(f"[CFF STEM] Extracted std_vw={std_vw} via {source} (units_per_em={units_per_em_val}) -> ratio={ratio:.4f}")
+        return ratio
     except Exception:
         return None
 
