@@ -1209,7 +1209,7 @@ async def apply_edits(
                 except Exception:
                     pass
                 page.add_redact_annot(rect, fill=bg_color)
-        page.apply_redactions(images=0, graphics=0)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=0)
 
         # ── Phase 2.5: Re-register fonts after redaction ──
         # apply_redactions() strips font resources from the page, so any

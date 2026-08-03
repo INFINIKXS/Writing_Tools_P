@@ -429,6 +429,20 @@ const detectItalic = (item) => {
   return false;
 };
 
+// Robust line-to-string sanitizer — handles every shape the backend can emit:
+// plain string, { text }, { str }, { chars: [...] }, or a bare char array.
+const lineToStr = (l) => {
+  if (typeof l === 'string') return l;
+  if (l == null) return '';
+  if (typeof l.text === 'string') return l.text;
+  if (typeof l.str === 'string') return l.str;
+  if (Array.isArray(l.chars))
+    return l.chars.map(c => (typeof c === 'string' ? c : (c?.c ?? ''))).join('');
+  if (Array.isArray(l))
+    return l.map(x => (typeof x === 'string' ? x : (x?.c ?? x?.str ?? x?.text ?? ''))).join('');
+  return '';
+};
+
 const extractColor = (item) => {
   if (item?.color) return rgbToHex(item.color);
   const firstChar = item?.origLines?.[0]?.chars?.[0] || item?.lines?.[0]?.chars?.[0];
@@ -440,7 +454,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const getInitialText = useCallback(() => {
     if (existingEdit && existingEdit.newStr) return existingEdit.newStr;
     if (item.lines && item.lines.length > 0) {
-      return item.lines.map(l => (typeof l === 'string' ? l : (l?.text || l))).join('\n');
+      return item.lines.map(lineToStr).join('\n');
     }
     if (item.rawPdfLines && item.rawPdfLines.length > 0) return item.rawPdfLines.join('\n');
     return item.str || item.text || '';
@@ -484,6 +498,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const dragAnchorRef = useRef(0);
   const isProgrammaticSelectionRef = useRef(false);
   const lastReportedDeltaHRef = useRef(null);
+  // Cache for decoded inline image elements (keyed by base64 data string)
+  const imgCache = useRef({});
 
   // Connect to pdfTypographyStore for reactive typography updates
   useSyncExternalStore(
@@ -1383,6 +1399,27 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, pdfW, pdfH);
 
+      // Draw inline images (e.g. ORCID iD badge, symbol glyphs) that overlap
+      // this paragraph block. Coordinates are in PDF-point space.
+      const inlineImages = item.inlineImages || [];
+      for (const im of inlineImages) {
+        const x = im.bbox[0] - item.pdfX;
+        const y = im.bbox[1] - item.pdfY_top;
+        const w = im.bbox[2] - im.bbox[0];
+        const h = im.bbox[3] - im.bbox[1];
+        if (!imgCache.current[im.data]) {
+          const el = new Image();
+          el.src = `data:image/${im.ext};base64,${im.data}`;
+          imgCache.current[im.data] = el;
+        }
+        const el = imgCache.current[im.data];
+        if (el.complete && el.naturalWidth > 0) {
+          ctx.drawImage(el, x, y, w, h);
+        } else {
+          el.onload = () => renderCanvas();
+        }
+      }
+
       // 3. Compute Final Layout
       const layout = computeLineLayout(ctx);
       canvas._layout = { ...layout, dpr };
@@ -1431,7 +1468,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
   }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj, cssW, onCancel]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     renderCanvas();
   }, [renderCanvas]);
 
@@ -1767,6 +1804,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           backgroundColor: '#ffffff',
           zIndex: 99,
           pointerEvents: 'none',
+          willChange: 'transform',
+          contain: 'strict',
         }}
       />
 
@@ -1788,6 +1827,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           outlineOffset: '-1px',
           backgroundColor: '#ffffff',
           transform: keyboardOffset ? `translateY(${-keyboardOffset}px)` : undefined,
+          willChange: 'transform',
+          contain: 'strict',
         }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}

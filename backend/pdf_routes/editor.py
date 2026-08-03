@@ -577,6 +577,23 @@ def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
         page_blocks = extract_page_spacing_data(page, page_idx=page_index)
         column_boundaries = _get_column_boundaries(page)
 
+        # Collect inline images (e.g. ORCID iD badge, symbol glyphs) so the
+        # frontend canvas can redraw them during editing.
+        images = []
+        for img_info in page.get_image_info(xrefs=True):
+            xref = img_info.get("xref")
+            if not xref or img_info.get("bbox") is None:
+                continue
+            try:
+                extracted = doc.extract_image(xref)
+                images.append({
+                    "bbox": list(img_info["bbox"]),
+                    "data": base64.b64encode(extracted["image"]).decode("ascii"),
+                    "ext": extracted["ext"],
+                })
+            except Exception:
+                continue
+
         for p_idx, blk in enumerate(page_blocks):
             total_paragraphs += 1
             preview = blk["text"].replace("\n", " ")
@@ -592,6 +609,7 @@ def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
             "page": page_index,
             "blocks": page_blocks,
             "columns": column_boundaries,
+            "inline_images": images,
         })
 
     doc.close()

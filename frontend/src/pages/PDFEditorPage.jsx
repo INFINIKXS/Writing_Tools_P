@@ -52,6 +52,8 @@ export default function PDFEditorPage({ initialToolId = null }) {
   const [defaultStyle, setDefaultStyle] = useState({ font: 'Helvetica', size: 16 });
   const [livePreviewUrl, setLivePreviewUrl] = useState(null);
   const [isLiveBaking, setIsLiveBaking] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const analyzeAbortRef = useRef(null);
   const objectUrlRef = useRef(null);
   const prevLiveUrlRef = useRef(null);
   const [fontWarnings, setFontWarnings] = useState([]);
@@ -83,8 +85,25 @@ export default function PDFEditorPage({ initialToolId = null }) {
   useEffect(() => {
     return () => {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      // Cancel any pending analysis on unmount
+      if (analyzeAbortRef.current) analyzeAbortRef.current.abort();
     };
   }, []);
+
+  // ── Tab-visibility recovery ───────────────────────────────────────────────
+  // If the user switches tabs while extract-spacing is in-flight the browser
+  // throttles or drops the network request. When they come back we detect the
+  // still-pending state and retry the analysis automatically.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && !spacingData && currentFile && !isAnalyzing) {
+        handleUpload(currentFile);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spacingData, currentFile, isAnalyzing]);
 
   const viewerFile = useMemo(
     () => livePreviewUrl ? { url: livePreviewUrl } : currentFile,
@@ -104,16 +123,30 @@ export default function PDFEditorPage({ initialToolId = null }) {
       URL.revokeObjectURL(prevLiveUrlRef.current);
       prevLiveUrlRef.current = null;
     }
+    // Abort any in-flight analysis request before starting a new one
+    if (analyzeAbortRef.current) analyzeAbortRef.current.abort();
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
+    setIsAnalyzing(true);
+    setSpacingData(null);
     try {
       const fd = new FormData();
       fd.append('file', file, 'document.pdf');
-      const res = await fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', { method: 'POST', body: fd });
+      const res = await fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', {
+        method: 'POST',
+        body: fd,
+        signal: controller.signal,
+      });
       if (res.ok) {
         const payload = await res.json();
         setSpacingData(payload);
         pdfTypographyStore.setTypographyData(activeFileId, payload);
       }
-    } catch (e) { console.error('extract-spacing error:', e); }
+    } catch (e) {
+      if (e.name !== 'AbortError') console.error('extract-spacing error:', e);
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   const handleLivePreview = useCallback(async () => {
@@ -320,6 +353,15 @@ export default function PDFEditorPage({ initialToolId = null }) {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
               </svg>
               Processing…
+            </span>
+          )}
+          {isAnalyzing && !isLiveBaking && (
+            <span className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400 font-medium shrink-0">
+              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+              </svg>
+              Analyzing document…
             </span>
           )}
           <div className="flex items-center gap-2 ml-auto shrink-0">

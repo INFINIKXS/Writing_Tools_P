@@ -383,6 +383,9 @@ export default function PDFViewer({
 
       pageItemsExtracted.current[pageNum] = true;
 
+      // Inline images for this page (e.g. ORCID badge, symbol glyphs)
+      const pageInlineImages = pageData.inline_images || [];
+
       // ── Step 1: Build one item per line AND index words by baseline ──
       const lineItems = [];
       const allWordsByBaseline = {};
@@ -842,6 +845,10 @@ export default function PDFViewer({
               paragraph_color: pColor,
               paragraph_align: pAlign,
               paragraph_text: pStr,
+              inlineImages: pageInlineImages.filter(im =>
+                im.bbox[0] < pX1 && im.bbox[2] > pX0 &&
+                im.bbox[1] < pY1 && im.bbox[3] > pY0
+              ),
               paragraphTypography: {
                 font_size: pFontSize,
                 font_family: pFontFamily,
@@ -869,6 +876,10 @@ export default function PDFViewer({
             paragraph_color: pColor,
             paragraph_align: pAlign,
             paragraph_text: l0.str || l0.text || '',
+            inlineImages: pageInlineImages.filter(im =>
+              im.bbox[0] < (l0.pdfX + l0.pdfW) && im.bbox[2] > l0.pdfX &&
+              im.bbox[1] < (l0.pdfY_top + l0.pdfH) && im.bbox[3] > l0.pdfY_top
+            ),
             paragraphTypography: {
               font_size: pFontSize,
               font_family: pFontFamily,
@@ -1221,59 +1232,16 @@ export default function PDFViewer({
               renderTextLayer={true}
               renderAnnotationLayer={true}
               onLoadSuccess={async (page) => {
+                // Only record the page size here. Edit-box items are exclusively
+                // populated by the spacingData effect so that single-line PDF.js
+                // fragments never appear as interactive boxes before analysis completes.
                 const newSize = {
                   height: page.originalHeight || page.view[3],
                 };
-                
-                try {
-                  const textContent = await page.getTextContent();
-                  const viewport1 = page.getViewport({ scale: 1.0 });
-                  const pageHeight = viewport1.height;
-
-                  const nativeItems = [];
-                  textContent.items.forEach((item) => {
-                    if (!item.str || item.str.trim() === '') return;
-                    const tx = item.transform[4];
-                    const ty = item.transform[5];
-                    const fontH = Math.abs(item.transform[3]) || item.height || 12;
-                    const pdfY_top = Math.max(0, pageHeight - ty - fontH);
-
-                    nativeItems.push({
-                      str: item.str,
-                      pdfX: tx,
-                      pdfY_base: ty,
-                      pdfY_top: pdfY_top,
-                      pdfW: item.width || (item.str.length * fontH * 0.5),
-                      pdfH: fontH,
-                      fontSize: fontH,
-                      fontName: item.fontName || 'Helvetica',
-                      fontPostScriptName: item.fontName || 'Helvetica',
-                      ascender_h: fontH * 0.8,
-                      descender_h: fontH * 0.2,
-                      color: 'rgb(0, 0, 0)',
-                      isBold: false,
-                      isItalic: false,
-                    });
-                  });
-
-                  setPageMetadata((prev) => {
-                    const existing = prev[index + 1] || {};
-                    return {
-                      ...prev,
-                      [index + 1]: {
-                        ...existing,
-                        size: newSize,
-                        items: existing.items || nativeItems,
-                      },
-                    };
-                  });
-                } catch (e) {
-                  console.warn('Browser native PDF text extraction fallback:', e);
-                  setPageMetadata((prev) => ({
-                    ...prev,
-                    [index + 1]: { ...(prev[index + 1] || {}), size: newSize },
-                  }));
-                }
+                setPageMetadata((prev) => ({
+                  ...prev,
+                  [index + 1]: { ...(prev[index + 1] || {}), size: newSize },
+                }));
               }}
 
               onRenderSuccess={() => {
@@ -1284,8 +1252,26 @@ export default function PDFViewer({
               }}
             />
 
+            {/* Analysis-pending shimmer — visible only while the PDF page has loaded
+                but spacingData has not yet arrived. Hidden once items are ready. */}
+            {!pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && spacingData === null && (
+              <div
+                aria-hidden="true"
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  pointerEvents: 'none',
+                  zIndex: 10,
+                  background:
+                    'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.18) 40%, rgba(255,255,255,0.32) 50%, rgba(255,255,255,0.18) 60%, transparent 100%)',
+                  backgroundSize: '200% 100%',
+                  animation: 'analysisShimmer 1.8s ease-in-out infinite',
+                }}
+              />
+            )}
+
             {/* Text hit-testing overlay and inline editor */}
-            {pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && (
+            {pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && spacingData !== null && (
               <>
                 {debugMode && (
                   <DebugOverlay
