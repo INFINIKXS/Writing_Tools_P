@@ -22,7 +22,7 @@ const rgbToHex = (colorStr) => {
   return '#' + match.slice(0, 3).map(x => parseInt(x, 10).toString(16).padStart(2, '0')).join('');
 };
 
-const SUPERSAMPLE_FACTOR = 2; // extra sharpness multiplier beyond native devicePixelRatio
+const SUPERSAMPLE_FACTOR = 1; // 1:1 physical mapping; LCD sub-pixel AA provides all needed crispness
 const MAX_EFFECTIVE_DPR = 4;  // hard cap to bound memory/CPU on already-high-DPR devices
 
 // FALLBACK: used when the font has no derivable StdVW — TrueType-outline fonts,
@@ -416,7 +416,7 @@ const detectBold = (item) => {
   if (item?.isBold === true) return true;
   const name = (item?.fontPostScriptName || item?.fontName || '').toLowerCase();
   if (/bold|heavy|black|w[6-9]|semibold/.test(name)) return true;
-  if (typeof item?.flags === 'number' && (item.flags & 2)) return true;
+  if (typeof item?.flags === 'number' && (item.flags & 16)) return true;
   return false;
 };
 
@@ -424,7 +424,7 @@ const detectItalic = (item) => {
   if (item?.isItalic === true) return true;
   const name = (item?.fontPostScriptName || item?.fontName || '').toLowerCase();
   if (/italic|oblique/.test(name)) return true;
-  if (typeof item?.flags === 'number' && (item.flags & 1)) return true;
+  if (typeof item?.flags === 'number' && (item.flags & 2)) return true;
   return false;
 };
 
@@ -1239,6 +1239,17 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       const useFontFamily = cm.charFont
         ? `"${sanitizeFontName(stripSubset(cm.charFont))}", ${currentFontFamily}`
         : currentFontFamily;
+
+      // PREVENT SYNTHETIC BOLD/ITALIC (Faux Bold)
+      // If the font file itself is already bold (e.g. "HelveticaNeueLTStd-Bd"),
+      // adding "bold " to the CSS font string forces the browser to apply synthetic bolding
+      // on top of the bold font, doubling the stem thickness.
+      const fontHasBold = /bold|black|heavy|semibold|-bd/i.test(useFontFamily);
+      const fontHasItalic = /italic|oblique|-it$|-it\b/i.test(useFontFamily);
+
+      const applyBold = useBold && !fontHasBold;
+      const applyItalic = useItalic && !fontHasItalic;
+
       // Use exact PDF font size for super/subscripts if available; fall back to proportional heuristic
       let currentFontSizePt = fontSizePt;
       if ((isSuper || isSub) && cm.pdfSize) {
@@ -1247,7 +1258,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         currentFontSizePt = fontSizePt * 0.65; // Fallback for newly typed text
       }
       const glyphSizePt = currentFontSizePt;
-      ctx.font = `${useItalic ? 'italic ' : ''}${useBold ? 'bold ' : ''}${glyphSizePt.toFixed(2)}px ${useFontFamily}`;
+      ctx.font = `${applyItalic ? 'italic ' : ''}${applyBold ? 'bold ' : ''}${glyphSizePt.toFixed(2)}px ${useFontFamily}`;
 
       ctx.fillStyle = cm.color || defaultColor || '#000000';
 
@@ -1272,14 +1283,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       ctx.fillText(cm.displayChar, crispX, crispY);
 
-      if (!useBold) {
-        const stemVwRatio = getFontStemVwRatio(useFontFamily);
-        const darken = getStemDarkeningPx(ctx.font, glyphSizePt * scale, stemVwRatio, dpr) / scale;
-        if (darken > 0.05 / scale) {
-          // Single subtle top-up offset pass only if native font rendering is genuinely deficient
-          ctx.fillText(cm.displayChar, crispX + darken, crispY);
-        }
-      }
 
       const charW = ctx.measureText(cm.displayChar).width;
       const extra = (line.extraPerSpace && (cm.origChar === ' ' || cm.origChar === '\u00A0')) ? line.extraPerSpace : 0;
@@ -1295,7 +1298,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    // Forces the canvas to use the exact same sRGB gamma color blending as the DOM
+    // text layer, eliminating the dark alpha-blended edge bleed.
+    const ctx = canvas.getContext('2d', { alpha: false, colorSpace: 'srgb' });
     if (!ctx) return;
 
     const nativeDpr = window.devicePixelRatio || 1;
@@ -1335,7 +1340,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     ctx.scale(dpr, dpr);
     ctx.scale(scale, scale);
-    ctx.textRendering = 'geometricPrecision';
+    // 'auto' allows the browser to use standard grid-fitting (hinting),
+    // which matches the exact stroke thickness of the PDF.js DOM text layer.
+    ctx.textRendering = 'auto';
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
 
