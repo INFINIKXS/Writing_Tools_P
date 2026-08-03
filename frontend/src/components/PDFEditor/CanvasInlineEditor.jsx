@@ -263,6 +263,9 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
         const displayChar = SUPER_MAP[bMeta.c] || bMeta.c;
         const origChar = SUPER_MAP[bMeta.c] || bMeta.c;
         const color = bMeta.color || undefined;
+        const charFont = bMeta.font || null;
+        const charIsItalic = charFont ? /italic|oblique|-it$|-it\b/i.test(charFont) : null;
+        const charIsBold = charFont ? /bold|black|heavy|semibold|-bd/i.test(charFont) : null;
 
         cleanChars.push(origChar);
         charMeta.push({
@@ -270,7 +273,12 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
           displayChar,
           kind,
           color,
-          charIndex: i
+          charIndex: i,
+          charFont,
+          charIsItalic,
+          charIsBold,
+          pdfSize: bMeta.size || undefined,
+          pdfOriginY: bMeta.origin_y || undefined,
         });
       } else {
         let kind = 'normal';
@@ -439,11 +447,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
   const rawInitialStr = getInitialText();
   const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
-  console.log('[mixed-style-check]', origLines?.flatMap(l => l.chars || []).map(c => ({
-    char: c.c ?? c.char,
-    font: c.font,
-    flags: c.flags,
-  })));
   const initialParsed = useMemo(() => {
     const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
     return parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
@@ -667,13 +670,15 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const computeLineLayout = useCallback((ctx) => {
     const { charMeta } = parseCharMetadata(text, initialRanges, origLines);
     
+    const baseFontSizePt = item.fontSize + (fontSizeAdj / scale);
     // Font specs
-    const baseFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${baseFontSizePx}px ${currentFontFamily}`;
-    const superFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${Math.round(baseFontSizePx * 0.65)}px ${currentFontFamily}`;
+    const baseFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${baseFontSizePt}px ${currentFontFamily}`;
+    // Preserve exact proportional metrics to prevent ascent/descent baseline drops
+    const superFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${(baseFontSizePt * 0.65).toFixed(2)}px ${currentFontFamily}`;
 
     // Measure HTML ascender
     ctx.font = baseFont;
-    let ascenderPx = baseFontSizePx * 0.8;
+    let ascenderPx = baseFontSizePt * 0.8;
     try {
       const m = ctx.measureText('Hpx');
       if (m.actualBoundingBoxAscent != null && !isNaN(m.actualBoundingBoxAscent)) {
@@ -686,8 +691,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
 
     // Real, PDF-measured offset from top of block to line 1's baseline
-    const firstLineBaselineOffsetPx = (item.pdfY_base != null && item.pdfY_top != null)
-      ? (item.pdfY_base - item.pdfY_top) * scale
+    const firstLineBaselineOffsetPt = (item.pdfY_base != null && item.pdfY_top != null)
+      ? (item.pdfY_base - item.pdfY_top)
       : ascenderPx;
 
     // Hard line breaks matching original PDF line structure (text.split('\n'))
@@ -696,11 +701,11 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     // Calculate line height using ACTUAL PDF-derived line height.
     const pdfLineHeight = item.lineHeight
-      ? item.lineHeight * scale
+      ? item.lineHeight
       : (r.h > 0 && origLines && origLines.length > 0)
-        ? r.h / origLines.length
-        : baseFontSizePx * 1.2;
-    const lineHeightPx = pdfLineHeight;
+        ? (r.h / scale) / origLines.length
+        : baseFontSizePt * 1.2;
+    const lineHeightPt = pdfLineHeight;
 
     let globalCharOffset = 0;
     let overflowUnitsFromPrevLine = [];
@@ -710,10 +715,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       const isLineUnedited = overflowUnitsFromPrevLine.length === 0 &&
                               pIdx < initialLinesText.length &&
                               pText === initialLinesText[pIdx];
-
-      if (isLineUnedited) {
-        console.log('[unedited-skip]', { pIdx, pText: pText.slice(0, 30) });
-      }
       const pMeta = charMeta.slice(globalCharOffset, globalCharOffset + pText.length);
 
       // Extract current line units from pMeta
@@ -736,7 +737,13 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           }
           let unitWidth = 0;
           for (const ucm of currentUnitChars) {
-            ctx.font = (ucm.kind === 'super' || ucm.kind === 'sub') ? superFont : baseFont;
+            const useItalicU = ucm.charIsItalic != null ? ucm.charIsItalic : isItalic;
+            const useBoldU = ucm.charIsBold != null ? ucm.charIsBold : isBold;
+            const useFamilyU = ucm.charFont
+              ? `"${sanitizeFontName(stripSubset(ucm.charFont))}", ${currentFontFamily}`
+              : currentFontFamily;
+            const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? Math.round(baseFontSizePt * 0.65) : baseFontSizePt;
+            ctx.font = `${useItalicU ? 'italic ' : ''}${useBoldU ? 'bold ' : ''}${glyphSzU}px ${useFamilyU}`;
             unitWidth += ctx.measureText(ucm.displayChar).width;
           }
           lineUnits.push({ chars: currentUnitChars, width: unitWidth });
@@ -747,7 +754,13 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       if (currentUnitChars.length > 0) {
         let unitWidth = 0;
         for (const ucm of currentUnitChars) {
-          ctx.font = (ucm.kind === 'super' || ucm.kind === 'sub') ? superFont : baseFont;
+          const useItalicU = ucm.charIsItalic != null ? ucm.charIsItalic : isItalic;
+          const useBoldU = ucm.charIsBold != null ? ucm.charIsBold : isBold;
+          const useFamilyU = ucm.charFont
+            ? `"${sanitizeFontName(stripSubset(ucm.charFont))}", ${currentFontFamily}`
+            : currentFontFamily;
+          const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? Math.round(baseFontSizePt * 0.65) : baseFontSizePt;
+          ctx.font = `${useItalicU ? 'italic ' : ''}${useBoldU ? 'bold ' : ''}${glyphSzU}px ${useFamilyU}`;
           unitWidth += ctx.measureText(ucm.displayChar).width;
         }
         lineUnits.push({ chars: currentUnitChars, width: unitWidth });
@@ -777,8 +790,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       const pOrigLine = (origLines && Array.isArray(origLines) && origLines[pIdx]) ? origLines[pIdx] : null;
       const { line_x0, line_x1 } = getOrigLineBounds(pOrigLine, pIdx);
-      const pLineTargetW = Math.max(1, (line_x1 - line_x0) * scale);
-      const pStartX = (line_x0 - item.pdfX) * scale;
+      const pLineTargetW = Math.max(1, (line_x1 - line_x0));
+      const pStartX = (line_x0 - item.pdfX);
 
       let currentLineUnits = [];
       let currentLineWidth = 0;
@@ -795,6 +808,26 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const c = ch.c ?? ch.char ?? '';
           return c !== ' ' && c !== '\u00A0' && c.length > 0;
         });
+
+        // Calculate the exact baseline (dominant origin_y) for normal text on this line
+        let dominantPdfOriginY = null;
+        const normalOriginYs = pdfChars
+          .filter(ch => !ch.is_superscript && !ch.is_subscript && ch.origin_y != null)
+          .map(ch => ch.origin_y);
+        if (normalOriginYs.length > 0) {
+          const counts = {};
+          for (const y of normalOriginYs) {
+            const rounded = Math.round(y * 10) / 10; // bucket to 0.1pt precision
+            counts[rounded] = (counts[rounded] || 0) + 1;
+          }
+          let maxCount = 0;
+          for (const [y, count] of Object.entries(counts)) {
+            if (count > maxCount) {
+              maxCount = count;
+              dominantPdfOriginY = parseFloat(y);
+            }
+          }
+        }
 
         // Match leading non-space characters in lineChars against pdfNonSpaceChars
         const lineNonSpaceChars = lineChars.filter(
@@ -913,17 +946,17 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             if (!isSpace && testPdfCharIdx < prefixMatchCount) {
               const pdfCh = pdfNonSpaceChars[testPdfCharIdx];
               if (linePrefixStartWordIdx > 0 && !testDeltaXComputed && testPdfCharIdx === 0) {
-                const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX) * scale;
+                const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX);
                 testDeltaX = testX - firstPrefixPdfX0;
                 testDeltaXComputed = true;
               }
-              testX = (pdfCh.x1 - item.pdfX) * scale + testDeltaX + testExtraSpaceShift;
+              testX = (pdfCh.x1 - item.pdfX) + testDeltaX + testExtraSpaceShift;
               testPdfCharIdx++;
               testPrevWasSpace = false;
             } else if (isSpace && testPdfCharIdx > 0 && testPdfCharIdx < prefixMatchCount) {
               if (!testPrevWasSpace) {
                 const nextPdfCh = pdfNonSpaceChars[testPdfCharIdx];
-                testX = (nextPdfCh.x0 - item.pdfX) * scale + testDeltaX + testExtraSpaceShift;
+                testX = (nextPdfCh.x0 - item.pdfX) + testDeltaX + testExtraSpaceShift;
               } else {
                 ctx.font = isSuper ? superFont : baseFont;
                 const extraW = ctx.measureText(cm.displayChar).width;
@@ -933,14 +966,14 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
               testPrevWasSpace = true;
             } else if (!isSpace && testNonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
               if (!testDeltaXComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
-                const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX) * scale;
+                const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX);
                 testDeltaX = testX - firstSuffixPdfX0;
                 testDeltaXComputed = true;
               }
               const suffixPdfIdx = pdfNonSpaceChars.length - (lineNonSpaceChars.length - testNonSpaceCounter);
               if (suffixPdfIdx >= 0 && suffixPdfIdx < pdfNonSpaceChars.length) {
                 const pdfCh = pdfNonSpaceChars[suffixPdfIdx];
-                testX = (pdfCh.x1 - item.pdfX) * scale + testDeltaX;
+                testX = (pdfCh.x1 - item.pdfX) + testDeltaX;
               } else {
                 ctx.font = isSuper ? superFont : baseFont;
                 testX += ctx.measureText(cm.displayChar).width;
@@ -982,12 +1015,12 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             // ── PREFIX REGION: exact PDF coordinates + deltaXShift + extraSpaceShift ──
             const pdfCh = pdfNonSpaceChars[pdfCharIdx];
             if (linePrefixStartWordIdx > 0 && !deltaXShiftComputed && pdfCharIdx === 0 && pdfNonSpaceChars.length > 0) {
-              const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX) * scale;
+              const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX);
               deltaXShift = accumX - firstPrefixPdfX0;
               deltaXShiftComputed = true;
             }
-            const pdfX0 = (pdfCh.x0 - item.pdfX) * scale + deltaXShift + extraSpaceShift;
-            const pdfX1 = (pdfCh.x1 - item.pdfX) * scale + deltaXShift + extraSpaceShift;
+            const pdfX0 = (pdfCh.x0 - item.pdfX) + deltaXShift + extraSpaceShift;
+            const pdfX1 = (pdfCh.x1 - item.pdfX) + deltaXShift + extraSpaceShift;
             charXPositions.push(pdfX0);
             accumX = pdfX1;
             pdfCharIdx++;
@@ -996,7 +1029,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             // ── PREFIX SPACE ──
             if (!prevWasSpace) {
               const nextPdfCh = pdfNonSpaceChars[pdfCharIdx];
-              const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) * scale + deltaXShift;
+              const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) + deltaXShift;
               charXPositions.push(accumX);
               accumX = nextPdfX0 + extraSpaceShift + (spacesEncountered * extraPerSpace);
             } else {
@@ -1012,15 +1045,15 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           } else if (!isSpace && nonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
             // ── SUFFIX REGION: PDF x0 + ΔX + justification offset ──
             if (!deltaXShiftComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
-              const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX) * scale;
+              const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX);
               deltaXShift = accumX - firstSuffixPdfX0;
               deltaXShiftComputed = true;
             }
             const suffixPdfIdx = pdfNonSpaceChars.length - (lineNonSpaceChars.length - nonSpaceCounter);
             if (suffixPdfIdx >= 0 && suffixPdfIdx < pdfNonSpaceChars.length) {
               const pdfCh = pdfNonSpaceChars[suffixPdfIdx];
-              const shiftedX0 = (pdfCh.x0 - item.pdfX) * scale + deltaXShift;
-              const shiftedX1 = (pdfCh.x1 - item.pdfX) * scale + deltaXShift;
+              const shiftedX0 = (pdfCh.x0 - item.pdfX) + deltaXShift;
+              const shiftedX1 = (pdfCh.x1 - item.pdfX) + deltaXShift;
               charXPositions.push(shiftedX0);
               accumX = shiftedX1;
             } else {
@@ -1047,7 +1080,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         }
         charXPositions.push(accumX);
 
-        if (unitsToPush.length > 1 && accumX > pStartX + pLineTargetW + (1.5 * scale)) {
+        if (unitsToPush.length > 1 && accumX > pStartX + pLineTargetW + 1.5) {
           const trimmedUnits = unitsToPush.slice(0, unitsToPush.length - 1);
           const poppedUnit = unitsToPush[unitsToPush.length - 1];
 
@@ -1066,8 +1099,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           return pushLine(trimmedUnits, isLastCanvasLineOfBlock);
         }
 
-        const yTop = lineIdx * lineHeightPx;
-        const yBaseline = yTop + firstLineBaselineOffsetPx;
+        const yTop = lineIdx * lineHeightPt;
+        const yBaseline = yTop + firstLineBaselineOffsetPt;
 
         lines.push({
           lineIndex: lineIdx,
@@ -1082,19 +1115,20 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           width: accumX - pStartX,
           yTop,
           yBaseline,
-          lineHeightPx
+          lineHeightPt,
+          dominantPdfOriginY,
         });
       };
 
       if (isLineUnedited) {
         currentLineUnits = allUnitsForLine;
       } else {
-        const OUTER_OVERFLOW_TOLERANCE_PX = 1.5 * scale;
+        const OUTER_OVERFLOW_TOLERANCE_PT = 1.5;
         for (let uIdx = 0; uIdx < allUnitsForLine.length; uIdx++) {
           const unit = allUnitsForLine[uIdx];
           const isFirstInLine = currentLineUnits.length === 0;
 
-          if (currentLineWidth + unit.width <= pLineTargetW + OUTER_OVERFLOW_TOLERANCE_PX || isFirstInLine) {
+          if (currentLineWidth + unit.width <= pLineTargetW + OUTER_OVERFLOW_TOLERANCE_PT || isFirstInLine) {
             currentLineUnits.push(unit);
             currentLineWidth += unit.width;
           } else {
@@ -1129,7 +1163,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             x: xPos,
             yTop: lineObj.yTop,
             yBaseline: lineObj.yBaseline,
-            lineHeightPx: lineObj.lineHeightPx,
+            lineHeightPt: lineObj.lineHeightPt,
             lineIndex: lineIdx
           };
         }
@@ -1149,7 +1183,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
               x: endX,
               yTop: lineObj.yTop,
               yBaseline: lineObj.yBaseline,
-              lineHeightPx: lineObj.lineHeightPx,
+              lineHeightPt: lineObj.lineHeightPt,
               lineIndex: lineIdx
             };
           }
@@ -1158,7 +1192,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     });
 
     // Fill any missing unmapped indices by interpolating from adjacent mapped indices
-    let lastValidPos = { x: 0, yTop: 0, yBaseline: firstLineBaselineOffsetPx, lineHeightPx, lineIndex: 0 };
+    let lastValidPos = { x: 0, yTop: 0, yBaseline: firstLineBaselineOffsetPt, lineHeightPt, lineIndex: 0 };
     for (let idx = 0; idx <= text.length; idx++) {
       if (globalCharMap[idx]) {
         lastValidPos = globalCharMap[idx];
@@ -1177,53 +1211,71 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       x: finalX,
       yTop: lastLine ? lastLine.yTop : 0,
       yBaseline: lastLine ? lastLine.yBaseline : 0,
-      lineHeightPx: lastLine ? lastLine.lineHeightPx : lineHeightPx,
+      lineHeightPt: lastLine ? lastLine.lineHeightPt : lineHeightPt,
       lineIndex: lines.length - 1
     };
 
     const nativeDpr = window.devicePixelRatio || 1;
     const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
-    return { lines, baseFont, superFont, ascenderPx, lineHeightPx, globalCharMap, dpr };
-  }, [text, initialRanges, origLines, item, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h, initialLinesText]);
+    return { lines, baseFont, superFont, ascenderPx, lineHeightPt, globalCharMap, dpr };
+  }, [text, initialRanges, origLines, item, scale, fontSizeAdj, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h, initialLinesText]);
 
   /**
    * Sequential X-Advance Tracking & Superscript Y-Elevation rendering per line
    */
-  const drawCanvasLine = useCallback((ctx, line, layout, fontSizePx, defaultColor) => {
+  const drawCanvasLine = useCallback((ctx, line, layout, fontSizePt, defaultColor) => {
     let currentX = line.startX || 0;
     const dpr = layout?.dpr || Math.min((window.devicePixelRatio || 1) * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+    const totalScale = dpr * scale;
 
     for (let i = 0; i < line.chars.length; i++) {
       const cm = line.chars[i];
       const isSuper = cm.kind === 'super';
       const isSub = cm.kind === 'sub';
 
-      ctx.font = (isSuper || isSub) ? layout.superFont : layout.baseFont;
+      // Per-character font: fall back to block-level style for new/edited characters that have no charFont
+      const useItalic = cm.charIsItalic != null ? cm.charIsItalic : isItalic;
+      const useBold = cm.charIsBold != null ? cm.charIsBold : isBold;
+      const useFontFamily = cm.charFont
+        ? `"${sanitizeFontName(stripSubset(cm.charFont))}", ${currentFontFamily}`
+        : currentFontFamily;
+      // Use exact PDF font size for super/subscripts if available; fall back to proportional heuristic
+      let currentFontSizePt = fontSizePt;
+      if ((isSuper || isSub) && cm.pdfSize) {
+        currentFontSizePt = cm.pdfSize; // Exact PDF point size
+      } else if (isSuper || isSub) {
+        currentFontSizePt = fontSizePt * 0.65; // Fallback for newly typed text
+      }
+      const glyphSizePt = currentFontSizePt;
+      ctx.font = `${useItalic ? 'italic ' : ''}${useBold ? 'bold ' : ''}${glyphSizePt.toFixed(2)}px ${useFontFamily}`;
+
       ctx.fillStyle = cm.color || defaultColor || '#000000';
 
-      // Dual-baseline vertical elevation offset:
-      // Superscript: -0.32 * fontSizePx
-      // Subscript: +0.15 * fontSizePx
+      // Use exact PDF baseline delta when available; fall back to heuristics for newly typed text
       let yPos = line.yBaseline;
-      if (isSuper) {
-        yPos = line.yBaseline - (0.32 * fontSizePx);
+      if ((isSuper || isSub) && cm.pdfOriginY != null && line.dominantPdfOriginY != null) {
+        // In PDF space (top-down), superscript origin_y < normal baseline origin_y.
+        // Positive pdfShiftY means the char sits above the baseline — subtract to move UP on canvas.
+        const pdfShiftY = line.dominantPdfOriginY - cm.pdfOriginY;
+        yPos = line.yBaseline - pdfShiftY;
+      } else if (isSuper) {
+        yPos = line.yBaseline - (0.38 * fontSizePt); // Fallback for newly typed text
       } else if (isSub) {
-        yPos = line.yBaseline + (0.15 * fontSizePx);
+        yPos = line.yBaseline + (0.15 * fontSizePt); // Fallback for newly typed text
       }
 
       const rawX = (line.charXPositions && line.charXPositions[i] != null) ? line.charXPositions[i] : currentX;
       
       // Snap to exact device pixel boundary for crystal-clear, non-blurry text rendering
-      const crispX = Math.round(rawX * dpr) / dpr;
-      const crispY = Math.round(yPos * dpr) / dpr;
+      const crispX = Math.round(rawX * totalScale) / totalScale;
+      const crispY = Math.round(yPos * totalScale) / totalScale;
 
       ctx.fillText(cm.displayChar, crispX, crispY);
 
-      if (!isBold) {
-        const glyphFontSizePx = (isSuper || isSub) ? fontSizePx * 0.65 : fontSizePx;
-        const stemVwRatio = getFontStemVwRatio(currentFontFamily);
-        const darken = getStemDarkeningPx(ctx.font, glyphFontSizePx, stemVwRatio, dpr);
-        if (darken > 0.05) {
+      if (!useBold) {
+        const stemVwRatio = getFontStemVwRatio(useFontFamily);
+        const darken = getStemDarkeningPx(ctx.font, glyphSizePt * scale, stemVwRatio, dpr) / scale;
+        if (darken > 0.05 / scale) {
           // Single subtle top-up offset pass only if native font rendering is genuinely deficient
           ctx.fillText(cm.displayChar, crispX + darken, crispY);
         }
@@ -1233,7 +1285,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       const extra = (line.extraPerSpace && (cm.origChar === ' ' || cm.origChar === '\u00A0')) ? line.extraPerSpace : 0;
       currentX = rawX + charW + extra;
     }
-  }, [isBold, currentFontFamily]);
+  }, [isBold, isItalic, currentFontFamily, scale]);
 
   const coverageRef = useRef(null);
 
@@ -1246,14 +1298,18 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    const nativeDpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+
     // 1. Temporary Layout Pass to determine total required height
     const initialLayout = computeLineLayout(ctx);
     const numOrigLines = (origLines && origLines.length) || 1;
     const extraLines = Math.max(0, initialLayout.lines.length - numOrigLines);
-    const requiredHeightPx = r.h + extraLines * initialLayout.lineHeightPx;
+    const requiredHeightPt = (r.h / scale) + extraLines * initialLayout.lineHeightPt;
+    const requiredHeightPx = requiredHeightPt * scale;
     const deltaH = requiredHeightPx - r.h;
 
-    const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise from font metric rounding
+    const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise
     if (
       onHeightChange &&
       (lastReportedDeltaHRef.current === null ||
@@ -1263,8 +1319,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       onHeightChange(item.pdfY, deltaH);
     }
 
-    const nativeDpr = window.devicePixelRatio || 1;
-    const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+    // 2. Set exact dimensions using r.w and r.h (Zero-Distortion)
     const canvasW = Math.max(1, Math.round(r.w * dpr));
     const canvasH = Math.max(1, Math.round(requiredHeightPx * dpr));
 
@@ -1274,18 +1329,21 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     canvas.style.height = `${requiredHeightPx}px`;
 
     if (coverageRef.current) {
+      coverageRef.current.style.width = `${r.w}px`;
       coverageRef.current.style.height = `${requiredHeightPx}px`;
     }
 
     ctx.scale(dpr, dpr);
+    ctx.scale(scale, scale);
     ctx.textRendering = 'geometricPrecision';
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
 
-    // 2. Clear & Fill Solid White Background Fill
-    ctx.clearRect(0, 0, r.w, requiredHeightPx);
+    const pdfW = r.w / scale;
+    const pdfH = requiredHeightPx / scale;
+    ctx.clearRect(0, 0, pdfW, pdfH);
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, r.w, requiredHeightPx);
+    ctx.fillRect(0, 0, pdfW, pdfH);
 
     // 3. Compute Final Layout
     const layout = computeLineLayout(ctx);
@@ -1306,16 +1364,17 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         const xStart = line.charXPositions[localStart] || 0;
         const xEnd = line.charXPositions[localEnd] || 0;
 
-        ctx.fillRect(xStart, line.yTop, Math.max(1, xEnd - xStart), line.lineHeightPx);
+        ctx.fillRect(xStart, line.yTop, Math.max(0.5, xEnd - xStart), line.lineHeightPt);
       }
     }
 
-    // 5. Formatted Line Text & Dual-Baseline Superscripts
+    // 5. Draw Text using exact baseFontSizePt
+    const baseFontSizePt = item.fontSize + (fontSizeAdj / scale);
     for (const line of layout.lines) {
-      drawCanvasLine(ctx, line, layout, baseFontSizePx, color);
+      drawCanvasLine(ctx, line, layout, baseFontSizePt, color);
     }
 
-    // 6. 2px Smooth Blinking Caret Bar via Global Spatial Character Map
+    // 6. Blinking Caret Bar (2 CSS pixels wide = 2 / scale PDF points)
     if (isFocused && selection.start === selection.end && caretVisible) {
       const targetOffset = selection.start;
       const caretPos = (layout.globalCharMap && layout.globalCharMap[targetOffset])
@@ -1324,10 +1383,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       if (caretPos) {
         ctx.fillStyle = color || '#000000';
-        ctx.fillRect(Math.floor(caretPos.x), caretPos.yTop, 2, caretPos.lineHeightPx);
+        ctx.fillRect(caretPos.x, caretPos.yTop, 2 / scale, caretPos.lineHeightPt);
       }
     }
-  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, baseFontSizePx, color, isFocused, caretVisible, item.pdfY, onHeightChange]);
+  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj]);
 
   useEffect(() => {
     renderCanvas();
@@ -1343,17 +1402,20 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const layout = canvas._layout;
     if (!layout.lines || layout.lines.length === 0) return 0;
 
+    const pdfClickX = clickX / scale;
+    const pdfClickY = clickY / scale;
+
     // Exact vertical line bounding box lookup (yMin to yMax)
     let targetLine = layout.lines[0];
     for (let l = 0; l < layout.lines.length; l++) {
       const line = layout.lines[l];
       const yMin = line.yTop;
-      const yMax = line.yTop + line.lineHeightPx;
-      if (clickY >= yMin && clickY < yMax) {
+      const yMax = line.yTop + line.lineHeightPt;
+      if (pdfClickY >= yMin && pdfClickY < yMax) {
         targetLine = line;
         break;
       }
-      if (clickY >= yMax) {
+      if (pdfClickY >= yMax) {
         targetLine = line;
       }
     }
@@ -1371,21 +1433,21 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const lastCm = lineChars[len - 1];
     const lastOffset = (lastCm && lastCm.charIndex >= 0) ? lastCm.charIndex + 1 : targetLine.charEndOffset;
 
-    if (clickX <= charX[0]) return firstOffset;
-    if (clickX >= charX[len]) return lastOffset;
+    if (pdfClickX <= charX[0]) return firstOffset;
+    if (pdfClickX >= charX[len]) return lastOffset;
 
     for (let i = 0; i < len; i++) {
       const xLeft = charX[i];
       const xRight = charX[i + 1];
       const xMid = (xLeft + xRight) / 2;
 
-      if (clickX < xMid) {
+      if (pdfClickX < xMid) {
         const cm = lineChars[i];
         return (cm && cm.charIndex >= 0) ? cm.charIndex : (targetLine.charStartOffset + i);
       }
     }
     return lastOffset;
-  }, [text.length]);
+  }, [text.length, scale]);
 
   /**
    * Mouse Pointer Event Handlers
@@ -1494,7 +1556,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           : Math.min(layout.lines.length - 1, currentLineIdx + 1);
 
         const targetLine = layout.lines[targetLineIdx];
-        const targetOffset = getCharOffsetFromPoint(currentX, targetLine.yTop + 2);
+        const targetOffset = getCharOffsetFromPoint(currentX * scale, (targetLine.yTop + 0.1) * scale);
 
         if (e.shiftKey) {
           const anchor = selection.start;
@@ -1679,7 +1741,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           height: `${r.h}px`,
           zIndex: 100,
           cursor: 'text',
-          border: '1px dashed rgba(148, 163, 184, 0.8)',
+          outline: '1px dashed rgba(148, 163, 184, 0.8)',
+          outlineOffset: '-1px',
           backgroundColor: '#ffffff',
           transform: keyboardOffset ? `translateY(${-keyboardOffset}px)` : undefined,
         }}
