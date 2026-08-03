@@ -79,12 +79,12 @@ function measureNativeStemWidthPx(fontString, dpr = 1) {
   const cacheKey = `${fontString}__dpr${dpr.toFixed(2)}`;
   if (nativeStemWidthCache.has(cacheKey)) return nativeStemWidthCache.get(cacheKey);
 
-  // Lowercase-only, full-ascender-height characters: guaranteed single clean
-  // vertical stroke, same glyph class (no uppercase stem-weight difference),
-  // and tall enough to reliably hit the fixed sampling row (unlike x-height-only
-  // letters like 'n', which can fail to reach the row entirely and silently drop
-  // out of the measurement — biasing the result toward whatever survives).
-  const stemChars = ['l', 'i', 't'];
+  // Single-character probe: 'l' is a clean, unadorned, full-ascender-height
+  // vertical stroke with no crossbar (H), no x-height/row-mismatch risk (n, i),
+  // and no curved/tapering base (t). Every other character tried introduced a
+  // distinct measurement bug of its own; 'l' alone has given a consistent,
+  // plausible reading across every test in this investigation.
+  const stemChars = ['l'];
   const probeSize = 256; // large + fixed, so measurement precision doesn't depend on the real render size
   const probe = document.createElement('canvas');
   probe.width = probeSize;
@@ -125,12 +125,6 @@ function measureNativeStemWidthPx(fontString, dpr = 1) {
   const medianEntry = measurements[Math.floor(measurements.length / 2)];
   const medianRatio = medianEntry.ratio;
 
-  console.log(
-    `[stem-probe] font="${fontString}" ` +
-    measurements.map(m => `${m.ch}=${m.ratio.toFixed(4)}`).join(' ') +
-    ` | median(${medianEntry.ch})=${medianRatio.toFixed(4)}`
-  );
-
   // ONLY cache if font is confirmed loaded in browser memory,
   // preventing premature fallback measurements from permanently corrupting the cache.
   const isFontLoaded = typeof document !== 'undefined' && document.fonts && document.fonts.check(probeFont);
@@ -156,11 +150,6 @@ const getStemDarkeningPx = (fontString, fontSizePx, stemVwRatio, dpr = 1) => {
   if (!getStemDarkeningPx._loggedKeys) getStemDarkeningPx._loggedKeys = new Set();
   if (!getStemDarkeningPx._loggedKeys.has(logKey)) {
     getStemDarkeningPx._loggedKeys.add(logKey);
-    console.log(
-      `[stem-darken] font="${fontString}" size=${fontSizePx.toFixed(2)}px ` +
-      `stemVwRatio=${stemVwRatio.toFixed(4)} target=${targetStemWidthPx.toFixed(3)}px ` +
-      `native=${nativeStemWidthPx.toFixed(3)}px result=${result.toFixed(3)}px`
-    );
   }
 
   return result;
@@ -450,12 +439,18 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
   const rawInitialStr = getInitialText();
   const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
+  console.log('[mixed-style-check]', origLines?.flatMap(l => l.chars || []).map(c => ({
+    char: c.c ?? c.char,
+    font: c.font,
+    flags: c.flags,
+  })));
   const initialParsed = useMemo(() => {
     const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
     return parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
   }, [rawInitialStr, existingEdit, item, origLines]);
   const initialStr = initialParsed.cleanText;
   const initialRanges = useMemo(() => extractRangesFromCharMeta(initialParsed.charMeta), [initialParsed.charMeta]);
+  const initialLinesText = useMemo(() => initialStr.split('\n'), [initialStr]);
 
   // Text state
   const [text, setText] = useState(initialStr);
@@ -681,14 +676,19 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     let ascenderPx = baseFontSizePx * 0.8;
     try {
       const m = ctx.measureText('Hpx');
-      if (m.fontBoundingBoxAscent != null && !isNaN(m.fontBoundingBoxAscent)) {
-        ascenderPx = m.fontBoundingBoxAscent;
-      } else if (m.actualBoundingBoxAscent != null && !isNaN(m.actualBoundingBoxAscent)) {
+      if (m.actualBoundingBoxAscent != null && !isNaN(m.actualBoundingBoxAscent)) {
         ascenderPx = m.actualBoundingBoxAscent;
+      } else if (m.fontBoundingBoxAscent != null && !isNaN(m.fontBoundingBoxAscent)) {
+        ascenderPx = m.fontBoundingBoxAscent;
       }
     } catch {
       // Fall back to default ascender estimate if font metrics unavailable
     }
+
+    // Real, PDF-measured offset from top of block to line 1's baseline
+    const firstLineBaselineOffsetPx = (item.pdfY_base != null && item.pdfY_top != null)
+      ? (item.pdfY_base - item.pdfY_top) * scale
+      : ascenderPx;
 
     // Hard line breaks matching original PDF line structure (text.split('\n'))
     const rawLinesText = text.split('\n');
@@ -707,6 +707,13 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     for (let pIdx = 0; pIdx < rawLinesText.length || overflowUnitsFromPrevLine.length > 0; pIdx++) {
       const pText = pIdx < rawLinesText.length ? rawLinesText[pIdx] : '';
+      const isLineUnedited = overflowUnitsFromPrevLine.length === 0 &&
+                              pIdx < initialLinesText.length &&
+                              pText === initialLinesText[pIdx];
+
+      if (isLineUnedited) {
+        console.log('[unedited-skip]', { pIdx, pText: pText.slice(0, 30) });
+      }
       const pMeta = charMeta.slice(globalCharOffset, globalCharOffset + pText.length);
 
       // Extract current line units from pMeta
@@ -1060,7 +1067,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         }
 
         const yTop = lineIdx * lineHeightPx;
-        const yBaseline = yTop + ascenderPx;
+        const yBaseline = yTop + firstLineBaselineOffsetPx;
 
         lines.push({
           lineIndex: lineIdx,
@@ -1079,18 +1086,22 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         });
       };
 
-      const OUTER_OVERFLOW_TOLERANCE_PX = 1.5 * scale;
-      for (let uIdx = 0; uIdx < allUnitsForLine.length; uIdx++) {
-        const unit = allUnitsForLine[uIdx];
-        const isFirstInLine = currentLineUnits.length === 0;
+      if (isLineUnedited) {
+        currentLineUnits = allUnitsForLine;
+      } else {
+        const OUTER_OVERFLOW_TOLERANCE_PX = 1.5 * scale;
+        for (let uIdx = 0; uIdx < allUnitsForLine.length; uIdx++) {
+          const unit = allUnitsForLine[uIdx];
+          const isFirstInLine = currentLineUnits.length === 0;
 
-        if (currentLineWidth + unit.width <= pLineTargetW + OUTER_OVERFLOW_TOLERANCE_PX || isFirstInLine) {
-          currentLineUnits.push(unit);
-          currentLineWidth += unit.width;
-        } else {
-          // Unit exceeds target width of current line — push remaining units to overflow for next line!
-          overflowUnitsFromPrevLine = allUnitsForLine.slice(uIdx);
-          break;
+          if (currentLineWidth + unit.width <= pLineTargetW + OUTER_OVERFLOW_TOLERANCE_PX || isFirstInLine) {
+            currentLineUnits.push(unit);
+            currentLineWidth += unit.width;
+          } else {
+            // Unit exceeds target width of current line — push remaining units to overflow for next line!
+            overflowUnitsFromPrevLine = allUnitsForLine.slice(uIdx);
+            break;
+          }
         }
       }
 
@@ -1147,7 +1158,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     });
 
     // Fill any missing unmapped indices by interpolating from adjacent mapped indices
-    let lastValidPos = { x: 0, yTop: 0, yBaseline: ascenderPx, lineHeightPx, lineIndex: 0 };
+    let lastValidPos = { x: 0, yTop: 0, yBaseline: firstLineBaselineOffsetPx, lineHeightPx, lineIndex: 0 };
     for (let idx = 0; idx <= text.length; idx++) {
       if (globalCharMap[idx]) {
         lastValidPos = globalCharMap[idx];
@@ -1173,7 +1184,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const nativeDpr = window.devicePixelRatio || 1;
     const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
     return { lines, baseFont, superFont, ascenderPx, lineHeightPx, globalCharMap, dpr };
-  }, [text, initialRanges, origLines, item, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h]);
+  }, [text, initialRanges, origLines, item, scale, baseFontSizePx, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h, initialLinesText]);
 
   /**
    * Sequential X-Advance Tracking & Superscript Y-Elevation rendering per line
@@ -1237,7 +1248,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     // 1. Temporary Layout Pass to determine total required height
     const initialLayout = computeLineLayout(ctx);
-    const requiredHeightPx = Math.max(r.h, initialLayout.lines.length * initialLayout.lineHeightPx);
+    const numOrigLines = (origLines && origLines.length) || 1;
+    const extraLines = Math.max(0, initialLayout.lines.length - numOrigLines);
+    const requiredHeightPx = r.h + extraLines * initialLayout.lineHeightPx;
     const deltaH = requiredHeightPx - r.h;
 
     const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise from font metric rounding
