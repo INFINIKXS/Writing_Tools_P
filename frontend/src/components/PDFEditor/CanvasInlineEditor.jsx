@@ -278,6 +278,7 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
           charIsItalic,
           charIsBold,
           pdfSize: bMeta.size || undefined,
+          pdfOriginX: bMeta.origin_x || undefined,
           pdfOriginY: bMeta.origin_y || undefined,
         });
       } else {
@@ -530,6 +531,16 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   }, [item]);
 
   const r = pdfToScreen(item, scale);
+  const nativeDpr = window.devicePixelRatio || 1;
+  const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+  
+  // Calculate exact 1:1 CSS dimensions to prevent compositor scaling blur
+  const canvasW = Math.max(1, Math.round(r.w * dpr));
+  const cssW = canvasW / dpr;
+  
+  const canvasH_initial = Math.max(1, Math.round(r.h * dpr));
+  const cssH_initial = canvasH_initial / dpr;
+
   const baseFontSizePx = Math.max(8, (item.fontSize * scale) + fontSizeAdj);
   // Authoritative block alignment from PyMuPDF or paragraphTypography
   const blockAlign = paragraphTypography.align || item.align || 'left';
@@ -674,7 +685,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     // Font specs
     const baseFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${baseFontSizePt}px ${currentFontFamily}`;
     // Preserve exact proportional metrics to prevent ascent/descent baseline drops
-    const superFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${(baseFontSizePt * 0.65).toFixed(2)}px ${currentFontFamily}`;
+    const superFont = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${baseFontSizePt * 0.65}px ${currentFontFamily}`;
 
     // Measure HTML ascender
     ctx.font = baseFont;
@@ -742,7 +753,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             const useFamilyU = ucm.charFont
               ? `"${sanitizeFontName(stripSubset(ucm.charFont))}", ${currentFontFamily}`
               : currentFontFamily;
-            const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? Math.round(baseFontSizePt * 0.65) : baseFontSizePt;
+            const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? baseFontSizePt * 0.65 : baseFontSizePt;
             ctx.font = `${useItalicU ? 'italic ' : ''}${useBoldU ? 'bold ' : ''}${glyphSzU}px ${useFamilyU}`;
             unitWidth += ctx.measureText(ucm.displayChar).width;
           }
@@ -759,7 +770,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const useFamilyU = ucm.charFont
             ? `"${sanitizeFontName(stripSubset(ucm.charFont))}", ${currentFontFamily}`
             : currentFontFamily;
-          const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? Math.round(baseFontSizePt * 0.65) : baseFontSizePt;
+          const glyphSzU = (ucm.kind === 'super' || ucm.kind === 'sub') ? baseFontSizePt * 0.65 : baseFontSizePt;
           ctx.font = `${useItalicU ? 'italic ' : ''}${useBoldU ? 'bold ' : ''}${glyphSzU}px ${useFamilyU}`;
           unitWidth += ctx.measureText(ucm.displayChar).width;
         }
@@ -784,6 +795,21 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const spaceMeta = { origChar: ' ', displayChar: ' ', kind: 'normal', charIndex: -1 };
           const spaceUnit = { chars: [spaceMeta], width: ctx.measureText(' ').width };
           allUnitsForLine = [...overflowUnitsFromPrevLine, spaceUnit, ...lineUnits];
+        }
+      }
+
+      // Keep citation units atomic across reflow: a unit consisting only of
+      // super/sub chars (an orphaned superscript) must re-attach to the
+      // previous unit instead of starting a line alone.
+      for (let u = 1; u < allUnitsForLine.length; u++) {
+        const un = allUnitsForLine[u];
+        if (un.chars.length > 0 && un.chars.every(c => c.kind === 'super' || c.kind === 'sub')) {
+          allUnitsForLine[u - 1] = {
+            chars: [...allUnitsForLine[u - 1].chars, ...un.chars],
+            width: allUnitsForLine[u - 1].width + un.width,
+          };
+          allUnitsForLine.splice(u, 1);
+          u--;
         }
       }
       overflowUnitsFromPrevLine = [];
@@ -875,10 +901,14 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         }
 
         const isReflowedLine = allUnitsForLine.length > lineUnits.length;
+        // PDF coordinate anchoring is only valid for lines byte-identical to the
+        // PDF. Edited lines must use pure canvas flow layout, otherwise the
+        // anchored tail overprints newly typed text.
+        const usePdfAnchoring = !isReflowedLine && isLineUnedited;
 
         let prefixMatchCount = 0;
         let linePrefixStartWordIdx = 0;
-        if (!isReflowedLine && pdfWords.length > 0) {
+        if (usePdfAnchoring && pdfWords.length > 0) {
           const matchIdx = lineWords.indexOf(pdfWords[0]);
           if (matchIdx >= 0) {
             linePrefixStartWordIdx = matchIdx;
@@ -898,7 +928,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         // Match trailing non-space characters (suffix) to preserve original PDF trailing kerning shifted by deltaX
         // Disable suffix matching on reflowed lines (lines with overflow from previous lines) to avoid invalid negative shifts
         let suffixMatchCount = 0;
-        if (!isReflowedLine) {
+        if (usePdfAnchoring) {
           while (
             suffixMatchCount < (pdfNonSpaceChars.length - prefixMatchCount) &&
             suffixMatchCount < (lineNonSpaceChars.length - prefixMatchCount)
@@ -915,7 +945,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           }
         }
 
-        const isPurePrefixOrUnedited = (prefixMatchCount === pdfNonSpaceChars.length);
+        const isPurePrefixOrUnedited = usePdfAnchoring && (prefixMatchCount === pdfNonSpaceChars.length);
         const usePdfCoords = pdfNonSpaceChars.length > 0 && isPurePrefixOrUnedited;
 
         const shouldJustify = (item.align === 'justify' || item.isJustified ||
@@ -998,8 +1028,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         let accumX = pStartX;
         let pdfCharIdx = 0;
 
-        let deltaXShift = 0;
-        let deltaXShiftComputed = false;
 
         let nonSpaceCounter = 0;
         let spacesEncountered = 0;
@@ -1012,50 +1040,50 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const isSuper = cm.kind === 'super' || cm.kind === 'sub';
 
           if (!isSpace && pdfCharIdx < prefixMatchCount) {
-            // ── PREFIX REGION: exact PDF coordinates + deltaXShift + extraSpaceShift ──
             const pdfCh = pdfNonSpaceChars[pdfCharIdx];
-            if (linePrefixStartWordIdx > 0 && !deltaXShiftComputed && pdfCharIdx === 0 && pdfNonSpaceChars.length > 0) {
-              const firstPrefixPdfX0 = (pdfNonSpaceChars[0].x0 - item.pdfX);
-              deltaXShift = accumX - firstPrefixPdfX0;
-              deltaXShiftComputed = true;
+            // Use PDF origin_x directly — no deltaXShift needed.
+            // PDF coordinates are already relative to item.pdfX (paragraph block left edge).
+            const pdfOriginX = (Number.isFinite(pdfCh.origin_x) ? pdfCh.origin_x : pdfCh.x0) - item.pdfX;
+            charXPositions.push(pdfOriginX);
+            
+            // Advance accumX to next character's origin (or x1 for last char)
+            const nextPdfCh = pdfNonSpaceChars[pdfCharIdx + 1];
+            if (nextPdfCh) {
+              accumX = (Number.isFinite(nextPdfCh.origin_x) ? nextPdfCh.origin_x : nextPdfCh.x0) - item.pdfX;
+            } else {
+              accumX = pdfCh.x1 - item.pdfX;
             }
-            const pdfX0 = (pdfCh.x0 - item.pdfX) + deltaXShift + extraSpaceShift;
-            const pdfX1 = (pdfCh.x1 - item.pdfX) + deltaXShift + extraSpaceShift;
-            charXPositions.push(pdfX0);
-            accumX = pdfX1;
             pdfCharIdx++;
             prevWasSpace = false;
           } else if (isSpace && pdfCharIdx > 0 && pdfCharIdx < prefixMatchCount) {
             // ── PREFIX SPACE ──
             if (!prevWasSpace) {
               const nextPdfCh = pdfNonSpaceChars[pdfCharIdx];
-              const nextPdfX0 = (nextPdfCh.x0 - item.pdfX) + deltaXShift;
+              // Advance to next character's origin_x (not x0)
+              const nextPdfOriginX = (Number.isFinite(nextPdfCh.origin_x) ? nextPdfCh.origin_x : nextPdfCh.x0) - item.pdfX;
               charXPositions.push(accumX);
-              accumX = nextPdfX0 + extraSpaceShift + (spacesEncountered * extraPerSpace);
+              accumX = nextPdfOriginX;
             } else {
-              // Extra space bar hit! Shift all subsequent words rightward
+              // Consecutive spaces in prefix: use canvas measurement
               charXPositions.push(accumX);
               ctx.font = isSuper ? superFont : baseFont;
-              const extraW = ctx.measureText(cm.displayChar).width + extraPerSpace;
-              extraSpaceShift += extraW;
-              accumX += extraW;
+              accumX += ctx.measureText(cm.displayChar).width;
             }
             spacesEncountered++;
             prevWasSpace = true;
           } else if (!isSpace && nonSpaceCounter >= suffixStartNonSpaceIdx && suffixMatchCount > 0) {
-            // ── SUFFIX REGION: PDF x0 + ΔX + justification offset ──
-            if (!deltaXShiftComputed && firstSuffixPdfIdx >= 0 && firstSuffixPdfIdx < pdfNonSpaceChars.length) {
-              const firstSuffixPdfX0 = (pdfNonSpaceChars[firstSuffixPdfIdx].x0 - item.pdfX);
-              deltaXShift = accumX - firstSuffixPdfX0;
-              deltaXShiftComputed = true;
-            }
             const suffixPdfIdx = pdfNonSpaceChars.length - (lineNonSpaceChars.length - nonSpaceCounter);
             if (suffixPdfIdx >= 0 && suffixPdfIdx < pdfNonSpaceChars.length) {
               const pdfCh = pdfNonSpaceChars[suffixPdfIdx];
-              const shiftedX0 = (pdfCh.x0 - item.pdfX) + deltaXShift;
-              const shiftedX1 = (pdfCh.x1 - item.pdfX) + deltaXShift;
-              charXPositions.push(shiftedX0);
-              accumX = shiftedX1;
+              // Use PDF origin_x directly — no deltaXShift needed
+              const suffixOriginX = (Number.isFinite(pdfCh.origin_x) ? pdfCh.origin_x : pdfCh.x0) - item.pdfX;
+              charXPositions.push(suffixOriginX);
+              const nextSuffixCh = pdfNonSpaceChars[suffixPdfIdx + 1];
+              if (nextSuffixCh) {
+                accumX = (Number.isFinite(nextSuffixCh.origin_x) ? nextSuffixCh.origin_x : nextSuffixCh.x0) - item.pdfX;
+              } else {
+                accumX = pdfCh.x1 - item.pdfX;
+              }
             } else {
               charXPositions.push(accumX);
               ctx.font = isSuper ? superFont : baseFont;
@@ -1099,8 +1127,15 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           return pushLine(trimmedUnits, isLastCanvasLineOfBlock);
         }
 
-        const yTop = lineIdx * lineHeightPt;
-        const yBaseline = yTop + firstLineBaselineOffsetPt;
+        let yBaseline;
+        if (pOrigLine && Number.isFinite(dominantPdfOriginY) && Number.isFinite(item.pdfY_top)) {
+          // Use this line's actual PDF baseline (relative to block top), not
+          // a uniform lineHeightPt. This preserves non-uniform PDF leading.
+          yBaseline = dominantPdfOriginY - item.pdfY_top;
+        } else {
+          yBaseline = lineIdx * lineHeightPt + firstLineBaselineOffsetPt;
+        }
+        const yTop = yBaseline - ascenderPx;
 
         lines.push({
           lineIndex: lineIdx,
@@ -1117,6 +1152,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           yBaseline,
           lineHeightPt,
           dominantPdfOriginY,
+          usesPdfAnchoring: usePdfAnchoring,
         });
       };
 
@@ -1258,13 +1294,13 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
         currentFontSizePt = fontSizePt * 0.65; // Fallback for newly typed text
       }
       const glyphSizePt = currentFontSizePt;
-      ctx.font = `${applyItalic ? 'italic ' : ''}${applyBold ? 'bold ' : ''}${glyphSizePt.toFixed(2)}px ${useFontFamily}`;
+      ctx.font = `${applyItalic ? 'italic ' : ''}${applyBold ? 'bold ' : ''}${glyphSizePt}px ${useFontFamily}`;
 
       ctx.fillStyle = cm.color || defaultColor || '#000000';
 
       // Use exact PDF baseline delta when available; fall back to heuristics for newly typed text
       let yPos = line.yBaseline;
-      if ((isSuper || isSub) && cm.pdfOriginY != null && line.dominantPdfOriginY != null) {
+      if ((isSuper || isSub) && line.usesPdfAnchoring && cm.pdfOriginY != null && line.dominantPdfOriginY != null) {
         // In PDF space (top-down), superscript origin_y < normal baseline origin_y.
         // Positive pdfShiftY means the char sits above the baseline — subtract to move UP on canvas.
         const pdfShiftY = line.dominantPdfOriginY - cm.pdfOriginY;
@@ -1277,11 +1313,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       const rawX = (line.charXPositions && line.charXPositions[i] != null) ? line.charXPositions[i] : currentX;
       
-      // Snap to exact device pixel boundary for crystal-clear, non-blurry text rendering
-      const crispX = Math.round(rawX * totalScale) / totalScale;
-      const crispY = Math.round(yPos * totalScale) / totalScale;
-
-      ctx.fillText(cm.displayChar, crispX, crispY);
+      // Allow the browser's native sub-pixel positioning to handle fractional coordinates
+      // (DirectWrite/CoreText will shift RGB sub-pixels to keep text crisp without blurring stems).
+      ctx.fillText(cm.displayChar, rawX, yPos);
 
 
       const charW = ctx.measureText(cm.displayChar).width;
@@ -1291,10 +1325,6 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   }, [isBold, isItalic, currentFontFamily, scale]);
 
   const coverageRef = useRef(null);
-
-  /**
-   * Render Canvas Loop with Dynamic Height Auto-Expansion
-   */
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1303,97 +1333,103 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const ctx = canvas.getContext('2d', { alpha: false, colorSpace: 'srgb' });
     if (!ctx) return;
 
-    const nativeDpr = window.devicePixelRatio || 1;
-    const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
+    try {
+      const nativeDpr = window.devicePixelRatio || 1;
+      const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
 
-    // 1. Temporary Layout Pass to determine total required height
-    const initialLayout = computeLineLayout(ctx);
-    const numOrigLines = (origLines && origLines.length) || 1;
-    const extraLines = Math.max(0, initialLayout.lines.length - numOrigLines);
-    const requiredHeightPt = (r.h / scale) + extraLines * initialLayout.lineHeightPt;
-    const requiredHeightPx = requiredHeightPt * scale;
-    const deltaH = requiredHeightPx - r.h;
+      // 1. Temporary Layout Pass to determine total required height
+      const initialLayout = computeLineLayout(ctx);
+      const numOrigLines = (origLines && origLines.length) || 1;
+      const extraLines = Math.max(0, initialLayout.lines.length - numOrigLines);
+      const requiredHeightPt = (r.h / scale) + extraLines * initialLayout.lineHeightPt;
+      const requiredHeightPx = requiredHeightPt * scale;
+      const deltaH = requiredHeightPx - r.h;
 
-    const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise
-    if (
-      onHeightChange &&
-      (lastReportedDeltaHRef.current === null ||
-        Math.abs(deltaH - lastReportedDeltaHRef.current) > HEIGHT_CHANGE_THRESHOLD)
-    ) {
-      lastReportedDeltaHRef.current = deltaH;
-      onHeightChange(item.pdfY, deltaH);
-    }
+      const HEIGHT_CHANGE_THRESHOLD = 0.5; // ignore sub-pixel noise
+      if (
+        onHeightChange &&
+        (lastReportedDeltaHRef.current === null ||
+          Math.abs(deltaH - lastReportedDeltaHRef.current) > HEIGHT_CHANGE_THRESHOLD)
+      ) {
+        lastReportedDeltaHRef.current = deltaH;
+        onHeightChange(item.pdfY, deltaH);
+      }
 
-    // 2. Set exact dimensions using r.w and r.h (Zero-Distortion)
-    const canvasW = Math.max(1, Math.round(r.w * dpr));
-    const canvasH = Math.max(1, Math.round(requiredHeightPx * dpr));
+      // 2. Set exact dimensions using r.w and r.h (Zero-Distortion)
+      const canvasW = Number.isFinite(r.w) ? Math.max(1, Math.round(r.w * dpr)) : 1;
+      const canvasH = Number.isFinite(requiredHeightPx) ? Math.max(1, Math.round(requiredHeightPx * dpr)) : 1;
 
-    canvas.width = canvasW;
-    canvas.height = canvasH;
-    canvas.style.width = `${r.w}px`;
-    canvas.style.height = `${requiredHeightPx}px`;
+      canvas.width = canvasW;
+      canvas.height = canvasH;
+      // Exact 1:1 mapping to prevent compositor scaling blur
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${canvasH / dpr}px`;
 
-    if (coverageRef.current) {
-      coverageRef.current.style.width = `${r.w}px`;
-      coverageRef.current.style.height = `${requiredHeightPx}px`;
-    }
+      if (coverageRef.current) {
+        coverageRef.current.style.width = `${cssW}px`;
+        coverageRef.current.style.height = `${canvasH / dpr}px`;
+      }
 
-    ctx.scale(dpr, dpr);
-    ctx.scale(scale, scale);
-    // 'auto' allows the browser to use standard grid-fitting (hinting),
-    // which matches the exact stroke thickness of the PDF.js DOM text layer.
-    ctx.textRendering = 'auto';
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
+      ctx.scale(dpr, dpr);
+      ctx.scale(scale, scale);
+      // Disable hinting to render unhinted vector paths matching PDF.js behavior
+      ctx.textRendering = 'geometricPrecision';
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
 
-    const pdfW = r.w / scale;
-    const pdfH = requiredHeightPx / scale;
-    ctx.clearRect(0, 0, pdfW, pdfH);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, pdfW, pdfH);
+      const pdfW = r.w / scale;
+      const pdfH = requiredHeightPx / scale;
+      ctx.clearRect(0, 0, pdfW, pdfH);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, pdfW, pdfH);
 
-    // 3. Compute Final Layout
-    const layout = computeLineLayout(ctx);
-    canvas._layout = { ...layout, dpr };
+      // 3. Compute Final Layout
+      const layout = computeLineLayout(ctx);
+      canvas._layout = { ...layout, dpr };
 
-    // 4. Selection Highlight Rectangles (rgba(147, 197, 253, 0.6))
-    if (selection.start !== selection.end) {
-      const minSel = Math.min(selection.start, selection.end);
-      const maxSel = Math.max(selection.start, selection.end);
-      ctx.fillStyle = 'rgba(147, 197, 253, 0.6)';
+      // 4. Selection Highlight Rectangles (rgba(147, 197, 253, 0.6))
+      if (selection.start !== selection.end) {
+        const minSel = Math.min(selection.start, selection.end);
+        const maxSel = Math.max(selection.start, selection.end);
+        ctx.fillStyle = 'rgba(147, 197, 253, 0.6)';
 
+        for (const line of layout.lines) {
+          if (line.charEndOffset <= minSel || line.charStartOffset >= maxSel) continue;
+
+          const localStart = Math.max(0, minSel - line.charStartOffset);
+          const localEnd = Math.min(line.text.length, maxSel - line.charStartOffset);
+
+          const xStart = line.charXPositions[localStart] || 0;
+          const xEnd = line.charXPositions[localEnd] || 0;
+
+          ctx.fillRect(xStart, line.yTop, Math.max(0.5, xEnd - xStart), line.lineHeightPt);
+        }
+      }
+
+      // 5. Draw Text using exact baseFontSizePt
+      const baseFontSizePt = item.fontSize + (fontSizeAdj / scale);
       for (const line of layout.lines) {
-        if (line.charEndOffset <= minSel || line.charStartOffset >= maxSel) continue;
-
-        const localStart = Math.max(0, minSel - line.charStartOffset);
-        const localEnd = Math.min(line.text.length, maxSel - line.charStartOffset);
-
-        const xStart = line.charXPositions[localStart] || 0;
-        const xEnd = line.charXPositions[localEnd] || 0;
-
-        ctx.fillRect(xStart, line.yTop, Math.max(0.5, xEnd - xStart), line.lineHeightPt);
+        drawCanvasLine(ctx, line, layout, baseFontSizePt, color);
       }
-    }
 
-    // 5. Draw Text using exact baseFontSizePt
-    const baseFontSizePt = item.fontSize + (fontSizeAdj / scale);
-    for (const line of layout.lines) {
-      drawCanvasLine(ctx, line, layout, baseFontSizePt, color);
-    }
+      // 6. Blinking Caret Bar (2 CSS pixels wide = 2 / scale PDF points)
+      if (isFocused && selection.start === selection.end && caretVisible) {
+        const targetOffset = selection.start;
+        const caretPos = (layout.globalCharMap && layout.globalCharMap[targetOffset])
+          ? layout.globalCharMap[targetOffset]
+          : (layout.globalCharMap ? layout.globalCharMap[layout.globalCharMap.length - 1] : null);
 
-    // 6. Blinking Caret Bar (2 CSS pixels wide = 2 / scale PDF points)
-    if (isFocused && selection.start === selection.end && caretVisible) {
-      const targetOffset = selection.start;
-      const caretPos = (layout.globalCharMap && layout.globalCharMap[targetOffset])
-        ? layout.globalCharMap[targetOffset]
-        : (layout.globalCharMap ? layout.globalCharMap[layout.globalCharMap.length - 1] : null);
-
-      if (caretPos) {
-        ctx.fillStyle = color || '#000000';
-        ctx.fillRect(caretPos.x, caretPos.yTop, 2 / scale, caretPos.lineHeightPt);
+        if (caretPos) {
+          ctx.fillStyle = color || '#000000';
+          ctx.fillRect(caretPos.x, caretPos.yTop, 2 / scale, caretPos.lineHeightPt);
+        }
       }
+    } catch (err) {
+      console.error('[CanvasInlineEditor] layout failed, cancelling edit', err);
+      onCancel();
+      return;
     }
-  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj]);
+  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj, cssW, onCancel]);
 
   useEffect(() => {
     renderCanvas();
@@ -1726,8 +1762,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           position: 'absolute',
           left: r.x,
           top: r.y,
-          width: r.w,
-          height: r.h,
+          width: `${cssW}px`,
+          height: `${cssH_initial}px`,
           backgroundColor: '#ffffff',
           zIndex: 99,
           pointerEvents: 'none',
@@ -1744,8 +1780,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           position: 'absolute',
           left: r.x,
           top: r.y,
-          width: `${r.w}px`,
-          height: `${r.h}px`,
+          width: `${cssW}px`,
+          height: `${cssH_initial}px`,
           zIndex: 100,
           cursor: 'text',
           outline: '1px dashed rgba(148, 163, 184, 0.8)',
