@@ -189,6 +189,75 @@ const sanitizeForCommit = (text) => {
 const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
 const sanitizeFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
 
+const LIGATURE_MAP = {
+  '\uFB00': ['f', 'f'],
+  '\uFB01': ['f', 'i'],
+  '\uFB02': ['f', 'l'],
+  '\uFB03': ['f', 'f', 'i'],
+  '\uFB04': ['f', 'f', 'l'],
+  '\uFB05': ['f', 't'],
+  '\uFB06': ['s', 't'],
+};
+
+// Ligature expansion: split multi-codepoint or single-codepoint ligature char entries
+// into per-codepoint entries with interpolated geometry so all mappers keep 1:1 correspondence.
+const expandMultiCharEntries = (chars) => {
+  const out = [];
+  for (const meta of chars) {
+    const c = meta?.c ?? meta?.char ?? '';
+    const ligSplit = LIGATURE_MAP[c];
+    if (ligSplit) {
+      const x0 = Number.isFinite(meta.x0) ? meta.x0 : meta.origin_x;
+      const x1 = Number.isFinite(meta.x1) ? meta.x1 : meta.origin_x;
+      for (let k = 0; k < ligSplit.length; k++) {
+        const sx0 = x0 + ((x1 - x0) * k) / ligSplit.length;
+        const sx1 = x0 + ((x1 - x0) * (k + 1)) / ligSplit.length;
+        out.push({
+          ...meta,
+          c: ligSplit[k],
+          char: ligSplit[k],
+          text: ligSplit[k],
+          x0: sx0,
+          x1: sx1,
+          origin_x: k === 0 ? meta.origin_x : sx0,
+        });
+      }
+    } else if (c.length > 1 && !/\s/.test(c) && Number.isFinite(meta.origin_x)) {
+      const x0 = Number.isFinite(meta.x0) ? meta.x0 : meta.origin_x;
+      const x1 = Number.isFinite(meta.x1) ? meta.x1 : meta.origin_x;
+      for (let k = 0; k < c.length; k++) {
+        const sx0 = x0 + ((x1 - x0) * k) / c.length;
+        const sx1 = x0 + ((x1 - x0) * (k + 1)) / c.length;
+        out.push({
+          ...meta,
+          c: c[k],
+          char: c[k],
+          text: c[k],
+          x0: sx0,
+          x1: sx1,
+          origin_x: k === 0 ? meta.origin_x : sx0,
+        });
+      }
+    } else {
+      out.push(meta);
+    }
+  }
+  return out;
+};
+
+/**
+ * Sanity-check a backend PDF character's coordinate metadata.
+ * MuPDF can synthesise degenerate bboxes (NaN, zero-width, wildly out-of-page)
+ * for condensed CFF fonts and symbol glyphs in PyMuPDF ≥1.25.0.  Any char
+ * failing this gate falls back to pure canvas flow placement so fillText(x=NaN)
+ * never silently swallows lines.
+ */
+const isSaneChar = (c, pageW = 2000) =>
+  c != null &&
+  Number.isFinite(c.x0) && Number.isFinite(c.x1) &&
+  (c.x1 - c.x0) > 0.05 &&
+  c.x0 >= -50 && c.x1 <= pageW + 50;
+
 /**
  * Extract character metadata (normal, super, sub) for a text string,
  * taking into account superscriptRanges, HTML <sup>/<sub> tags, or Unicode superscripts.
@@ -197,7 +266,7 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
   if (!rawText) return { cleanText: '', charMeta: [] };
 
   const backendChars = (origLines && Array.isArray(origLines))
-    ? origLines.flatMap(l => l.chars || [])
+    ? expandMultiCharEntries(origLines.flatMap(l => l.chars || []))
     : [];
 
   const charMeta = [];
@@ -266,6 +335,11 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
         const charFont = bMeta.font || null;
         const charIsItalic = charFont ? /italic|oblique|-it$|-it\b/i.test(charFont) : null;
         const charIsBold = charFont ? /bold|black|heavy|semibold|-bd/i.test(charFont) : null;
+        // Only propagate PDF coordinate metadata if the char passed a sanity
+        // check.  Degenerate bboxes (NaN, zero-width, out-of-range) from the
+        // PyMuPDF >=1.25 CFF metric regression would produce NaN deltas and
+        // invisible text in the canvas engine.
+        const charPassesSanity = isSaneChar(bMeta);
 
         cleanChars.push(origChar);
         charMeta.push({
@@ -278,8 +352,11 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
           charIsItalic,
           charIsBold,
           pdfSize: bMeta.size || undefined,
-          pdfOriginX: bMeta.origin_x || undefined,
-          pdfOriginY: bMeta.origin_y || undefined,
+          pdfOriginX: (charPassesSanity && bMeta.origin_x != null) ? bMeta.origin_x : undefined,
+          pdfOriginY: (charPassesSanity && bMeta.origin_y != null) ? bMeta.origin_y : undefined,
+          // Expose raw bbox for the isSaneChar gate in pushLine
+          pdfX0: charPassesSanity ? bMeta.x0 : undefined,
+          pdfX1: charPassesSanity ? bMeta.x1 : undefined,
         });
       } else {
         let kind = 'normal';
@@ -462,6 +539,34 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
   const rawInitialStr = getInitialText();
   const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
+
+  // Safety-net: backend bboxes can exclude bullet/dingbat spans (Symbol font)
+  // and even their lines. Expand to the union of every char bbox and every
+  // inline image bbox so nothing renders at negative canvas coordinates.
+  item = useMemo(() => {
+    let minX = Number.isFinite(item.pdfX) ? item.pdfX : 0;
+    let minY = Number.isFinite(item.pdfY_top) ? item.pdfY_top : 0;
+    let maxX = minX + (item.pdfW || 0);
+    let maxY = minY + (item.pdfH || 0);
+    for (const l of origLines || []) {
+      for (const c of l?.chars || []) {
+        if (Number.isFinite(c.x0)) minX = Math.min(minX, c.x0);
+        if (Number.isFinite(c.x1)) maxX = Math.max(maxX, c.x1);
+        if (Number.isFinite(c.y0)) minY = Math.min(minY, c.y0);
+        if (Number.isFinite(c.y1)) maxY = Math.max(maxY, c.y1);
+      }
+    }
+    for (const im of item.inlineImages || []) {
+      if (Array.isArray(im.bbox)) {
+        minX = Math.min(minX, im.bbox[0]);
+        minY = Math.min(minY, im.bbox[1]);
+        maxX = Math.max(maxX, im.bbox[2]);
+        maxY = Math.max(maxY, im.bbox[3]);
+      }
+    }
+    return { ...item, pdfX: minX, pdfY_top: minY, pdfW: maxX - minX, pdfH: maxY - minY };
+  }, [item, origLines]);
+
   const initialParsed = useMemo(() => {
     const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
     return parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
@@ -673,7 +778,11 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const getOrigLineBounds = useCallback((origLine, lineIdx) => {
     let x0 = null;
     if (origLine && typeof origLine === 'object') {
-      x0 = origLine.line_x0 ?? origLine.pdfX ?? (Array.isArray(origLine.bbox) ? origLine.bbox[0] : null);
+      // Prefer the explicit line_bbox that the backend now injects (includes
+      // attached bullet markers). Fall back to line_x0 / pdfX / bbox[0].
+      const lb = origLine.line_bbox;
+      const lbX0 = Array.isArray(lb) && Number.isFinite(lb[0]) ? lb[0] : null;
+      x0 = lbX0 ?? origLine.line_x0 ?? origLine.pdfX ?? (Array.isArray(origLine.bbox) ? origLine.bbox[0] : null);
     }
     if (x0 == null) {
       x0 = item.pdfX + (lineIdx === 0 && item.textIndent ? item.textIndent : 0);
@@ -685,6 +794,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
     if (item.blockData && Array.isArray(item.blockData.bbox) && item.blockData.bbox[2] != null) {
       containerRightX = Math.max(containerRightX, item.blockData.bbox[2]);
+    }
+    // Also consider line_bbox right edge (backend now includes bullet marker extents)
+    if (origLine && Array.isArray(origLine.line_bbox) && Number.isFinite(origLine.line_bbox[2])) {
+      containerRightX = Math.max(containerRightX, origLine.line_bbox[2]);
     }
 
     return { line_x0: x0, line_x1: containerRightX };
@@ -845,7 +958,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
         const isLastLineOfParagraph = (pIdx >= rawLinesText.length - 1) && isLastCanvasLineOfBlock;
 
-        const pdfChars = pOrigLine?.chars || [];
+        const pdfChars = expandMultiCharEntries(pOrigLine?.chars || []);
         const pdfNonSpaceChars = pdfChars.filter(ch => {
           const c = ch.c ?? ch.char ?? '';
           return c !== ' ' && c !== '\u00A0' && c.length > 0;
@@ -1398,6 +1511,29 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       ctx.clearRect(0, 0, pdfW, pdfH);
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, pdfW, pdfH);
+
+      // Draw text-stripped underlay (images + vector art with text removed).
+      // Rendered server-side at 144 dpi so badges/arrows appear correctly
+      // without bleed-through from the PDF's own text layer.
+      if (item.underlay) {
+        const u = item.underlay;
+        const uKey = `__underlay__${u.data.slice(0, 32)}`;
+        if (!imgCache.current[uKey]) {
+          const el = new Image();
+          el.src = `data:image/${u.ext};base64,${u.data}`;
+          imgCache.current[uKey] = el;
+        }
+        const el = imgCache.current[uKey];
+        const ux = u.rect[0] - item.pdfX;
+        const uy = u.rect[1] - item.pdfY_top;
+        const uw = u.rect[2] - u.rect[0];
+        const uh = u.rect[3] - u.rect[1];
+        if (el.complete && el.naturalWidth > 0) {
+          ctx.drawImage(el, ux, uy, uw, uh);
+        } else {
+          el.onload = () => renderCanvas();
+        }
+      }
 
       // Draw inline images (e.g. ORCID iD badge, symbol glyphs) that overlap
       // this paragraph block. Coordinates are in PDF-point space.

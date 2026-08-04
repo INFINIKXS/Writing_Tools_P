@@ -20,6 +20,7 @@ fonttools
 pycryptodome
 pdf2doi
 pymupdf
+pymupdf-fonts
 pikepdf
 httpx
 tenacity

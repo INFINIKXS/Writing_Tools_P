@@ -4,6 +4,7 @@ import json
 import logging
 import base64
 import math
+from typing import Optional
 from fastapi import APIRouter, UploadFile, Form, File
 from fastapi.responses import StreamingResponse
 from .font_utils import get_font_for_edit
@@ -368,14 +369,103 @@ def _find_change_range(orig: str, new: str):
     return prefix_len, orig_end, new_end
 
 
-def _get_fallback_font_name(fontname) -> str:
-    """Return 'times-roman' for Baskerville/Serif fonts, otherwise 'helv'."""
+def get_universal_fallback_font(fontname: str = "") -> tuple[str, Optional[bytes]]:
+    """
+    Return (fontname, fontbuffer) using pymupdf_fonts (FiraGO / Noto Sans / Ubuntu)
+    for universal Unicode coverage, falling back to Base-14.
+
+    pymupdf_fonts v1.0.5 verified codes (use .myfont(code) -> bytes):
+      figo/figbo/figit/figbi  - FiraGO (widest Unicode sans-serif)
+      notos/notosbo/notosit/notosbi - Noto Sans
+      ubuntu/ubuntubo/ubuntuit/ubuntubi
+      spacemo/spacembo/spacemit/spacembi - Space Mono (monospaced)
+      cascadia/cascadiai/cascadiab/cascadiabi - Cascadia Code
+    """
     if not isinstance(fontname, str):
         fontname = str(fontname) if fontname is not None else ""
     fname_lower = fontname.lower()
-    if "baskerville" in fname_lower or "times" in fname_lower or "serif" in fname_lower:
-        return "times-roman"
-    return "helv"
+
+    is_bold   = any(k in fname_lower for k in ("bold", "-bd", "semibold", "heavy"))
+    is_italic = any(k in fname_lower for k in ("italic", "oblique", "-it"))
+    is_mono   = any(k in fname_lower for k in ("courier", "mono", "consolas", "code", "cascadia"))
+    is_serif  = any(k in fname_lower for k in ("times", "roman", "serif", "baskerville", "garamond"))
+
+    try:
+        import pymupdf_fonts
+
+        if is_mono:
+            if is_bold and is_italic:
+                candidates = ["cascadiabi", "spacembi", "spacemo"]
+            elif is_bold:
+                candidates = ["cascadiab", "spacembo", "spacemo"]
+            elif is_italic:
+                candidates = ["cascadiai", "spacemit", "spacemo"]
+            else:
+                candidates = ["cascadia", "spacemo"]
+        elif is_serif:
+            # pymupdf_fonts has no true serif; Ubuntu is closest proportional
+            if is_bold and is_italic:
+                candidates = ["ubuntubi", "figbi", "notosbi", "figo"]
+            elif is_bold:
+                candidates = ["ubuntubo", "figbo", "notosbo", "figo"]
+            elif is_italic:
+                candidates = ["ubuntuit", "figit", "notosit", "figo"]
+            else:
+                candidates = ["ubuntu", "figo", "notos"]
+        else:
+            # FiraGO: widest Unicode coverage in pymupdf_fonts
+            if is_bold and is_italic:
+                candidates = ["figbi", "notosbi", "ubuntubi", "figo"]
+            elif is_bold:
+                candidates = ["figbo", "notosbo", "ubuntubo", "figo"]
+            elif is_italic:
+                candidates = ["figit", "notosit", "ubuntuit", "figo"]
+            else:
+                candidates = ["figo", "notos", "ubuntu"]
+
+        for code in candidates:
+            try:
+                buf = pymupdf_fonts.myfont(code)
+                if buf:
+                    import logging as _log
+                    _log.getLogger(__name__).info(
+                        f"Universal fallback font resolved: pymupdf_fonts '{code}' "
+                        f"({len(buf):,} bytes)"
+                    )
+                    return code, buf
+            except Exception:
+                pass
+
+    except ImportError:
+        pass  # pymupdf_fonts not installed
+    except Exception as e:
+        pass
+
+    # Base-14 last resort
+    if is_serif:
+        try:
+            f = fitz.Font("tiro")
+            return "tiro", f.buffer
+        except Exception:
+            return "times-roman", None
+
+    if is_mono:
+        try:
+            f = fitz.Font("cour")
+            return "cour", f.buffer
+        except Exception:
+            return "cour", None
+
+    try:
+        f = fitz.Font("helv")
+        return "helv", f.buffer
+    except Exception:
+        return "helv", None
+
+
+def _get_fallback_font_name(fontname) -> str:
+    name, _ = get_universal_fallback_font(fontname)
+    return name
 
 
 @router.post("/apply-edits")
@@ -647,6 +737,32 @@ async def apply_edits(
                             letter_advs = [v for k, v in advance_table.items() if k != " "]
                             avg_letter_adv = sum(letter_advs) / len(letter_advs) if letter_advs else fontsize * 0.5
                             space_adv = advance_table.get(" ", None)
+                            
+                            # Robust space width inference: if the PDF doesn't encode spaces as characters,
+                            # they won't be in advance_table. We infer the space width by looking for
+                            # large gaps between consecutive characters in rawdict_chars.
+                            if space_adv is None or space_adv < fontsize * 0.15:
+                                inferred_spaces = []
+                                for i in range(len(rawdict_chars) - 1):
+                                    curr_char = rawdict_chars[i].get("c", "")
+                                    next_char = rawdict_chars[i+1].get("c", "")
+                                    if curr_char.strip() and next_char.strip():
+                                        curr_x = rawdict_chars[i]["origin"][0]
+                                        next_x = rawdict_chars[i+1]["origin"][0]
+                                        gap = next_x - curr_x
+                                        # A normal letter advance is roughly avg_letter_adv.
+                                        # A space advance (origin-to-origin) is typically > fontsize * 0.6.
+                                        if gap > fontsize * 0.6:
+                                            char_w = advance_table.get(curr_char, avg_letter_adv)
+                                            inferred_space = gap - char_w
+                                            if inferred_space > fontsize * 0.1:
+                                                inferred_spaces.append(inferred_space)
+                                
+                                if inferred_spaces:
+                                    inferred_spaces.sort()
+                                    space_adv = inferred_spaces[len(inferred_spaces) // 2]
+                                    logger.info(f"Inferred space_adv={space_adv:.2f} from {len(inferred_spaces)} inter-word gaps")
+                            
                             if space_adv is None or space_adv < fontsize * 0.05:
                                 space_adv = _get_space_width(
                                     page, erase_x0, change_origin_y, fontsize
@@ -1209,25 +1325,40 @@ async def apply_edits(
                 except Exception:
                     pass
                 page.add_redact_annot(rect, fill=bg_color)
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=0)
+        # Apply redactions cleanly with error recovery
+        try:
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+        except Exception as e:
+            logger.warning(f"page.apply_redactions with flags failed: {e}. Retrying default apply_redactions.")
+            try:
+                page.apply_redactions()
+            except Exception as e2:
+                logger.error(f"Redaction error on page {page_num}: {e2}")
 
         # ── Phase 2.5: Re-register fonts after redaction ──
         # apply_redactions() strips font resources from the page, so any
         # previously registered embedded fonts become unavailable.
-        # Re-register every unique font we plan to use.
+        # Re-register every unique font we plan to use and track its buffer.
         registered_fonts = set()
         font_tag_map = {}
+        font_buffer_map = {}
+
         for plan in edit_plans:
             for fontname, font_buffer in list(plan["font_registrations"].items()):
                 if fontname not in registered_fonts:
                     try:
                         font_key = page.insert_font(fontname=fontname, fontbuffer=font_buffer)
-                        font_tag_map[fontname] = font_key
+                        font_tag_map[fontname] = fontname
+                        if font_buffer:
+                            font_buffer_map[fontname] = font_buffer
+                            font_buffer_map[str(font_key)] = font_buffer
                         registered_fonts.add(fontname)
                         logger.info(f"Registered font '{fontname}' -> tag '{font_key}'")
                     except Exception as e:
                         fallback = _get_fallback_font_name(fontname)
                         font_tag_map[fontname] = fallback
+                        if font_buffer:
+                            font_buffer_map[fontname] = font_buffer
                         registered_fonts.add(fontname)
 
         # Map registered font tags into edit plans and ops
@@ -1238,25 +1369,7 @@ async def apply_edits(
                 if op.get("fontname") in font_tag_map:
                     op["fontname"] = font_tag_map[op["fontname"]]
 
-        # ── Phase 3.5: Apply super/sub baseline adjustments ──
-        # For each plan's super_ranges, we need to: erase the chars that
-        # Phase 3 just inserted at those positions, then re-insert them at
-        # a raised/lowered baseline using the super's own (smaller) font size.
-        # Since we can't easily erase just-inserted chars, we take a simpler
-        # approach: identify which ops in the plan correspond to super ranges
-        # BEFORE they get inserted, and insert those ops with adjusted y.
-        # This is done inline in Phase 3, so this 3.5 pass is a no-op placeholder
-        # unless we refactor. Keep for future extensibility.
-        pass
-
         # ── Phase 3: Insert all new text ──
-        # Ops carry their own correct positions and fontsizes. For lines
-        # with super_ranges, Phase 1's segmented-insert path already split
-        # super segments into separate ops with super-baseline + super-size
-        # baked in. For lines without super_ranges, ops are normal-baseline.
-        # All this phase does is emit each op, with optional coalescing of
-        # adjacent single-char ops that share style + baseline (which
-        # reduces fragmentation in the resulting PDF).
         for plan in edit_plans:
             if plan.get("is_paragraph_op"):
                 lines = plan.get("lines", [])
@@ -1271,14 +1384,22 @@ async def apply_edits(
                 font_name_arg = plan.get("fontname", "helv")
                 if not isinstance(font_name_arg, str):
                     font_name_arg = str(font_name_arg) if font_name_arg is not None else "helv"
+                font_buf_arg = font_buffer_map.get(font_name_arg) or plan.get("font_registrations", {}).get(font_name_arg)
+
+                tb_kwargs = {
+                    "fontname": font_name_arg,
+                    "fontsize": plan["fontsize"],
+                    "color": plan["color"],
+                    "align": fitz.TEXT_ALIGN_JUSTIFY,
+                }
+                if font_buf_arg:
+                    tb_kwargs["fontbuffer"] = font_buf_arg
+
                 try:
                     page.insert_textbox(
                         plan["paragraph_rect"],
                         paragraph_text,
-                        fontname=font_name_arg,
-                        fontsize=plan["fontsize"],
-                        color=plan["color"],
-                        align=fitz.TEXT_ALIGN_JUSTIFY,
+                        **tb_kwargs
                     )
                 except Exception as e:
                     fallback_font = _get_fallback_font_name(font_name_arg)
@@ -1325,14 +1446,23 @@ async def apply_edits(
                 font_name_arg = op.get("fontname", "helv")
                 if not isinstance(font_name_arg, str):
                     font_name_arg = str(font_name_arg) if font_name_arg is not None else "helv"
+                font_buf_arg = font_buffer_map.get(font_name_arg) or plan.get("font_registrations", {}).get(font_name_arg)
+
+                it_kwargs = {
+                    "fontname": font_name_arg,
+                    "fontsize": op["fontsize"],
+                    "color": op["color"],
+                    "morph": op["morph"],
+                }
+                if font_buf_arg:
+                    it_kwargs["fontbuffer"] = font_buf_arg
 
                 # Multi-char or morphed ops emit solo (no coalescing needed)
                 if len(op_text) > 1 or op["morph"] is not None:
                     try:
                         page.insert_text(
                             op["pos"], op_text,
-                            fontname=font_name_arg, fontsize=op["fontsize"],
-                            color=op["color"], morph=op["morph"],
+                            **it_kwargs
                         )
                     except Exception as e:
                         fallback_font = _get_fallback_font_name(font_name_arg)
@@ -1376,11 +1506,18 @@ async def apply_edits(
                     else:
                         break
 
+                grp_kwargs = {
+                    "fontname": font_name_arg,
+                    "fontsize": op["fontsize"],
+                    "color": op["color"],
+                }
+                if font_buf_arg:
+                    grp_kwargs["fontbuffer"] = font_buf_arg
+
                 try:
                     page.insert_text(
                         op["pos"], group_text,
-                        fontname=font_name_arg, fontsize=op["fontsize"],
-                        color=op["color"],
+                        **grp_kwargs
                     )
                 except Exception as e:
                     fallback_font = _get_fallback_font_name(font_name_arg)
@@ -1410,15 +1547,19 @@ async def apply_edits(
                 i = j
 
     # ── Subset embedded fonts to keep file size reasonable ──────────────────
-    # Only subsets newly embedded fonts; original subset fonts are untouched.
     try:
         doc.subset_fonts()
     except Exception as e:
         logger.warning(f"subset_fonts() failed (non-fatal): {e}")
 
-    # ── Serialise ────────────────────────────────────────────────────────────
+    # ── Serialise with Garbage Collection & XREF Cleaning ────────────────────
     buf = io.BytesIO()
-    doc.save(buf, garbage=4, deflate=True)
+    try:
+        doc.save(buf, garbage=4, deflate=True, clean=True)
+    except Exception as e:
+        logger.warning(f"doc.save with clean=True failed ({e}), falling back to standard garbage collection.")
+        buf = io.BytesIO()
+        doc.save(buf, garbage=4, deflate=True)
     buf.seek(0)
 
     # Encode warnings as a response header so the frontend can read them

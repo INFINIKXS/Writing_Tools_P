@@ -47,34 +47,68 @@ function getMedian(arr) {
  * A gap > 2.5× the median gap on the line signals a word boundary.
  */
 function groupCharsIntoWords(lineData) {
-  const { chars, gaps } = lineData;
+  const chars = lineData?.chars;
   if (!chars || chars.length === 0) return [];
 
-  const medianGap = gaps.length > 0 ? getMedian(gaps) : 0;
-  const wordBoundaryThreshold = Math.max(medianGap * 2.5, 1.0);
-
-  const words = [];
+  let words = [];
   let currentWord = [];
 
-  if (chars[0].c !== ' ' && chars[0].c !== '\u00A0') {
-    currentWord.push(chars[0]);
+  // 1. Calculate dynamic threshold based ONLY on non-space gaps
+  let gaps = [];
+  for (let i = 1; i < chars.length; i++) {
+    if (chars[i].c !== ' ' && chars[i].c !== '\u00A0' && chars[i - 1].c !== ' ' && chars[i - 1].c !== '\u00A0') {
+      let g = chars[i].x0 - chars[i - 1].x1;
+      if (g > 0) gaps.push(g);
+    }
   }
+  gaps.sort((a, b) => a - b);
+  const medianGap = gaps.length > 0 ? gaps[Math.floor(gaps.length / 2)] : 2.0;
 
-  for (let i = 0; i < gaps.length; i++) {
-    const isBoundary =
-      gaps[i] > wordBoundaryThreshold ||
-      chars[i + 1].c === ' ' ||
-      chars[i + 1].c === '\u00A0';
-    if (isBoundary && currentWord.length > 0) {
+  const wordBoundaryThreshold = Math.max(1.0, medianGap * 2.5);
+
+  for (let i = 0; i < chars.length; i++) {
+    const curr = chars[i];
+
+    // FIX A: Treat spaces as HARD word boundaries.
+    // Do not calculate gaps across spaces.
+    if (curr.c === ' ' || curr.c === '\u00A0') {
+      if (currentWord.length > 0) {
+        words.push(currentWord);
+        currentWord = [];
+      }
+      continue; // Skip adding the space character to the word array
+    }
+
+    // First character of a new word
+    if (currentWord.length === 0) {
+      currentWord.push(curr);
+      continue;
+    }
+
+    const prev = currentWord[currentWord.length - 1];
+    let gap = curr.x0 - prev.x1;
+
+    // FIX B: Handle zero-width bounding boxes (like the 'i' in "final")
+    // If gap is <= 0.1 (or very close to it), it's part of the same word (ligature/kerning)
+    if (gap <= 0.1) {
+      currentWord.push(curr);
+      continue;
+    }
+
+    // Standard word boundary check
+    if (gap > wordBoundaryThreshold) {
       words.push(currentWord);
-      currentWord = [];
-    }
-    if (chars[i + 1].c !== ' ' && chars[i + 1].c !== '\u00A0') {
-      currentWord.push(chars[i + 1]);
+      currentWord = [curr];
+    } else {
+      currentWord.push(curr);
     }
   }
 
-  if (currentWord.length > 0) words.push(currentWord);
+  // Push the last word
+  if (currentWord.length > 0) {
+    words.push(currentWord);
+  }
+
   return words;
 }
 
@@ -849,6 +883,7 @@ export default function PDFViewer({
                 im.bbox[0] < pX1 && im.bbox[2] > pX0 &&
                 im.bbox[1] < pY1 && im.bbox[3] > pY0
               ),
+              underlay: blockData.underlay || null,
               paragraphTypography: {
                 font_size: pFontSize,
                 font_family: pFontFamily,
@@ -880,6 +915,7 @@ export default function PDFViewer({
               im.bbox[0] < (l0.pdfX + l0.pdfW) && im.bbox[2] > l0.pdfX &&
               im.bbox[1] < (l0.pdfY_top + l0.pdfH) && im.bbox[3] > l0.pdfY_top
             ),
+            underlay: blockData.underlay || null,
             paragraphTypography: {
               font_size: pFontSize,
               font_family: pFontFamily,

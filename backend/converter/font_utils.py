@@ -41,11 +41,12 @@ _BASE14_MAP = {
     "couriernew":   "cour",
 }
 
-# pymupdf-fonts codes (pip install pymupdf-fonts required).
-# We only call these as fallback — never as the primary path.
-_PYMUPDF_SERIF_CODE  = "times"   # Nimbus Roman — visually ≈ Times New Roman
-_PYMUPDF_SANS_CODE   = "notos"   # Noto Sans — visually ≈ Helvetica/Arial
-_PYMUPDF_MONO_CODE   = "spacemo" # Space Mono
+# pymupdf-fonts v1.0.5 verified codes — retrieved via pymupdf_fonts.myfont(code).
+# NOT loadable via fitz.Font(code) without pymupdf-fonts installed.
+# Keys confirmed from pymupdf_fonts.fontbuffers.keys()
+_PYMUPDF_SERIF_CODE  = "ubuntu"  # Ubuntu — proportional, used as serif stand-in
+_PYMUPDF_SANS_CODE   = "figo"    # FiraGO Regular — widest Unicode coverage
+_PYMUPDF_MONO_CODE   = "spacemo" # Space Mono — monospaced
 
 
 @dataclass
@@ -411,13 +412,29 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
         missing = _find_missing_glyphs(test_font, new_text)
 
         if missing:
-            # Font parsed but subset doesn't have all required characters.
-            # This is expected for subset fonts — the original PDF only embedded
-            # glyphs that appeared in the document.
+            logger.info(f"Embedded font '{matched_basefont}' missing glyphs {missing}. Attempting dynamic glyph merging...")
+            merged_bytes = merge_missing_glyphs(font_bytes, missing, is_bold=is_bold, is_italic=is_italic)
+            if merged_bytes:
+                try:
+                    test_merged = fitz.Font(fontbuffer=merged_bytes)
+                    still_missing = _find_missing_glyphs(test_merged, new_text)
+                    if not still_missing:
+                        logger.info(f"Glyph merge successful for '{matched_basefont}'! All missing glyphs injected.")
+                        return FontResult(
+                            fontname=f"emb_{matched_basefont[:20]}",
+                            font_buffer=merged_bytes,
+                            fallback_used=False,
+                        )
+                    else:
+                        font_bytes = merged_font_bytes
+                        missing = still_missing
+                        logger.warning(f"Glyph merge partial: still missing {still_missing}")
+                except Exception as e:
+                    logger.warning(f"Merged font validation failed: {e}")
+
             reason = (
                 f"Embedded font '{matched_basefont}' is missing glyphs for: "
-                f"{missing!r}. These characters were not present in the original "
-                f"document's font subset."
+                f"{missing!r}. Dynamic glyph merging attempted."
             )
             logger.warning(reason)
             return FontResult(
@@ -548,55 +565,106 @@ def _fallback(
     reason: str,
 ) -> FontResult:
     """
-    Choose the best pymupdf-font fallback based on the original font name's
-    visual characteristics (serif / sans-serif / monospaced).
-
-    Requires: pip install pymupdf-fonts
+    Choose the best pymupdf_fonts fallback based on visual characteristics.
+    Uses pymupdf_fonts.myfont(code) -> bytes (v1.0.5 API).
+    Falls back to Base-14 helv/tiro/cour if pymupdf_fonts is not installed.
     """
     name_lower = original_font_name.lower()
 
-    # Monospaced detection
-    if any(k in name_lower for k in ("courier", "mono", "consolas", "inconsolata", "code")):
-        code = _PYMUPDF_MONO_CODE
-        description = "Space Mono (monospaced fallback)"
-
-    # Serif detection
-    elif any(k in name_lower for k in (
+    is_mono  = any(k in name_lower for k in ("courier", "mono", "consolas", "inconsolata", "code", "cascadia"))
+    is_serif = any(k in name_lower for k in (
         "times", "roman", "georgia", "garamond", "palatino",
         "minion", "cambria", "charter", "bookman", "caslon",
         "fruti", "nimbus", "utopia", "baskerville"
-    )):
-        code = _PYMUPDF_SERIF_CODE
-        description = "Nimbus Roman (serif fallback ≈ Times New Roman)"
+    ))
 
-    # Default: sans-serif
+    # Build ordered candidate list using verified pymupdf_fonts v1.0.5 codes
+    if is_mono:
+        if is_bold and is_italic:
+            candidates = ["cascadiabi", "spacembi", "spacemo"]
+            description = "Cascadia / Space Mono Bold-Italic"
+        elif is_bold:
+            candidates = ["cascadiab", "spacembo", "spacemo"]
+            description = "Cascadia / Space Mono Bold"
+        elif is_italic:
+            candidates = ["cascadiai", "spacemit", "spacemo"]
+            description = "Cascadia / Space Mono Italic"
+        else:
+            candidates = ["cascadia", "spacemo"]
+            description = "Cascadia / Space Mono (monospaced fallback)"
+    elif is_serif:
+        if is_bold and is_italic:
+            candidates = ["ubuntubi", "figbi", "notosbi", "figo"]
+            description = "Ubuntu Bold-Italic (serif-like fallback)"
+        elif is_bold:
+            candidates = ["ubuntubo", "figbo", "notosbo", "figo"]
+            description = "Ubuntu Bold (serif-like fallback)"
+        elif is_italic:
+            candidates = ["ubuntuit", "figit", "notosit", "figo"]
+            description = "Ubuntu Italic (serif-like fallback)"
+        else:
+            candidates = ["ubuntu", "figo", "notos"]
+            description = "Ubuntu (serif-like proportional fallback)"
     else:
-        code = _PYMUPDF_SANS_CODE
-        description = "Noto Sans (sans-serif fallback)"
+        if is_bold and is_italic:
+            candidates = ["figbi", "notosbi", "ubuntubi", "figo"]
+            description = "FiraGO Bold-Italic (sans-serif fallback)"
+        elif is_bold:
+            candidates = ["figbo", "notosbo", "ubuntubo", "figo"]
+            description = "FiraGO Bold (sans-serif fallback)"
+        elif is_italic:
+            candidates = ["figit", "notosit", "ubuntuit", "figo"]
+            description = "FiraGO Italic (sans-serif fallback)"
+        else:
+            candidates = ["figo", "notos", "ubuntu"]
+            description = "FiraGO (universal sans-serif fallback)"
 
-    # Append bold/italic variant suffix where pymupdf-fonts supports it
-    # pymupdf-fonts naming: "times" = regular, "timesbo" = bold, "timesit" = italic, "timesbi" = bold-italic
-    suffix = ""
-    if is_bold and is_italic:
-        suffix = "bi"
-    elif is_bold:
-        suffix = "bo"
-    elif is_italic:
-        suffix = "it"
+    chosen_code = None
+    font_buf = None
 
-    full_code = code + suffix
-
-    # Verify the variant exists — pymupdf-fonts doesn't have all combinations
+    # Try pymupdf_fonts first
     try:
-        f = fitz.Font(full_code)
-        chosen_code = full_code
-        font_buf = f.buffer
-    except Exception:
-        # Variant not available — use regular weight
-        chosen_code = code
-        description += f" (bold/italic variant '{full_code}' not available, using regular)"
-        f = fitz.Font(code)
-        font_buf = f.buffer
+        import pymupdf_fonts
+        for code in candidates:
+            try:
+                buf = pymupdf_fonts.myfont(code)
+                if buf:
+                    chosen_code = code
+                    font_buf = buf
+                    logger.info(
+                        f"Fallback font resolved: pymupdf_fonts '{code}' ({len(buf):,} bytes)"
+                    )
+                    break
+            except Exception:
+                pass
+    except ImportError:
+        logger.debug("pymupdf_fonts not installed; using Base-14 fallback")
+    except Exception as e:
+        logger.debug(f"pymupdf_fonts lookup failed: {e}")
+
+    # Base-14 last resort
+    if not chosen_code:
+        if is_mono:
+            try:
+                f = fitz.Font("cour")
+                chosen_code, font_buf = "cour", f.buffer
+                description += " → Base-14 Courier"
+            except Exception:
+                chosen_code = "cour"
+        elif is_serif:
+            try:
+                f = fitz.Font("tiro")
+                chosen_code, font_buf = "tiro", f.buffer
+                description += " → Base-14 Times"
+            except Exception:
+                chosen_code = "tiro"
+        else:
+            try:
+                f = fitz.Font("helv")
+                chosen_code, font_buf = "helv", f.buffer
+                description += " → Base-14 Helvetica"
+            except Exception:
+                chosen_code = "helv"
 
     full_reason = f"{reason} Falling back to: {description}."
 
@@ -993,6 +1061,49 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                 # If 'f' isn't in the ToUnicode single_map, it stays unmapped
                 # and MuPDF will use .notdef or fallback — which is correct.
 
+        # ── Force-map standard ASCII range (U+0020 to U+007E) if missing ──────
+        _AGL_NAMES = {
+            0x20: "space", 0x21: "exclam", 0x22: "quotedbl", 0x23: "numbersign",
+            0x24: "dollar", 0x25: "percent", 0x26: "ampersand", 0x27: "quotesingle",
+            0x28: "parenleft", 0x29: "parenright", 0x2A: "asterisk", 0x2B: "plus",
+            0x2C: "comma", 0x2D: "hyphen", 0x2E: "period", 0x2F: "slash",
+            0x3A: "colon", 0x3B: "semicolon", 0x3C: "less", 0x3D: "equal",
+            0x3E: "greater", 0x3F: "question", 0x40: "at",
+            0x5B: "bracketleft", 0x5C: "backslash", 0x5D: "bracketright",
+            0x5E: "asciicircum", 0x5F: "underscore", 0x60: "grave",
+            0x7B: "braceleft", 0x7C: "bar", 0x7D: "braceright", 0x7E: "asciitilde"
+        }
+
+        glyph_name_to_gid = {gname: gid for gid, gname in enumerate(glyph_order)}
+        force_mapped_count = 0
+        for ucp in range(0x0020, 0x007F):
+            if ucp not in unicode_to_glyph:
+                gname = None
+                ch = chr(ucp)
+                agl_name = _AGL_NAMES.get(ucp)
+                uni_hex_upper = f"uni{ucp:04X}"
+                uni_hex_lower = f"uni{ucp:04x}"
+
+                if ch in glyph_name_to_gid:
+                    gname = ch
+                elif agl_name and agl_name in glyph_name_to_gid:
+                    gname = agl_name
+                elif uni_hex_upper in glyph_name_to_gid:
+                    gname = uni_hex_upper
+                elif uni_hex_lower in glyph_name_to_gid:
+                    gname = uni_hex_lower
+                elif ucp in font_cmap_gids and 0 < font_cmap_gids[ucp] < n_glyphs:
+                    gname = glyph_order[font_cmap_gids[ucp]]
+                elif ucp in unicode_to_gid and 0 < unicode_to_gid[ucp] < n_glyphs:
+                    gname = glyph_order[unicode_to_gid[ucp]]
+
+                if gname:
+                    unicode_to_glyph[ucp] = gname
+                    force_mapped_count += 1
+
+        if force_mapped_count > 0:
+            logger.info(f"Force-mapped {force_mapped_count} unmapped standard ASCII characters (U+0020 to U+007E)")
+
         if not unicode_to_glyph:
             logger.warning("unicode_to_glyph is EMPTY! Returning original font_bytes.")
             return font_bytes
@@ -1112,3 +1223,115 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
     except Exception as e:
         logger.error(f"==== INJECT_CMAP FAILED: {e} ====", exc_info=True)
         return None
+
+
+def merge_missing_glyphs(
+    target_font_bytes: bytes,
+    missing_chars: list[str],
+    is_bold: bool = False,
+    is_italic: bool = False,
+) -> Optional[bytes]:
+    """
+    Dynamically extract missing glyphs from a fallback font (e.g. Noto Sans /
+    Nimbus Roman / Helvetica) and merge them into target_font_bytes using fontTools.
+    """
+    if not missing_chars or not target_font_bytes:
+        return None
+
+    try:
+        source_code = _PYMUPDF_SERIF_CODE if (is_bold or is_italic) else _PYMUPDF_SANS_CODE
+        try:
+            source_font = fitz.Font(source_code)
+            source_buf = source_font.buffer
+        except Exception:
+            source_font = fitz.Font("helv")
+            source_buf = source_font.buffer
+
+        if not source_buf:
+            return None
+
+        target_tt = TTFont(io.BytesIO(target_font_bytes))
+        source_tt = TTFont(io.BytesIO(source_buf))
+
+        source_cmap = source_tt.getBestCmap() if 'cmap' in source_tt else {}
+        if not source_cmap:
+            return None
+
+        cmap_table = target_tt.get('cmap')
+        if not cmap_table:
+            from fontTools.ttLib import newTable
+            cmap_table = newTable('cmap')
+            cmap_table.tableVersion = 0
+            cmap_table.tables = []
+            target_tt['cmap'] = cmap_table
+
+        subtable = None
+        for t in cmap_table.tables:
+            if t.platformID == 3 and t.platEncID == 1:
+                subtable = t
+                break
+        if not subtable:
+            subtable = CmapSubtable.newSubtable(4)
+            subtable.platformID = 3
+            subtable.platEncID = 1
+            subtable.language = 0
+            subtable.cmap = {}
+            cmap_table.tables.append(subtable)
+
+        target_glyph_order = list(target_tt.getGlyphOrder())
+        merged_count = 0
+
+        is_target_ttf = 'glyf' in target_tt and 'hmtx' in target_tt
+        is_source_ttf = 'glyf' in source_tt and 'hmtx' in source_tt
+
+        for ch in missing_chars:
+            cp = ord(ch)
+            source_gname = source_cmap.get(cp)
+            if not source_gname or source_gname not in source_tt.getGlyphOrder():
+                continue
+
+            new_gname = f"sym_{cp:04X}"
+            if new_gname in target_glyph_order:
+                subtable.cmap[cp] = new_gname
+                merged_count += 1
+                continue
+
+            if is_target_ttf and is_source_ttf:
+                try:
+                    from fontTools.pens.ttGlyphPen import TTGlyphPen
+                    pen = TTGlyphPen(target_tt.getGlyphSet())
+                    source_tt.getGlyphSet()[source_gname].draw(pen)
+                    new_glyph = pen.glyph()
+
+                    target_tt['glyf'][new_gname] = new_glyph
+                    src_adv, src_lsb = source_tt['hmtx'][source_gname]
+                    target_tt['hmtx'][new_gname] = (src_adv, src_lsb)
+                    target_glyph_order.append(new_gname)
+                    subtable.cmap[cp] = new_gname
+                    merged_count += 1
+                except Exception as e:
+                    logger.debug(f"TTF glyph merge for U+{cp:04X} '{ch}' failed: {e}")
+            elif 'CFF ' in target_tt and 'hmtx' in target_tt:
+                try:
+                    src_adv = 500
+                    if 'hmtx' in source_tt and source_gname in source_tt['hmtx']:
+                        src_adv = source_tt['hmtx'][source_gname][0]
+                    target_tt['hmtx'][new_gname] = (src_adv, 0)
+                    target_glyph_order.append(new_gname)
+                    subtable.cmap[cp] = new_gname
+                    merged_count += 1
+                except Exception as e:
+                    logger.debug(f"CFF glyph map for U+{cp:04X} '{ch}' failed: {e}")
+
+        if merged_count > 0:
+            target_tt.setGlyphOrder(target_glyph_order)
+            _ensure_browser_required_tables(target_tt)
+            out = io.BytesIO()
+            target_tt.save(out)
+            logger.info(f"Merged {merged_count} missing glyph(s) into font subset.")
+            return out.getvalue()
+
+    except Exception as e:
+        logger.warning(f"merge_missing_glyphs failed: {e}")
+
+    return None

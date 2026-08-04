@@ -35,14 +35,29 @@ def parse_color(color_val):
         return f"rgb({r}, {g}, {b})", f"#{r:02x}{g:02x}{b:02x}"
     return "rgb(0, 0, 0)", "#000000"
 
+import unicodedata
+
 UNICODE_SUPER_MAP = str.maketrans({
     '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
     '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'
 })
 
+LIGATURE_MAP = {
+    '\uFB00': 'ff',
+    '\uFB01': 'fi',
+    '\uFB02': 'fl',
+    '\uFB03': 'ffi',
+    '\uFB04': 'ffl',
+    '\uFB05': 'ft',
+    '\uFB06': 'st',
+}
+
 def normalize_pdf_text(text: str) -> str:
     if not text:
         return ""
+    text = unicodedata.normalize('NFKC', text)
+    for lig, replacement in LIGATURE_MAP.items():
+        text = text.replace(lig, replacement)
     return text.translate(UNICODE_SUPER_MAP)
 
 router = APIRouter()
@@ -322,241 +337,573 @@ def _line_font_flags(spans):
     return font_details[dom_font]["is_bold"], font_details[dom_font]["is_italic"], dom_font
 
 
-def extract_page_spacing_data(page, page_idx: int = None):
+def _collect_enclosing_rects(page):
+    pr = page.rect
+    rects = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d.get("rect"))
+        its = d.get("items") or []
+        if not any(it[0] == "re" for it in its):      # true rect ops only
+            continue
+        if r.width < 8 or r.height < 8:               # skip rules/underlines
+            continue
+        if r.get_area() > 0.9 * pr.get_area():        # skip page frame
+            continue
+        rects.append(r)
+    # de-duplicate near-identical rects (double-stroked borders)
+    out = []
+    for r in rects:
+        if not any(abs(o.x0-r.x0)<0.5 and abs(o.y0-r.y0)<0.5 and
+                   abs(o.x1-r.x1)<0.5 and abs(o.y1-r.y1)<0.5 for o in out):
+            out.append(r)
+    return out
+
+
+def _innermost_rect(rects, bbox):
+    best = None
+    for r in rects:
+        if r.contains(bbox):
+            if best is None or r.get_area() < best.get_area():
+                best = r
+    return best
+
+
+def get_base_font_family(font_name: str) -> str:
+    if not font_name:
+        return ""
+    return font_name.split("-")[0].split(",")[0]
+
+
+def _cluster_free_lines(free):
+    if not free:
+        return []
+    free = sorted(free, key=lambda l: (round(l["bbox"][1], 1), l["bbox"][0]))
+    out, cur = [], [free[0]]
+    for prev, nxt in zip(free, free[1:]):
+        pb, nb = fitz.Rect(prev["bbox"]), fitz.Rect(nxt["bbox"])
+        v_gap   = nb.y0 - pb.y1
+        v_tol   = max(3.5, 0.6 * min(prev["size"], nxt["size"]))   # font-scaled (stable across descenderless lines)
+        h_ovl   = min(pb.x1, nb.x1) - max(pb.x0, nb.x0)
+        x_close = (abs(pb.x0 - nb.x0) <= 0.5 * max(pb.height, nb.height)
+                   or h_ovl > 0.3 * min(pb.width, nb.width))
+        size_ok = abs(prev["size"] - nxt["size"]) <= 2.5
+        family_similar = (prev.get("font_family") == nxt.get("font_family")
+                          or prev.get("font_family", "") in nxt.get("font_family", "")
+                          or nxt.get("font_family", "") in prev.get("font_family", ""))
+        # Allow merge if: same family OR size difference <= 1.0
+        merge_ok = size_ok or (abs(prev["size"] - nxt["size"]) <= 1.0 and family_similar)
+
+        print(f"[CLUSTER-DEBUG] gap={v_gap:.2f} tol={v_tol:.2f} | x_close={x_close} | "
+              f"sz={prev['size']:.1f}->{nxt['size']:.1f} | merge={merge_ok} | "
+              f"Text: {prev.get('text', '')[:20]!r} -> {nxt.get('text', '')[:20]!r}")
+
+        if v_gap <= v_tol and x_close and merge_ok:
+            cur.append(nxt)
+        else:
+            out.append(cur); cur = [nxt]
+    out.append(cur)
+    return out
+
+
+def _split_bucket_by_left_edge(bucket, align_tol=3.0, min_share=0.15, depth=0):
+    """Split a page-column bucket into left-edge sub-buckets when it secretly
+    contains two visual columns (e.g. 8pt sidebar at x0=40 + 9pt abstract at x0=144).
+
+    Returns a list with one element ([bucket] unchanged) unless BOTH:
+      - the two largest left-edge clusters each hold >= max(3, 15%) lines, AND
+      - their separation is >= max(36pt, 5x DOMINANT (not max) font size).
+
+    Hanging-indents (~10-20pt gap) therefore never trigger a split, while a
+    sidebar-vs-abstract separation of ~103pt will.
+    """
+    if depth > 1 or len(bucket) < 8:
+        return [bucket]
+
+    get_x0 = lambda ln: ln["line_x0"] if "line_x0" in ln else ln["bbox"][0]
+
+    # Use the DOMINANT (most-common) font size, not max — a single 22pt heading
+    # in the bucket must not inflate the threshold from 36pt to 110pt.
+    size_counts = Counter(round(ln.get("size", 10.0), 1) for ln in bucket)
+    dom_size = size_counts.most_common(1)[0][0] if size_counts else 10.0
+
+    # Cluster lines by left-edge proximity (within align_tol)
+    clusters = []
+    for ln in sorted(bucket, key=get_x0):
+        placed = False
+        for c in clusters:
+            if abs(c["x0"] - get_x0(ln)) <= align_tol:
+                # Running average keeps anchor accurate
+                c["x0"] = (c["x0"] * c["n"] + get_x0(ln)) / (c["n"] + 1)
+                c["n"] += 1
+                placed = True
+                break
+        if not placed:
+            clusters.append({"x0": get_x0(ln), "n": 1})
+
+    if len(clusters) < 2:
+        return [bucket]
+
+    # Evaluate only the two most-populated clusters
+    clusters.sort(key=lambda c: -c["n"])
+    a, b = sorted(clusters[:2], key=lambda c: c["x0"])
+    n = len(bucket)
+    sep = b["x0"] - a["x0"]
+    sep_floor = max(36.0, 5.0 * dom_size)
+
+    # Guard: both groups must be substantial
+    if a["n"] < max(3, min_share * n) or b["n"] < max(3, min_share * n):
+        logger.debug(
+            f"[SPLIT-SKIP] depth={depth} n={n} dom_size={dom_size:.1f} "
+            f"anchors=[({a['x0']:.1f},{a['n']}),({b['x0']:.1f},{b['n']})] "
+            f"sep={sep:.1f} reason=min_share"
+        )
+        return [bucket]
+    # Guard: separation must exceed hanging-indent scale
+    if sep < sep_floor:
+        logger.debug(
+            f"[SPLIT-SKIP] depth={depth} n={n} dom_size={dom_size:.1f} "
+            f"anchors=[({a['x0']:.1f},{a['n']}),({b['x0']:.1f},{b['n']})] "
+            f"sep={sep:.1f} < floor={sep_floor:.1f} reason=sep"
+        )
+        return [bucket]
+
+    mid = (a["x0"] + b["x0"]) / 2.0
+    left  = sorted([ln for ln in bucket if get_x0(ln) <  mid], key=lambda l: l["line_y0"])
+    right = sorted([ln for ln in bucket if get_x0(ln) >= mid], key=lambda l: l["line_y0"])
+    out = []
+    for part in (left, right):
+        out.extend(_split_bucket_by_left_edge(part, align_tol, min_share, depth + 1))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Bullet / marker glyph pre-pass helpers
+# ---------------------------------------------------------------------------
+
+MARKER_GLYPHS = set("\u21d2\u2794\u2192\u27f6\u2022\u25e6\u25aa\u25ba\u25b6\u25a0\u25a1\u00b7\u2013\u2014")
+
+
+def _is_marker_line(ln):
+    """Return True if this line is a standalone bullet/arrow marker (1–2 non-space glyphs)."""
+    txt = "".join(ch for ch in ln.get("text", "") if not ch.isspace())
+    return 1 <= len(txt) <= 2 and all(c in MARKER_GLYPHS for c in txt)
+
+
+def _attach_bullet_markers(lines):
+    """
+    Pre-pass: merge single-glyph bullet/arrow marker lines into the text line
+    that sits immediately to their right on the same visual row.
+
+    A 'marker' line has 1-2 non-whitespace chars that are all bullet symbols
+    (e.g. ⇒, •, ►).  These are emitted by PyMuPDF as separate lines with a
+    different font and zero horizontal overlap with the body text – so the
+    normal x_close clustering rule never fires.  We attach them here before
+    column bucketing so downstream clustering sees a single wide line.
+    """
+    lines = [dict(l) for l in lines]
+    for m in lines:
+        if not _is_marker_line(m):
+            continue
+        for t in lines:
+            if t is m or t.get("_consumed"):
+                continue
+            # Same visual row: vertical overlap AND marker sits to the left of text
+            if (t["line_y0"] < m["line_y1"] and m["line_y0"] < t["line_y1"]
+                    and m["line_x1"] <= t["line_x0"] + 3.0):
+                # Prepend marker chars and expand bounding geometry
+                t["chars"]   = m["chars"] + t["chars"]
+                t["line_x0"] = min(m["line_x0"], t["line_x0"])
+                t["bbox"]    = [
+                    min(m["bbox"][0], t["bbox"][0]),
+                    min(m["bbox"][1], t["bbox"][1]),
+                    max(m["bbox"][2], t["bbox"][2]),
+                    max(m["bbox"][3], t["bbox"][3]),
+                ]
+                sep = "" if m["text"].endswith(" ") else " "
+                t["text"] = m["text"] + sep + t["text"]
+                m["_consumed"] = True
+                break
+    return [l for l in lines if not l.get("_consumed")]
+
+
+def extract_page_spacing_data(page, page_idx: int = None,
+                              page_images=None, page_drawings=None,
+                              pdf_bytes=None):
     """
     Extract per-character spatial data and paragraph typography metadata from a page.
-
-    Returns a list of blocks (paragraphs), each containing:
-      - paragraph_id: string e.g. "p_{page_idx}_{block_number}"
-      - font_size: float (dominant font size in pt)
-      - font_family: string (dominant postscript font name)
-      - font_color: string (CSS "rgb(r,g,b)")
-      - hex_color: string ("#RRGGBB")
-      - is_bold: boolean
-      - is_italic: boolean
-      - align: string ("left", "center", "right", "justify")
-      - bbox: list [x0, y0, x1, y1]
-      - text: full string content of the paragraph
-      - line_count: int
-      - spans: list of text span objects
-      - lines: list of line objects with line text, bbox, size, font, color, bold, italic, chars
+    Uses 3-tier region extraction: rect-bound -> gap-clustered -> per-line floor.
     """
     if page_idx is None:
         page_idx = getattr(page, 'number', 0)
 
-    data = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
     blocks_out = []
 
-    for b_idx, block in enumerate(data.get("blocks", [])):
-        if block.get("type", -1) != 0:
-            continue  # skip image blocks
+    def _extract_all_lines():
+        all_lines = []
+        # Use TEXT_ACCURATE_BBOXES so PyMuPDF evaluates actual glyph outlines
+        # instead of synthesised ascender/descender metrics. This fixes the
+        # right-border under-reporting on condensed CFF fonts (HelveticaNeueLTStd-Cn)
+        # and symbol glyphs (e.g. ⇒) that regressed in PyMuPDF ≥1.25.0.
+        # unset_quad_corrections is required as a companion (maintainer note, issue #4115).
+        fitz.TOOLS.unset_quad_corrections(True)
+        flags = fitz.TEXTFLAGS_RAWDICT | fitz.TEXT_ACCURATE_BBOXES
+        data = page.get_text("rawdict", flags=flags)
+        for block in data.get("blocks", []):
+            if block.get("type", -1) != 0:
+                continue
+            for line in block.get("lines", []):
+                raw_chars = []
+                spans = line.get("spans", [])
+                dom_bold, dom_italic, dom_font = _line_font_flags(spans)
 
-        block_num = block.get("number", b_idx)
-        block_lines = []
-        block_spans = []
-        all_block_fonts = Counter()
-        all_block_sizes = Counter()
-        all_block_colors = Counter()
-        all_block_bolds = Counter()
-        all_block_italics = Counter()
+                for span in spans:
+                    is_superscript_flag = bool(span.get("flags", 0) & fitz.TEXT_FONT_SUPERSCRIPT)
+                    span_font = span.get("font", "")
+                    span_size = span.get("size", 0.0)
+                    span_flags = span.get("flags", 0)
+                    span_bold = bool(span_flags & 16) or "Bold" in span_font or "bold" in span_font.lower()
+                    span_italic = bool(span_flags & 2) or "Italic" in span_font or "Oblique" in span_font or "italic" in span_font.lower()
+                    span_color_css, span_hex = parse_color(span.get("color", 0))
+                    span_text = normalize_pdf_text(span.get("text", ""))
+                    if not span_text and "chars" in span:
+                        span_text = "".join(normalize_pdf_text(ch.get("c", "")) for ch in span.get("chars", []))
 
-        for line in block.get("lines", []):
-            # ── Pass 1: collect all chars with span-level metadata ──────────
-            raw_chars = []
-            spans = line.get("spans", [])
-            dom_bold, dom_italic, dom_font = _line_font_flags(spans)
+                    for ch in span.get("chars", []):
+                        ch_text = normalize_pdf_text(ch.get("c", ""))
+                        raw_chars.append({
+                            "c":              ch_text,
+                            "x0":             ch["bbox"][0],
+                            "x1":             ch["bbox"][2],
+                            "y0":             ch["bbox"][1],
+                            "y1":             ch["bbox"][3],
+                            "origin_x":       ch["origin"][0],
+                            "origin_y":       ch["origin"][1],
+                            "font":           span_font,
+                            "size":           span_size,
+                            "is_superscript_flag": is_superscript_flag,
+                            "color":          span_color_css,
+                            "hex_color":      span_hex,
+                            "is_bold":        span_bold,
+                            "is_italic":      span_italic,
+                        })
 
-            for span in spans:
-                is_superscript_flag = bool(span.get("flags", 0) & fitz.TEXT_FONT_SUPERSCRIPT)
-                span_font = span.get("font", "")
-                span_size = span.get("size", 0.0)
-                span_flags = span.get("flags", 0)
-                
-                span_bold = bool(span_flags & 16) or "Bold" in span_font or "bold" in span_font.lower()
-                span_italic = bool(span_flags & 2) or "Italic" in span_font or "Oblique" in span_font or "italic" in span_font.lower()
-                
-                span_color_css, span_hex = parse_color(span.get("color", 0))
-                
-                span_text = normalize_pdf_text(span.get("text", ""))
-                if not span_text and "chars" in span:
-                    span_text = "".join(normalize_pdf_text(ch.get("c", "")) for ch in span.get("chars", []))
+                if not raw_chars:
+                    continue
 
-                block_spans.append({
-                    "text": span_text,
-                    "font": span_font,
-                    "size": round(span_size, 1),
-                    "color": span_color_css,
-                    "hex_color": span_hex,
-                    "is_bold": span_bold,
-                    "is_italic": span_italic,
-                })
+                normal_origins = [ch["origin_y"] for ch in raw_chars if not ch["is_superscript_flag"]]
+                if not normal_origins:
+                    normal_origins = [ch["origin_y"] for ch in raw_chars]
+                bucketed = [round(y * 2) / 2 for y in normal_origins]
+                dom_baseline = Counter(bucketed).most_common(1)[0][0]
 
-                for ch in span.get("chars", []):
-                    ch_text = normalize_pdf_text(ch.get("c", ""))
-                    raw_chars.append({
-                        "c":              ch_text,
-                        "x0":             ch["bbox"][0],
-                        "x1":             ch["bbox"][2],
-                        "y0":             ch["bbox"][1],
-                        "y1":             ch["bbox"][3],
-                        "origin_x":       ch["origin"][0],
-                        "origin_y":       ch["origin"][1],
-                        "font":           span_font,
-                        "size":           span_size,
-                        "is_superscript_flag": is_superscript_flag,
-                        "color":          span_color_css,
-                        "hex_color":      span_hex,
-                        "is_bold":        span_bold,
-                        "is_italic":      span_italic,
+                normal_sizes = [ch["size"] for ch in raw_chars if not ch["is_superscript_flag"]]
+                if not normal_sizes:
+                    normal_sizes = [ch["size"] for ch in raw_chars]
+                dom_line_size = Counter(normal_sizes).most_common(1)[0][0]
+                sub_threshold = dom_line_size * 0.15
+
+                line_chars = []
+                for ch in raw_chars:
+                    is_sup = ch["is_superscript_flag"]
+                    is_sub = (
+                        not is_sup
+                        and ch["origin_y"] > dom_baseline + sub_threshold
+                        and ch["size"] < dom_line_size - 0.5
+                    )
+                    line_chars.append({
+                        "c":              ch["c"],
+                        "x0":             ch["x0"],
+                        "x1":             ch["x1"],
+                        "y0":             ch["y0"],
+                        "y1":             ch["y1"],
+                        "origin_x":       ch["origin_x"],
+                        "origin_y":       ch["origin_y"],
+                        "font":           ch["font"],
+                        "size":           ch["size"],
+                        "is_superscript": is_sup,
+                        "is_subscript":   is_sub,
+                        "color":          ch["color"],
+                        "hex_color":      ch.get("hex_color", "#000000"),
+                        "is_bold":        ch.get("is_bold", False),
+                        "is_italic":      ch.get("is_italic", False),
                     })
-                    if ch_text.strip():
-                        all_block_fonts[span_font] += 1
-                        all_block_sizes[round(span_size, 1)] += 1
-                        all_block_colors[(span_color_css, span_hex)] += 1
-                        all_block_bolds[span_bold] += 1
-                        all_block_italics[span_italic] += 1
 
-            if not raw_chars:
-                continue
+                if not line_chars:
+                    continue
 
-            # ── Pass 2: compute dominant baseline & size for subscript detection ──
-            normal_origins = [ch["origin_y"] for ch in raw_chars if not ch["is_superscript_flag"]]
-            if not normal_origins:
-                normal_origins = [ch["origin_y"] for ch in raw_chars]
-            bucketed = [round(y * 2) / 2 for y in normal_origins]
-            dom_baseline = Counter(bucketed).most_common(1)[0][0]
+                gaps = [line_chars[i]["x0"] - line_chars[i - 1]["x1"] for i in range(1, len(line_chars))]
+                line_color_counts = Counter(c["color"] for c in line_chars)
+                dom_color = line_color_counts.most_common(1)[0][0] if line_color_counts else "rgb(0, 0, 0)"
 
-            normal_sizes = [ch["size"] for ch in raw_chars if not ch["is_superscript_flag"]]
-            if not normal_sizes:
-                normal_sizes = [ch["size"] for ch in raw_chars]
-            dom_line_size = Counter(normal_sizes).most_common(1)[0][0]
+                x0, y0, x1, y1 = line["bbox"][0], line["bbox"][1], line["bbox"][2], line["bbox"][3]
+                line_text = "".join(c["c"] for c in line_chars)
 
-            sub_threshold = dom_line_size * 0.15
+                base_family = get_base_font_family(dom_font)
+                has_bold = bool("Bold" in dom_font or "-Bd" in dom_font or "bold" in dom_font.lower() or dom_bold)
+                has_italic = bool("Italic" in dom_font or "-It" in dom_font or "Oblique" in dom_font or "italic" in dom_font.lower() or dom_italic)
 
-            # ── Pass 3: tag each char with final is_superscript / is_subscript ──
-            line_chars = []
-            for ch in raw_chars:
-                is_sup = ch["is_superscript_flag"]
-                is_sub = (
-                    not is_sup
-                    and ch["origin_y"] > dom_baseline + sub_threshold
-                    and ch["size"] < dom_line_size - 0.5
-                )
-                line_chars.append({
-                    "c":              ch["c"],
-                    "x0":             ch["x0"],
-                    "x1":             ch["x1"],
-                    "y0":             ch["y0"],
-                    "y1":             ch["y1"],
-                    "origin_x":       ch["origin_x"],
-                    "origin_y":       ch["origin_y"],
-                    "font":           ch["font"],
-                    "size":           ch["size"],
-                    "is_superscript": is_sup,
-                    "is_subscript":   is_sub,
-                    "color":          ch["color"],
+                all_lines.append({
+                    "text":        line_text,
+                    "bbox":        [x0, y0, x1, y1],
+                    "width":       x1 - x0,
+                    "height":      y1 - y0,
+                    "space_count": line_text.count(" "),
+                    "chars":       line_chars,
+                    "gaps":        gaps,
+                    "line_x0":     x0,
+                    "line_x1":     x1,
+                    "line_y0":     y0,
+                    "line_y1":     y1,
+                    "is_bold":     dom_bold,
+                    "is_italic":   dom_italic,
+                    "dominant_font": dom_font,
+                    "dominant_color": dom_color,
+                    "size":        round(dom_line_size, 1),
+                    "font":        dom_font,
+                    "color":       dom_color,
+                    "bold":        dom_bold,
+                    "italic":      dom_italic,
+                    "font_family": base_family,
+                    "has_bold":    has_bold,
+                    "has_italic":  has_italic,
+                    "spans":       spans,
                 })
+        return all_lines
 
-            if not line_chars:
-                continue
+    try:
+        all_lines = _extract_all_lines()
+        # Attach hanging-indent bullet/arrow markers to their text lines before
+        # column bucketing so downstream gap-clustering merges them correctly.
+        all_lines = _attach_bullet_markers(all_lines)
+        if not all_lines:
+            return []
 
-            gaps = []
-            for i in range(1, len(line_chars)):
-                gap = line_chars[i]["x0"] - line_chars[i - 1]["x1"]
-                gaps.append(gap)
+        cols = _get_column_boundaries(page)
+        rects = _collect_enclosing_rects(page)
+        grouped, free = {}, []
+        for line in all_lines:
+            r = _innermost_rect(rects, fitz.Rect(line["bbox"]))
+            if r:
+                grouped.setdefault(tuple(r), []).append(line)
+            else:
+                free.append(line)
 
-            line_color_counts = Counter(c["color"] for c in line_chars)
-            dom_color = line_color_counts.most_common(1)[0][0] if line_color_counts else "rgb(0, 0, 0)"
+        buckets = {i: [] for i in range(len(cols))}
+        for ln in free:
+            x0 = ln["line_x0"]
+            idx = None
+            for i, (c0, c1) in enumerate(cols):
+                if c0 - 5 <= x0 <= c1 + 5:
+                    idx = i
+                    break
+            if idx is None:  # nearest column LEFT edge (not center)
+                idx = min(range(len(cols)), key=lambda i: abs(x0 - cols[i][0]))
+            buckets[idx].append(ln)
 
-            x0 = line["bbox"][0]
-            y0 = line["bbox"][1]
-            x1 = line["bbox"][2]
-            y1 = line["bbox"][3]
-            line_text = "".join(c["c"] for c in line_chars)
-            space_count = line_text.count(" ")
+        logger.info(
+            f"[REGIONS-DEBUG] page {page_idx}: "
+            f"cols={[(round(a, 1), round(b, 1)) for a, b in cols]} "
+            f"bucket_sizes={ {i: len(v) for i, v in buckets.items()} }"
+        )
 
-            block_lines.append({
-                "text":        line_text,
-                "bbox":        [x0, y0, x1, y1],
-                "width":       x1 - x0,
-                "height":      y1 - y0,
-                "space_count": space_count,
-                "chars":       line_chars,
-                "gaps":        gaps,
-                "line_x0":     x0,
-                "line_x1":     x1,
-                "line_y0":     y0,
-                "line_y1":     y1,
-                "is_bold":     dom_bold,
-                "is_italic":   dom_italic,
-                "dominant_font": dom_font,
-                "dominant_color": dom_color,
-                "size":        round(dom_line_size, 1),
-                "font":        dom_font,
-                "color":       dom_color,
-                "bold":        dom_bold,
-                "italic":      dom_italic,
-            })
+        region_tuples = []
+        for r_key, lines in grouped.items():
+            cx = (min(l["line_x0"] for l in lines) + max(l["line_x1"] for l in lines)) / 2
+            c_idx = 0
+            for i, (c0, c1) in enumerate(cols):
+                if c0 - 5 <= cx <= c1 + 5:
+                    c_idx = i
+                    break
+            region_tuples.append((lines, "rect", c_idx))
 
-        if block_lines:
-            # Determine block alignment authoritatively from line coordinates
-            block_align = "left"
-            b_x0s = [l["line_x0"] for l in block_lines]
-            b_x1s = [l["line_x1"] for l in block_lines]
-            b_y0s = [l["line_y0"] for l in block_lines]
-            b_y1s = [l["line_y1"] for l in block_lines]
-            block_x0 = min(b_x0s)
-            block_x1 = max(b_x1s)
-            block_y0 = min(b_y0s)
-            block_y1 = max(b_y1s)
+        for i in sorted(buckets):
+            if buckets[i]:
+                subs = _split_bucket_by_left_edge(buckets[i])
+                # Unconditional — prints even for 1-sub-bucket (proves the path ran)
+                logger.info(
+                    f"[SUBBUCKET] page {page_idx} bucket {i}: {len(subs)} sub-bucket(s) "
+                    f"sizes={[len(s) for s in subs]} "
+                    f"anchors={[round(s[0]['line_x0'], 1) for s in subs]}"
+                )
+                for sub in subs:
+                    for cluster in _cluster_free_lines(sub):
+                        region_tuples.append((cluster, "gap", i))
 
-            if len(block_lines) > 1:
-                justified_count = 0
-                for l in block_lines[:-1]:  # exclude final line
-                    touches_left = abs(l["line_x0"] - block_x0) < 5.0
-                    touches_right = abs(l["line_x1"] - block_x1) < 18.0
-                    if touches_left and touches_right:
-                        justified_count += 1
+        if not region_tuples:
+            region_tuples = [([l], "line", 0) for l in all_lines]
 
-                if len(block_lines) > 1 and justified_count >= (len(block_lines) - 1) / 2:
-                    block_align = "justify"
-                else:
-                    midpoints = [(l["line_x0"] + l["line_x1"]) / 2 for l in block_lines]
-                    block_mid = (block_x0 + block_x1) / 2
-                    if all(abs(m - block_mid) < 5.0 for m in midpoints):
-                        block_align = "center"
-                    elif all(abs(l["line_x1"] - block_x1) < 5.0 for l in block_lines):
-                        block_align = "right"
+        logger.info(
+            f"[REGIONS] page {page_idx}: rect_regions={len(grouped)} "
+            f"free_lines={len(free)} regions={len(region_tuples)}"
+        )
 
-            # Dominant block font properties
-            dom_font_family = all_block_fonts.most_common(1)[0][0] if all_block_fonts else (block_lines[0]["dominant_font"] if block_lines else "Helvetica")
-            dom_font_size = all_block_sizes.most_common(1)[0][0] if all_block_sizes else (block_lines[0]["size"] if block_lines else 12.0)
-            dom_color_pair = all_block_colors.most_common(1)[0][0] if all_block_colors else ("rgb(0, 0, 0)", "#000000")
+    except Exception as e:
+        logger.exception(f"[REGIONS] extract_page_spacing_data failed on page {page_idx}")
+        try:
+            all_lines = _extract_all_lines()
+        except Exception:
+            all_lines = []
+        region_tuples = [([l], "line", 0) for l in all_lines]
+
+    # Sort regions by column index (primary), y0 (secondary), x0 (tertiary)
+    region_tuples.sort(
+        key=lambda item: (
+            item[2],
+            round(min(l["line_y0"] for l in item[0]), 1),
+            min(l["line_x0"] for l in item[0])
+        )
+    )
+
+    for reg_idx, (reg_lines, reg_kind, _col) in enumerate(region_tuples):
+        if not reg_lines:
+            continue
+
+        paragraph_text = "\n".join(l["text"] for l in reg_lines)
+
+        all_chars = [ch for l in reg_lines for ch in l.get("chars", [])]
+        non_space_chars = [ch for ch in all_chars if ch.get("c", "").strip()]
+        target_chars = non_space_chars if non_space_chars else all_chars
+
+        if target_chars:
+            dom_font_family = Counter(ch["font"] for ch in target_chars).most_common(1)[0][0]
+            total_width = sum(max(0.0, ch["x1"] - ch["x0"]) for ch in target_chars)
+            if total_width > 0:
+                dom_font_size = round(sum(ch["size"] * max(0.0, ch["x1"] - ch["x0"]) for ch in target_chars) / total_width, 1)
+            else:
+                dom_font_size = Counter(round(ch["size"], 1) for ch in target_chars).most_common(1)[0][0]
+            dom_color_pair = Counter((ch["color"], ch.get("hex_color", "#000000")) for ch in target_chars).most_common(1)[0][0]
             dom_rgb, dom_hex = dom_color_pair
-            dom_block_bold = all_block_bolds.most_common(1)[0][0] if all_block_bolds else False
-            dom_block_italic = all_block_italics.most_common(1)[0][0] if all_block_italics else False
+            dom_block_bold = Counter(ch["is_bold"] for ch in target_chars).most_common(1)[0][0]
+            dom_block_italic = Counter(ch["is_italic"] for ch in target_chars).most_common(1)[0][0]
+        else:
+            dom_font_family = reg_lines[0]["font"]
+            dom_font_size = reg_lines[0]["size"]
+            dom_rgb, dom_hex = "rgb(0, 0, 0)", "#000000"
+            dom_block_bold = reg_lines[0]["is_bold"]
+            dom_block_italic = reg_lines[0]["is_italic"]
 
-            paragraph_text = "\n".join(l["text"] for l in block_lines)
-            paragraph_id = f"p_{page_idx}_{block_num}"
+        # Compute block bounds as union of every line & char bbox
+        b_x0s = [l["line_x0"] for l in reg_lines] + [c["x0"] for l in reg_lines for c in l.get("chars", []) if c.get("x0") is not None]
+        b_x1s = [l["line_x1"] for l in reg_lines] + [c["x1"] for l in reg_lines for c in l.get("chars", []) if c.get("x1") is not None]
+        b_y0s = [l["line_y0"] for l in reg_lines] + [c["y0"] for l in reg_lines for c in l.get("chars", []) if c.get("y0") is not None]
+        b_y1s = [l["line_y1"] for l in reg_lines] + [c["y1"] for l in reg_lines for c in l.get("chars", []) if c.get("y1") is not None]
+        block_x0 = min(b_x0s)
+        block_x1 = max(b_x1s)
+        block_y0 = min(b_y0s)
+        block_y1 = max(b_y1s)
 
-            blocks_out.append({
-                "paragraph_id": paragraph_id,
-                "block_number": block_num,
-                "font_size": dom_font_size,
-                "font_family": dom_font_family,
-                "font_color": dom_rgb,
-                "hex_color": dom_hex,
-                "is_bold": dom_block_bold,
-                "is_italic": dom_block_italic,
-                "align": block_align,
-                "bbox": [block_x0, block_y0, block_x1, block_y1],
-                "text": paragraph_text,
-                "line_count": len(block_lines),
-                "spans": block_spans,
-                "lines": block_lines,
-            })
+        block_align = "left"
+        if len(reg_lines) > 1:
+            justified_count = 0
+            for l in reg_lines[:-1]:
+                touches_left = abs(l["line_x0"] - block_x0) < 5.0
+                touches_right = abs(l["line_x1"] - block_x1) < 18.0
+                if touches_left and touches_right:
+                    justified_count += 1
+
+            if len(reg_lines) > 1 and justified_count >= (len(reg_lines) - 1) / 2:
+                block_align = "justify"
+            else:
+                midpoints = [(l["line_x0"] + l["line_x1"]) / 2 for l in reg_lines]
+                block_mid = (block_x0 + block_x1) / 2
+                if all(abs(m - block_mid) < 5.0 for m in midpoints):
+                    block_align = "center"
+                elif all(abs(l["line_x1"] - block_x1) < 5.0 for l in reg_lines):
+                    block_align = "right"
+
+        text_bbox = [block_x0, block_y0, block_x1, block_y1]
+        union_bbox = text_bbox[:]
+
+        # Dilate text_bbox by 3pt before testing intersections so vector-art
+        # bullets drawn just outside the text cluster edge are still captured.
+        dilated_bbox = [text_bbox[0] - 3.0, text_bbox[1] - 3.0,
+                        text_bbox[2] + 3.0, text_bbox[3] + 3.0]
+
+        for img in (page_images or []):
+            ib = img.get("bbox")
+            if ib and _rects_intersect(dilated_bbox, ib):
+                union_bbox = _union(union_bbox, list(ib))
+
+        for drw in (page_drawings or []):
+            db = drw.get("rect")
+            if db:
+                db_list = [db.x0, db.y0, db.x1, db.y1]
+                if _rects_intersect(dilated_bbox, db_list):
+                    union_bbox = _union(union_bbox, db_list)
+
+        pw, ph = page.rect.width, page.rect.height
+        union_bbox[0] = max(0.0, union_bbox[0])
+        union_bbox[1] = max(0.0, union_bbox[1])
+        union_bbox[2] = min(pw, union_bbox[2])
+        union_bbox[3] = min(ph, union_bbox[3])
+
+        has_non_text = (union_bbox != text_bbox)
+        underlay = None
+        paragraph_id = f"p_{page_idx}_{reg_idx}"
+
+        if has_non_text and pdf_bytes is not None:
+            try:
+                tmp_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                tmp_page = tmp_doc[page_idx]
+                u_rect = fitz.Rect(union_bbox)
+                tmp_page.add_redact_annot(u_rect)
+                tmp_page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
+                pix = tmp_page.get_pixmap(clip=u_rect, dpi=144)
+                underlay = {
+                    "data": base64.b64encode(pix.tobytes("png")).decode("ascii"),
+                    "ext": "png",
+                    "rect": union_bbox,
+                }
+                tmp_doc.close()
+            except Exception as e:
+                logger.warning(f"underlay render failed for {paragraph_id}: {e}")
+
+        u_x0, u_y0, u_x1, u_y1 = union_bbox
+        block_spans = []
+        for l in reg_lines:
+            block_spans.extend(l.get("spans", []))
+
+        blocks_out.append({
+            "paragraph_id": paragraph_id,
+            "block_number": reg_idx,
+            "font_size": dom_font_size,
+            "font_family": dom_font_family,
+            "font_color": dom_rgb,
+            "hex_color": dom_hex,
+            "is_bold": dom_block_bold,
+            "is_italic": dom_block_italic,
+            "align": block_align,
+            "bbox": union_bbox,
+            "pdfX": u_x0,
+            "pdfY_top": u_y0,
+            "pdfW": u_x1 - u_x0,
+            "pdfH": u_y1 - u_y0,
+            "text": paragraph_text,
+            "line_count": len(reg_lines),
+            "spans": block_spans,
+            "lines": [
+                dict(l, line_bbox=l["bbox"]) for l in reg_lines
+            ],
+            "underlay": underlay,
+            "region_kind": reg_kind,
+        })
 
     return blocks_out
+
+
+def _rects_intersect(r1, r2, pad=2.0):
+    """Return True if rect r1=[x0,y0,x1,y1] and r2 overlap (with optional pad)."""
+    return (r1[0] - pad < r2[2] and r1[2] + pad > r2[0] and
+            r1[1] - pad < r2[3] and r1[3] + pad > r2[1])
+
+
+def _union(r1, r2):
+    """Return the bounding union of two [x0,y0,x1,y1] rects."""
+    return [min(r1[0], r2[0]), min(r1[1], r2[1]),
+            max(r1[2], r2[2]), max(r1[3], r2[3])]
 
 
 def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
@@ -574,7 +921,18 @@ def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
 
     for page_index in range(len(doc)):
         page = doc[page_index]
-        page_blocks = extract_page_spacing_data(page, page_idx=page_index)
+
+        # Collect images and drawings once per page — passed into
+        # extract_page_spacing_data so it can union bboxes and render underlays.
+        page_images = page.get_image_info(xrefs=True)
+        page_drawings = page.get_drawings()
+
+        page_blocks = extract_page_spacing_data(
+            page, page_idx=page_index,
+            page_images=page_images,
+            page_drawings=page_drawings,
+            pdf_bytes=pdf_bytes,
+        )
         column_boundaries = _get_column_boundaries(page)
 
         # Collect inline images (e.g. ORCID iD badge, symbol glyphs) so the
@@ -642,7 +1000,7 @@ async def extract_typography(file: UploadFile = File(...), doc_id: str = Form(No
         TYPOGRAPHY_CACHE[doc_id] = cached_result
         return JSONResponse(status_code=200, content=cached_result)
     except Exception as e:
-        logger.error(f"extract-typography failed: {e}")
+        logger.exception("extract-typography failed")
         return JSONResponse(
             status_code=500,
             content={"error": f"Failed to extract typography: {str(e)}"},
@@ -685,7 +1043,7 @@ async def extract_spacing(file: UploadFile = File(...)):
 
         return JSONResponse(status_code=200, content=payload)
     except Exception as e:
-        logger.error(f"extract-spacing failed: {e}")
+        logger.exception("extract-spacing failed")
         return JSONResponse(
             status_code=500,
             content={"error": "Failed to extract spacing layout"},
