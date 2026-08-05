@@ -28,6 +28,11 @@ export function getFontStemVwRatio(fontFamilyName) {
   return null;
 }
 
+const canon = (n) => (n || '')
+  .replace(/^[A-Z]{6}\+/, '')
+  .replace(/\s+(Regular|Reg|Bold|Italic|Oblique)$/i, '')
+  .replace(/\s*-\s*/g, '-');
+
 export async function loadPDFFonts(fontsData) {
   // fontsData shape: { "NBUDXT+MetaProLight-Regular": { data, format, postscript_name, subset_tag, stem_vw_ratio } }
   
@@ -38,6 +43,8 @@ export async function loadPDFFonts(fontsData) {
     if (meta.stem_vw_ratio != null && typeof meta.stem_vw_ratio === 'number') {
       fontStemRatios.set(psName, meta.stem_vw_ratio);
       fontStemRatios.set(basename, meta.stem_vw_ratio);
+      fontStemRatios.set(canon(psName), meta.stem_vw_ratio);
+      fontStemRatios.set(canon(basename), meta.stem_vw_ratio);
     }
 
     // Skip if already loaded (can happen with multi-page PDFs referencing same font)
@@ -51,10 +58,13 @@ export async function loadPDFFonts(fontsData) {
       'woff2': 'woff2',
     }[meta.format] || 'opentype';
     
-    // Register with both PostScript name and subset-prefixed name so CSS
-    // font-family lookup succeeds regardless of which form it was given.
+    // Register with PostScript name, subset-prefixed name, and canonized name
     const familyNames = [psName];
     if (basename !== psName) familyNames.push(basename);
+    const cPs = canon(psName);
+    if (cPs && !familyNames.includes(cPs)) familyNames.push(cPs);
+    const cBase = canon(basename);
+    if (cBase && !familyNames.includes(cBase)) familyNames.push(cBase);
     
     for (const familyName of familyNames) {
       if (meta.stem_vw_ratio != null && typeof meta.stem_vw_ratio === 'number') {

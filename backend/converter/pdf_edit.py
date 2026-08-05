@@ -5,9 +5,9 @@ import logging
 import base64
 import math
 from typing import Optional
-from fastapi import APIRouter, UploadFile, Form, File
+from fastapi import APIRouter, UploadFile, Form, File, HTTPException
 from fastapi.responses import StreamingResponse
-from .font_utils import get_font_for_edit
+from .font_utils import get_font_for_edit, _find_missing_glyphs
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -33,6 +33,149 @@ def _expand_ligatures(text: str) -> str:
 
 
 # ── Helper: measure true rendered width from rawdict per-character bboxes ────
+
+
+def _span_runs_in_rect(page: fitz.Page, rect: fitz.Rect) -> list:
+    """
+    Extract per-span text runs inside `rect` from the rawdict, preserving
+    per-run font/size/color, origin (x, baseline_y), rise (superscript offset),
+    and line grouping.
+
+    Returns run dicts sorted by (line_y, x):
+      {"line_y", "line_baseline_y", "x", "origin", "span_baseline_y", "rise",
+       "bbox", "text", "font", "size", "color", "color_rgb", "flags"}
+    """
+    runs = []
+    rd = page.get_text("rawdict", clip=rect)
+    for b in rd.get("blocks", []):
+        if b.get("type", 0) != 0:
+            continue
+        for ln in b.get("lines", []):
+            lb = ln.get("bbox", (0, 0, 0, 0))
+            line_spans = []
+            for sp in ln.get("spans", []):
+                txt = _expand_ligatures("".join(c.get("c", "") for c in sp.get("chars", []) if c.get("c") != "\u00AD"))
+                if not txt:
+                    continue
+                origin = sp.get("origin", (lb[0], lb[3]))
+                color_int = sp.get("color", 0)
+                color_rgb = (
+                    ((color_int >> 16) & 255) / 255.0,
+                    ((color_int >> 8) & 255) / 255.0,
+                    (color_int & 255) / 255.0
+                )
+                line_spans.append({
+                    "line_y": round(lb[1], 1),
+                    "x": round(origin[0], 2),
+                    "origin": origin,
+                    "span_baseline_y": round(origin[1], 2),
+                    "bbox": sp.get("bbox", lb),
+                    "text": txt,
+                    "font": sp.get("font", ""),
+                    "size": sp.get("size", 0.0),
+                    "color": color_int,
+                    "color_rgb": color_rgb,
+                    "flags": sp.get("flags", 0),
+                })
+
+            if not line_spans:
+                continue
+
+            max_size = max(s["size"] for s in line_spans)
+            body_baselines = [s["span_baseline_y"] for s in line_spans if abs(s["size"] - max_size) < 0.5]
+            line_baseline_y = max(body_baselines) if body_baselines else line_spans[0]["span_baseline_y"]
+
+            for s in line_spans:
+                s["line_baseline_y"] = line_baseline_y
+                s["rise"] = round(line_baseline_y - s["span_baseline_y"], 2)
+                runs.append(s)
+
+    runs.sort(key=lambda r: (r["line_y"], r["x"]))
+    return runs
+
+
+def _build_styled_chars(runs: list, orig_text: str, new_text: str, default_fontsize: float = 11.0, default_color=(0, 0, 0)) -> list:
+    """Map each character index in new_text to a run style dictionary."""
+    if isinstance(default_color, (int, float)):
+        c_int = int(default_color)
+        default_rgb = (
+            ((c_int >> 16) & 255) / 255.0,
+            ((c_int >> 8) & 255) / 255.0,
+            (c_int & 255) / 255.0
+        )
+    elif isinstance(default_color, (list, tuple)) and len(default_color) == 3:
+        default_rgb = tuple(default_color)
+    else:
+        default_rgb = (0.0, 0.0, 0.0)
+
+    default_style = {
+        "font": "helv",
+        "size": default_fontsize,
+        "color_rgb": default_rgb,
+        "rise": 0.0,
+        "flags": 0,
+    }
+
+    if not runs:
+        return [default_style] * len(new_text)
+
+    orig_styles = []
+    for r in runs:
+        color_rgb = r.get("color_rgb", default_rgb)
+        style = {
+            "font": r.get("font", ""),
+            "size": r.get("size", default_fontsize),
+            "color_rgb": color_rgb,
+            "rise": r.get("rise", 0.0),
+            "flags": r.get("flags", 0),
+        }
+        for _ in r.get("text", ""):
+            orig_styles.append(style)
+
+    if not orig_styles:
+        return [default_style] * len(new_text)
+
+    import difflib
+    matcher = difflib.SequenceMatcher(None, orig_text, new_text)
+    new_styles = [None] * len(new_text)
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(j2 - j1):
+                new_styles[j1 + k] = orig_styles[i1 + k]
+        elif tag in ("replace", "insert"):
+            fallback_style = orig_styles[i1 - 1] if i1 > 0 else (orig_styles[i1] if i1 < len(orig_styles) else orig_styles[0])
+            for k in range(j2 - j1):
+                new_styles[j1 + k] = fallback_style
+
+    return [s if s is not None else orig_styles[0] for s in new_styles]
+
+
+def _resolve_fitz_font_object(font_name: str, font_buffer_map: dict) -> tuple[fitz.Font, str]:
+    """Resolve a fitz.Font object for font_name using font_buffer_map or universal fallback."""
+    buf = font_buffer_map.get(font_name)
+    if not buf and font_name and "+" in font_name:
+        bare_name = font_name.split("+")[-1]
+        buf = font_buffer_map.get(bare_name)
+
+    if buf:
+        try:
+            return fitz.Font(fontbuffer=buf), font_name
+        except Exception as e:
+            logger.debug(f"fitz.Font(fontbuffer) failed for '{font_name}': {e}")
+
+    fb_name, fb_buf = get_universal_fallback_font(font_name)
+    if fb_buf:
+        try:
+            return fitz.Font(fontbuffer=fb_buf), fb_name
+        except Exception:
+            pass
+    try:
+        return fitz.Font(fontname=fb_name), fb_name
+    except Exception:
+        return fitz.Font(fontname="helv"), "helv"
+
+
 
 def _measure_span_width(
     page: fitz.Page,
@@ -428,7 +571,7 @@ def get_universal_fallback_font(fontname: str = "") -> tuple[str, Optional[bytes
                 buf = pymupdf_fonts.myfont(code)
                 if buf:
                     import logging as _log
-                    _log.getLogger(__name__).info(
+                    _log.getLogger(__name__).debug(
                         f"Universal fallback font resolved: pymupdf_fonts '{code}' "
                         f"({len(buf):,} bytes)"
                     )
@@ -468,6 +611,18 @@ def _get_fallback_font_name(fontname) -> str:
     return name
 
 
+def _check_font_buf_missing_glyphs(font_buf: Optional[bytes], text: str) -> list:
+    """Check if font_buf is missing glyphs for any characters in text."""
+    if not font_buf:
+        return []
+    try:
+        f = fitz.Font(fontbuffer=font_buf)
+        return _find_missing_glyphs(f, text)
+    except Exception as e:
+        logger.debug(f"Glyph check failed for font buffer: {e}")
+        return []
+
+
 @router.post("/apply-edits")
 async def apply_edits(
     file:  UploadFile = File(...),
@@ -501,7 +656,8 @@ async def apply_edits(
             orig_text = edit.get("origStr", "")
             new_text = edit.get("newStr", "")
             # Enforce sanitization of HTML non-breaking spaces injected by contenteditable
-            new_text = new_text.replace("\u00A0", " ").replace("&nbsp;", " ")
+            new_text = new_text.replace("\u00A0", " ").replace("&nbsp;", " ").replace("\u00AD", "")
+            orig_text = orig_text.replace("\u00AD", "")
             new_text = _expand_ligatures(new_text)
 
             # ── Coordinates (all in MuPDF space via Util.transform at scale=1) ──
@@ -569,6 +725,53 @@ async def apply_edits(
                 plan["color"] = insert_color
                 if font_result.font_buffer:
                     plan["font_registrations"][font_result.fontname] = font_result.font_buffer
+                # ── Run extraction (multi-font groundwork) — Phase 1, pre-redaction ──
+                runs = _span_runs_in_rect(page, erase_rect)
+                plan["runs"] = runs
+                plan["run_font_names"] = sorted({r["font"] for r in runs if r["font"]})
+
+                plan["super_ranges"] = edit.get("superscriptRanges", []) or []
+                body = max((r["size"] for r in runs), default=fontsize)
+                sup_runs = [r for r in runs if r["size"] < 0.9 * body or r.get("rise", 0) > 1.5]
+
+                if sup_runs:
+                    plan["sup_size"] = sorted(r["size"] for r in sup_runs)[len(sup_runs) // 2]
+                    rises = [r["rise"] for r in sup_runs if r.get("rise", 0) > 0]
+                    body_baseline = runs[0]["line_baseline_y"] if runs else y0 + body * 0.8
+                    plan["sup_rise"] = round(sum(rises) / len(rises), 1) if rises else round(body * 0.45, 1)
+                    sup_colors = [r["color_rgb"] for r in sup_runs if "color_rgb" in r]
+                    from collections import Counter
+                    plan["sup_color"] = Counter(sup_colors).most_common(1)[0][0] if sup_colors else insert_color
+                else:
+                    plan["sup_size"] = round(body * 0.66, 1)
+                    plan["sup_rise"] = round(body * 0.45, 1)
+                    plan["sup_color"] = insert_color
+
+                distinct_line_y = []
+                for r in runs:
+                    ly = r.get("line_baseline_y")
+                    if ly and (not distinct_line_y or abs(ly - distinct_line_y[-1]) > 1.0):
+                        distinct_line_y.append(ly)
+                if len(distinct_line_y) >= 2:
+                    gaps = [distinct_line_y[i + 1] - distinct_line_y[i] for i in range(len(distinct_line_y) - 1)]
+                    derived_leading = round(sum(gaps) / len(gaps), 2)
+                else:
+                    derived_leading = round(1.2 * body, 2)
+                plan["derived_leading"] = derived_leading
+                plan["leading"] = derived_leading
+                plan["align"] = (edit.get("align") or "").lower()
+
+                logger.debug(
+                    f"PARAGRAPH RUNS: page {edit['pageNum']}, {len(runs)} run(s), "
+                    f"fonts={plan['run_font_names']}, leading={derived_leading}pt, "
+                    f"sup_runs={len(sup_runs)}"
+                )
+                for r in runs:
+                    logger.debug(
+                        f"  RUN line_y={r['line_y']:.1f} baseline_y={r['span_baseline_y']:.1f} "
+                        f"x={r['x']:.1f} rise={r['rise']:.1f} "
+                        f"[{r['font']} {r['size']:.1f}pt color={r['color_rgb']}] {r['text'][:30]!r}"
+                    )
                 edit_plans.append(plan)
                 continue
             measured_w, matched_span = _measure_span_width(
@@ -659,7 +862,7 @@ async def apply_edits(
                 plan["font_registrations"][font_result.fontname] = font_result.font_buffer
 
             # ── MINIMAL-DIFF EDITING ─────────────────────────────────────────────
-            rawdict_chars = matched_span.get("chars", []) if matched_span else []
+            rawdict_chars = [c for c in (matched_span.get("chars", []) if matched_span else []) if c.get("c") != "\u00AD"]
             raw_text = "".join(ch.get("c", "") for ch in rawdict_chars)
             used_minimal_diff = False
 
@@ -1313,7 +1516,7 @@ async def apply_edits(
         for plan in edit_plans:
             for rect in plan["erase_rects"]:
                 bg_color = _sample_background_color(page, rect)
-                logger.info(
+                logger.debug(
                     f"REDACT: rect=[{rect.x0:.2f}, {rect.y0:.2f}, "
                     f"{rect.x1:.2f}, {rect.y1:.2f}] bg={bg_color}"
                 )
@@ -1321,7 +1524,7 @@ async def apply_edits(
                 try:
                     text_in_rect = page.get_text("text", clip=rect).strip()
                     if text_in_rect:
-                        logger.info(f"  ERASING TEXT: {text_in_rect[:200]!r}")
+                        logger.debug(f"  ERASING TEXT: {text_in_rect[:200]!r}")
                 except Exception:
                     pass
                 page.add_redact_annot(rect, fill=bg_color)
@@ -1338,36 +1541,51 @@ async def apply_edits(
         # ── Phase 2.5: Re-register fonts after redaction ──
         # apply_redactions() strips font resources from the page, so any
         # previously registered embedded fonts become unavailable.
-        # Re-register every unique font we plan to use and track its buffer.
+        # Re-register every unique font and track both the buffer and the
+        # registered alias name that PyMuPDF assigned.
         registered_fonts = set()
-        font_tag_map = {}
-        font_buffer_map = {}
+        font_tag_map    = {}   # original_name -> registered alias (string returned by insert_font)
+        font_buffer_map = {}   # original_name -> raw bytes (kept for re-injection in Phase 3)
 
         for plan in edit_plans:
             for fontname, font_buffer in list(plan["font_registrations"].items()):
                 if fontname not in registered_fonts:
                     try:
-                        font_key = page.insert_font(fontname=fontname, fontbuffer=font_buffer)
-                        font_tag_map[fontname] = fontname
-                        if font_buffer:
-                            font_buffer_map[fontname] = font_buffer
-                            font_buffer_map[str(font_key)] = font_buffer
+                        # insert_font returns the xref integer; the usable alias
+                        # is the fontname we passed (PyMuPDF registers it under
+                        # that name when fontbuffer is provided).
+                        page.insert_font(fontname=fontname, fontbuffer=font_buffer)
+                        font_tag_map[fontname]    = fontname  # alias == name we gave
+                        font_buffer_map[fontname] = font_buffer
                         registered_fonts.add(fontname)
-                        logger.info(f"Registered font '{fontname}' -> tag '{font_key}'")
+                        logger.debug(f"Phase 2.5: registered '{fontname}' with buffer ({len(font_buffer or b'')} bytes)")
                     except Exception as e:
-                        fallback = _get_fallback_font_name(fontname)
-                        font_tag_map[fontname] = fallback
-                        if font_buffer:
-                            font_buffer_map[fontname] = font_buffer
+                        logger.warning(f"Phase 2.5: insert_font failed for '{fontname}': {e}")
+                        fallback_name, fallback_buf = get_universal_fallback_font(fontname)
+                        font_tag_map[fontname]    = fallback_name
+                        font_buffer_map[fontname] = fallback_buf
                         registered_fonts.add(fontname)
+                        if fallback_buf:
+                            try:
+                                page.insert_font(fontname=fallback_name, fontbuffer=fallback_buf)
+                                logger.debug(f"Phase 2.5: registered fallback '{fallback_name}' ({len(fallback_buf)} bytes)")
+                            except Exception as e2:
+                                logger.warning(f"Phase 2.5: fallback insert_font failed: {e2}")
 
-        # Map registered font tags into edit plans and ops
+        # Map registered aliases into edit plans and ops
         for plan in edit_plans:
-            if plan.get("fontname") in font_tag_map:
-                plan["fontname"] = font_tag_map[plan["fontname"]]
+            orig = plan.get("fontname")
+            if orig in font_tag_map:
+                plan["fontname"] = font_tag_map[orig]
+                # keep buffer accessible under both old and new key
+                if orig in font_buffer_map and plan["fontname"] not in font_buffer_map:
+                    font_buffer_map[plan["fontname"]] = font_buffer_map[orig]
             for op in plan.get("insert_chars", []):
-                if op.get("fontname") in font_tag_map:
-                    op["fontname"] = font_tag_map[op["fontname"]]
+                orig_op = op.get("fontname")
+                if orig_op in font_tag_map:
+                    op["fontname"] = font_tag_map[orig_op]
+                    if orig_op in font_buffer_map and op["fontname"] not in font_buffer_map:
+                        font_buffer_map[op["fontname"]] = font_buffer_map[orig_op]
 
         # ── Phase 3: Insert all new text ──
         for plan in edit_plans:
@@ -1377,62 +1595,395 @@ async def apply_edits(
                     paragraph_text = "\n".join(lines)
                 else:
                     paragraph_text = plan.get("paragraph_text", plan.get("new_text", ""))
-                logger.info(
-                    f"EXECUTING PARAGRAPH INSERT: text='{paragraph_text[:40]}...', "
-                    f"fontsize={plan['fontsize']:.1f}"
-                )
+
+                super_ranges = plan.get("super_ranges", [])
+                runs = plan.get("runs", [])
+                body = max((r["size"] for r in runs), default=plan["fontsize"])
+
+                # Resolve super ranges (either from edit payload or derived from extracted sup runs)
+                # Frontend sends charStart/charEnd (not start/end); also carry fontSize + color.
+                resolved_super_ranges = []  # list of (charStart, charEnd, color_rgb, fontSize_or_None)
+                if super_ranges:
+                    for r in super_ranges:
+                        if isinstance(r, dict):
+                            c_val = r.get("color")
+                            c_rgb = None
+                            if isinstance(c_val, (int, float)):
+                                c_int = int(c_val)
+                                c_rgb = (
+                                    ((c_int >> 16) & 255) / 255.0,
+                                    ((c_int >> 8) & 255) / 255.0,
+                                    (c_int & 255) / 255.0
+                                )
+                            elif isinstance(c_val, str) and c_val.startswith("#") and len(c_val) == 7:
+                                try:
+                                    c_rgb = (
+                                        int(c_val[1:3], 16) / 255.0,
+                                        int(c_val[3:5], 16) / 255.0,
+                                        int(c_val[5:7], 16) / 255.0,
+                                    )
+                                except Exception:
+                                    pass
+                            elif isinstance(c_val, str) and c_val.startswith("rgb"):
+                                import re as _re
+                                m = _re.match(r"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", c_val)
+                                if m:
+                                    c_rgb = (int(m.group(1))/255, int(m.group(2))/255, int(m.group(3))/255)
+                            elif isinstance(c_val, (list, tuple)) and len(c_val) == 3:
+                                c_rgb = tuple(c_val)
+                            # ── KEY FIX: frontend uses charStart/charEnd, not start/end ──
+                            cs = r.get("charStart", r.get("start", 0))
+                            ce = r.get("charEnd", r.get("end", 0))
+                            fs = r.get("fontSize") or r.get("fontSize")  # explicit from frontend
+                            resolved_super_ranges.append((cs, ce, c_rgb, fs))
+                        elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                            resolved_super_ranges.append((r[0], r[1], None, None))
+                else:
+                    sup_runs = [r for r in runs if r.get("size", body) < 0.9 * body or r.get("rise", 0) > 1.5]
+                    if sup_runs:
+                        for r in sup_runs:
+                            txt = r.get("text", "").strip()
+                            if not txt:
+                                continue
+                            idx = 0
+                            while True:
+                                pos = paragraph_text.find(txt, idx)
+                                if pos == -1:
+                                    break
+                                resolved_super_ranges.append((pos, pos + len(txt), r.get("color_rgb"), r.get("size")))
+                                idx = pos + len(txt)
+
+                if resolved_super_ranges:
+                    # ── Run-Faithful Superscript Paragraph Emission ──
+                    # Uses original run baselines for the first N lines (position-exact),
+                    # then continues with derived leading. Left/right anchors come from the
+                    # extracted runs — NOT from the (padded) erase rect.
+                    logger.debug(
+                        f"EXECUTING SUPERSCRIPT-AWARE PARAGRAPH INSERT: page {edit['pageNum']}, "
+                        f"text='{paragraph_text[:40]}...', super_ranges={len(resolved_super_ranges)}"
+                    )
+
+                    # ── Geometry from original runs ──────────────────────────────────
+                    # Build ordered list of original baselines, one per distinct line_y.
+                    orig_baselines = []
+                    seen_ly = set()
+                    for r in runs:
+                        ly = round(r.get("line_y", 0), 1)
+                        if ly not in seen_ly:
+                            seen_ly.add(ly)
+                            orig_baselines.append(r["line_baseline_y"])
+
+                    if runs:
+                        left = min(r["x"] for r in runs)
+                        # right_target: use the max x1 of any run bbox
+                        right = max(r["bbox"][2] if "bbox" in r else r["x"] for r in runs)
+                    else:
+                        rect = plan["paragraph_rect"]
+                        left = rect.x0
+                        right = rect.x1
+
+                    leading = plan.get("leading", body * 1.2)
+                    sup_rise = plan.get("sup_rise", body * 0.45)
+
+                    font_obj, font_name_actual = _resolve_fitz_font_object(plan["fontname"], font_buffer_map)
+
+                    buf = font_buffer_map.get(plan["fontname"]) or font_buffer_map.get(plan["fontname"].split("+")[-1])
+                    if buf:
+                        try:
+                            page.insert_font(fontname=plan["fontname"], fontbuffer=buf)
+                        except Exception:
+                            pass
+
+                    # ── Glyph coverage guard: subset fonts may lack newly typed chars.
+                    #    insert_text() silently DROPS them; canvas masked them via CSS fallback.
+                    missing_chars = set()
+                    try:
+                        missing_chars = set(_find_missing_glyphs(font_obj, paragraph_text))
+                    except Exception:
+                        missing_chars = set()
+
+                    fb_name, fb_font = None, None
+                    if missing_chars:
+                        logger.warning(
+                            f"RUN-SEG: '{font_name_actual}' lacks glyphs {sorted(missing_chars)} "
+                            f"— registering universal fallback for those chars"
+                        )
+                        fb_name, fb_buf = get_universal_fallback_font(plan["fontname"])
+                        if fb_buf:
+                            try:
+                                page.insert_font(fontname=fb_name, fontbuffer=fb_buf)
+                                font_buffer_map[fb_name] = fb_buf
+                                fb_font = fitz.Font(fontbuffer=fb_buf)
+                            except Exception as e:
+                                logger.warning(f"RUN-SEG: fallback registration failed: {e}")
+                                fb_name, fb_font = None, None
+
+                    # ── Token stream: split on word/space boundaries, THEN split each
+                    #    word at super/sub range boundaries so a glued citation like
+                    #    "reviews.15" becomes ["reviews." (normal), "15" (sup)] instead
+                    #    of one whole-word sup token.
+                    import re
+                    tokens = []
+                    for match in re.finditer(r'\S+|\s+', paragraph_text):
+                        t_text = match.group(0)
+                        t_start = match.start()
+                        t_end = match.end()
+                        if t_text.isspace():
+                            tokens.append({
+                                "text": t_text, "start": t_start,
+                                "is_space": True, "is_sup": False,
+                                "color": plan["color"], "size": body,
+                                "break_ok": True,
+                            })
+                            continue
+                        # Word token: cut at every super-range boundary inside it
+                        cuts = set()
+                        for r_start, r_end, _c, _f in resolved_super_ranges:
+                            if t_start < r_start < t_end: cuts.add(r_start)
+                            if t_start < r_end < t_end: cuts.add(r_end)
+                        bounds = [t_start] + sorted(cuts) + [t_end]
+                        first_frag = True
+                        for a, b in zip(bounds[:-1], bounds[1:]):
+                            frag = paragraph_text[a:b]
+                            if not frag:
+                                continue
+                            is_sup = False
+                            tok_color = plan["color"]
+                            tok_size = body
+                            for r_start, r_end, r_col, r_fs in resolved_super_ranges:
+                                if not (b <= r_start or a >= r_end):  # fragment fully homogeneous
+                                    is_sup = True
+                                    tok_size = r_fs if r_fs and r_fs > 0 else plan.get("sup_size", body * 0.66)
+                                    tok_color = r_col if r_col else plan.get("sup_color", plan["color"])
+                                    break
+                            tokens.append({
+                                "text": frag, "start": a,
+                                "is_space": False, "is_sup": is_sup,
+                                "color": tok_color, "size": tok_size,
+                                # never allow a line break between a word and its glued citation
+                                "break_ok": first_frag,
+                            })
+                            first_frag = False
+
+                    # ── Greedy word-wrap + original-baseline anchoring ────────────────
+                    space_w = font_obj.text_length(" ", fontsize=body)
+                    line_idx = 0
+                    x = left
+                    baseline = orig_baselines[0] if orig_baselines else (left + body * 0.8)
+
+                    def _baseline_for_line(li: int) -> float:
+                        if li < len(orig_baselines):
+                            return orig_baselines[li]
+                        first = orig_baselines[0] if orig_baselines else baseline
+                        return first + li * leading
+
+                    def _unit_width(idx: int) -> float:
+                        """Width of token idx plus any glued fragments after it
+                        (break_ok=False), so 'reviews.' + '15' wrap as one unit."""
+                        total = 0.0
+                        j = idx
+                        while j < len(tokens):
+                            t = tokens[j]
+                            total += font_obj.text_length(t["text"], fontsize=t["size"])
+                            j += 1
+                            if j < len(tokens) and (tokens[j]["is_space"] or tokens[j]["break_ok"]):
+                                break
+                        return total
+
+                    def _emit_token(token, x_pos, y_pos):
+                        """Emit one text fragment; switches to fallback font char-by-char
+                        only for glyphs missing from the embedded subset.
+                        Returns the new x cursor position."""
+                        if not fb_name or not any(ch in missing_chars for ch in token["text"]):
+                            page.insert_text(
+                                fitz.Point(x_pos, y_pos), token["text"],
+                                fontname=font_name_actual, fontsize=token["size"], color=token["color"],
+                            )
+                            return x_pos + font_obj.text_length(token["text"], fontsize=token["size"])
+                        cx = x_pos
+                        for ch in token["text"]:
+                            if ch in missing_chars and fb_font is not None:
+                                page.insert_text(fitz.Point(cx, y_pos), ch,
+                                                 fontname=fb_name, fontsize=token["size"], color=token["color"])
+                                cx += fb_font.text_length(ch, fontsize=token["size"])
+                            else:
+                                page.insert_text(fitz.Point(cx, y_pos), ch,
+                                                 fontname=font_name_actual, fontsize=token["size"], color=token["color"])
+                                cx += font_obj.text_length(ch, fontsize=token["size"])
+                        return cx
+
+                    # ── Justification detection (───────────────────────────────────
+                    def _detect_justify():
+                        a = plan.get("align", "")
+                        if a:
+                            return a == "justify"
+                        groups = {}
+                        for rr in runs:
+                            groups.setdefault(round(rr.get("line_y", 0), 1), []).append(rr)
+                        ys = sorted(groups)
+                        if len(ys) < 2:
+                            return False
+                        full = sum(1 for y in ys[:-1]
+                                   if right - max(rr["bbox"][2] for rr in groups[y]) <= 2.0)
+                        return (full / (len(ys) - 1)) >= 0.7
+
+                    is_justify = _detect_justify()
+
+                    def _space_advances(token, extra):
+                        """Per-whitespace-char advance; hyphen-continuation newlines stay glued."""
+                        adv = []
+                        for k, ch in enumerate(token["text"]):
+                            prev = paragraph_text[token["start"] + k - 1] if token["start"] + k - 1 >= 0 else ""
+                            if ch == "\n" and prev in ("-", "\u00AD"):
+                                adv.append(0.0)
+                            else:
+                                adv.append(space_w + extra)
+                        return adv
+
+                    # ── Pass 1: wrap tokens into output lines ─────────────────────────
+                    out_lines = []
+                    cur, cur_w = [], 0.0
+                    for i, token in enumerate(tokens):
+                        tw = font_obj.text_length(token["text"], fontsize=token["size"])
+                        if (not token["is_space"] and token["break_ok"]
+                                and cur_w + _unit_width(i) > right - left
+                                and any(not t["is_space"] for t in cur)):
+                            while cur and cur[-1]["is_space"]:
+                                cur.pop()
+                            out_lines.append(cur)
+                            cur, cur_w = [], 0.0
+                        cur.append(token)
+                        cur_w += tw
+                    while cur and cur[-1]["is_space"]:
+                        cur.pop()
+                    if cur:
+                        out_lines.append(cur)
+
+                    # ── Pass 2: justify non-last lines, then emit ─────────────────────
+                    for li, line_tokens in enumerate(out_lines):
+                        baseline = _baseline_for_line(li)
+                        extra_per_space = 0.0
+                        if is_justify and li < len(out_lines) - 1:
+                            advances = [a for t in line_tokens if t["is_space"]
+                                        for a in _space_advances(t, 0.0)]
+                            n_sp = sum(1 for a in advances if a > 0)
+                            nat_w = (sum(font_obj.text_length(t["text"], fontsize=t["size"])
+                                        for t in line_tokens) + sum(advances))
+                            deficit = (right - left) - nat_w
+                            if n_sp > 0 and 0 < deficit < (right - left) * 0.5:
+                                extra_per_space = deficit / n_sp
+                        x = left
+                        for t in line_tokens:
+                            if t["is_space"]:
+                                x += sum(_space_advances(t, extra_per_space))
+                                continue
+                            y_pos = baseline - (sup_rise if t["is_sup"] else 0)
+                            start_x = x
+                            x = _emit_token(t, x, y_pos)
+                            if t["is_sup"]:
+                                logger.debug(
+                                    f"RUN-SEG INSERT sup '{t['text']}' at ({start_x:.1f}, {y_pos:.1f}) "
+                                    f"size={t['size']:.1f} color={t['color']}"
+                                )
+
+                    logger.info(f"PARAGRAPH RUN-SEG INSERT SUCCESS: page {edit['pageNum']}")
+                    continue
+
+                # ── Flat insert_textbox path when no superscripts present ──
                 font_name_arg = plan.get("fontname", "helv")
                 if not isinstance(font_name_arg, str):
                     font_name_arg = str(font_name_arg) if font_name_arg is not None else "helv"
-                font_buf_arg = font_buffer_map.get(font_name_arg) or plan.get("font_registrations", {}).get(font_name_arg)
 
-                tb_kwargs = {
-                    "fontname": font_name_arg,
-                    "fontsize": plan["fontsize"],
-                    "color": plan["color"],
-                    "align": fitz.TEXT_ALIGN_JUSTIFY,
-                }
-                if font_buf_arg:
-                    tb_kwargs["fontbuffer"] = font_buf_arg
+                font_buf_arg = (
+                    font_buffer_map.get(font_name_arg)
+                    or plan.get("font_registrations", {}).get(font_name_arg)
+                )
 
-                try:
-                    page.insert_textbox(
-                        plan["paragraph_rect"],
-                        paragraph_text,
-                        **tb_kwargs
-                    )
-                except Exception as e:
-                    fallback_font = _get_fallback_font_name(font_name_arg)
+                fallback_name, fallback_buf = get_universal_fallback_font(font_name_arg)
+                primary_missing = _check_font_buf_missing_glyphs(font_buf_arg, paragraph_text)
+
+                attempts = []
+                if primary_missing:
                     logger.warning(
-                        f"insert_textbox failed for font '{font_name_arg}' ({e}). "
-                        f"Retrying with fallback font '{fallback_font}'."
+                        f"Primary font subset '{font_name_arg}' is missing {len(primary_missing)} "
+                        f"glyph(s) for paragraph text. Prioritizing universal fallback '{fallback_name}'."
                     )
-                    try:
-                        page.insert_textbox(
-                            plan["paragraph_rect"],
-                            paragraph_text,
-                            fontname=fallback_font,
-                            fontsize=plan["fontsize"],
-                            color=plan["color"],
-                            align=fitz.TEXT_ALIGN_JUSTIFY,
-                        )
-                    except Exception as e2:
-                        logger.error(
-                            f"insert_textbox retry with '{fallback_font}' failed ({e2}). "
-                            f"Retrying with 'helv'."
-                        )
-                        if fallback_font != "helv":
-                            try:
-                                page.insert_textbox(
-                                    plan["paragraph_rect"],
-                                    paragraph_text,
-                                    fontname="helv",
-                                    fontsize=plan["fontsize"],
-                                    color=plan["color"],
-                                    align=fitz.TEXT_ALIGN_JUSTIFY,
+                    attempts.append((fallback_name, fallback_buf))
+                    attempts.append((font_name_arg, font_buf_arg))
+                else:
+                    attempts.append((font_name_arg, font_buf_arg))
+                    if fallback_name != font_name_arg:
+                        attempts.append((fallback_name, fallback_buf))
+
+                if not any(a[0] == "helv" for a in attempts):
+                    attempts.append(("helv", None))
+
+                base_fontsize = plan["fontsize"]
+                fontsize_candidates = [
+                    base_fontsize,
+                    base_fontsize * 0.95,
+                    base_fontsize * 0.90,
+                    base_fontsize * 0.85,
+                    base_fontsize * 0.80,
+                ]
+
+                insert_success = False
+                seen_font_names = set()
+
+                for name, buf in attempts:
+                    if not name or name in seen_font_names:
+                        continue
+                    seen_font_names.add(name)
+
+                    if buf is not None:
+                        try:
+                            page.insert_font(fontname=name, fontbuffer=buf)
+                        except Exception as e_font:
+                            logger.warning(f"page.insert_font('{name}') failed: {e_font}")
+
+                    for try_size in fontsize_candidates:
+                        try:
+                            rc = page.insert_textbox(
+                                plan["paragraph_rect"],
+                                paragraph_text,
+                                fontname=name,
+                                fontsize=try_size,
+                                color=plan["color"],
+                                align=fitz.TEXT_ALIGN_JUSTIFY,
+                            )
+                            if rc >= 0:
+                                logger.info(
+                                    f"PARAGRAPH INSERT OK: page {edit['pageNum']}, "
+                                    f"font='{name}', fontsize={try_size:.1f}pt "
+                                    f"(orig={base_fontsize:.1f}pt), remaining_height={rc:.2f}"
                                 )
-                            except Exception as e3:
-                                logger.error(f"insert_textbox final retry with 'helv' failed: {e3}")
+                                insert_success = True
+                                break
+                            else:
+                                logger.warning(
+                                    f"insert_textbox font='{name}' at {try_size:.1f}pt "
+                                    f"overflowed (rc={rc:.2f})"
+                                )
+                        except Exception as e_tb:
+                            logger.warning(
+                                f"insert_textbox font='{name}' at {try_size:.1f}pt failed: {e_tb}"
+                            )
+
+                    if insert_success:
+                        break
+
+                if not insert_success:
+                    logger.error(
+                        f"CRITICAL: All paragraph insert attempts failed on page {edit['pageNum']}! "
+                        f"rect={plan['paragraph_rect']}, text='{paragraph_text[:60]}...'"
+                    )
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Paragraph text insert failed on page {edit['pageNum']}. "
+                            "Text overflowed available bounding box or font rendering failed."
+                        ),
+                    )
                 continue
 
             ops = plan["insert_chars"]

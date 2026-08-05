@@ -9,7 +9,13 @@
 
 1. [High-Level Overview](#1-high-level-overview)
 2. [Repository Layout](#2-repository-layout)
-3. [Backend — `backend/pdf_routes/editor.py`](#3-backend--backendpdf_routeseditorpy)
+3. [Backend Architecture](#3-backend-architecture)
+   - [3.1 API Routes](#31-api-routes)
+   - [3.2 Typography Engine Pipeline (`editor.py`)](#32-typography-engine-pipeline-editorpy)
+   - [3.3 Region Extraction Engine (3-Tier System)](#33-region-extraction-engine-3-tier-system)
+   - [3.4 Column Detection](#34-column-detection)
+   - [3.5 Font Extraction & CFF->OTF Wrapping (`font_utils.py`)](#35-font-extraction--cff-otf-wrapping-font_utilspy)
+   - [3.6 Edit & Bake Engine (`pdf_edit.py`)](#36-edit--bake-engine-pdf_editpy)
 4. [Frontend State Layer — Stores](#4-frontend-state-layer--stores)
 5. [Frontend — `Viewer.jsx`](#5-frontend--viewerjsx)
 6. [Frontend — `CanvasInlineEditor.jsx`](#6-frontend--canvasinlineeditorjsx)
@@ -24,13 +30,13 @@
 
 ## 1. High-Level Overview
 
-The PDF Editor is a WYSIWYG in-place editor that lets a user click on any paragraph in a PDF and type to change it. It works through a tight loop between a Python/FastAPI backend (which understands the raw PDF geometry) and a React frontend (which renders the visual editing interface on top of the PDF.js canvas).
+The PDF Editor is a WYSIWYG in-place editor that lets a user click on any paragraph in a PDF and type to change it. It works through a tight loop between a Python/FastAPI backend (which understands raw PDF geometry, font metrics, and redaction) and a React frontend (which renders the visual editing interface on top of the PDF.js canvas).
 
 ```
 User uploads PDF
       │
       ▼
-Backend /extract-spacing  ──────►  Typography Engine (PyMuPDF)
+Backend /api/pdf/extract-spacing  ──►  Typography Engine (PyMuPDF)
       │                                     │
       │                            3-tier region extraction
       │                            (rect-bound → gap-clustered → per-line)
@@ -44,12 +50,13 @@ Viewer.jsx  ──►  builds paragraphItems (PDF-space boxes)
       ▼
 CanvasInlineEditor.jsx  ──►  HTML5 Canvas draws each box
       │                       Offscreen textarea captures keystrokes
+      │                       charMetaRef holds authoritative attribute model
       │
       ▼
 User edits text  ──►  pdfEditStore (undo/redo store)
       │
       ▼
-"Bake" button  ──►  Backend /bake  ──►  PyMuPDF redacts + reinserts text
+"Bake" button  ──►  Backend /api/pdf/apply-edits  ──►  PyMuPDF redacts + reinserts text
       │
       ▼
 New PDF bytes streamed back  ──►  Viewer re-renders with new PDF
@@ -62,54 +69,56 @@ New PDF bytes streamed back  ──►  Viewer re-renders with new PDF
 ```
 Writing_Tools_Production/
 ├── backend/
-│   ├── main.py                        # FastAPI app entry point, mounts all routers
+│   ├── main.py                        # FastAPI app entry point, mounts all routers (69 lines)
 │   ├── pdf_routes/
-│   │   └── editor.py                  # THE PDF editing engine (999 lines)
+│   │   └── editor.py                  # Typography engine, layout extraction & font API (1167 lines)
 │   └── converter/
-│       └── font_utils.py              # CFF→OTF wrapping, cmap injection, stem-vw extraction
+│       ├── pdf_edit.py                # Core PDF redaction, paragraph bake & edit engine (2291 lines)
+│       └── font_utils.py              # CFF→OTF wrapping, OTF name table fix, stem-vw extraction (1373 lines)
 │
 └── frontend/src/
-    ├── App.jsx                        # Root shell, navigation, persistent view mounting
+    ├── App.jsx                        # Root shell, navigation, persistent view mounting (203 lines)
     ├── pages/
-    │   └── PDFEditorPage.jsx          # Top-level page: file upload, bake orchestration
+    │   └── PDFEditorPage.jsx          # Top-level page: file upload, bake orchestration (452 lines)
     ├── components/PDFEditor/
-    │   ├── Viewer.jsx                 # PDF.js renderer + paragraph item builder (1548 lines)
-    │   ├── CanvasInlineEditor.jsx     # Per-paragraph Canvas editor (1989 lines)
-    │   ├── InlineEditor.jsx           # Legacy contentEditable editor (727 lines)
-    │   ├── RightPanel.jsx             # Tool settings sidebar
-    │   ├── Toolbar.jsx                # Left toolbar (tool picker)
-    │   ├── DebugOverlay.jsx           # Ctrl+Shift+D debug bbox overlay
-    │   ├── TextOverlay.jsx            # Thin shim for annotation placement
-    │   ├── DraggableItem.jsx          # Drag-and-drop wrapper for annotations
-    │   └── superscriptUtils.js        # Unicode super/sub char maps (shared, non-JSX)
+    │   ├── Viewer.jsx                 # PDF.js renderer + paragraph item builder (1582 lines)
+    │   ├── CanvasInlineEditor.jsx     # Per-paragraph Canvas editor with charMetaRef model (2098 lines)
+    │   ├── InlineEditor.jsx           # Legacy contentEditable editor (726 lines)
+    │   ├── RightPanel.jsx             # Tool settings sidebar (346 lines)
+    │   ├── Toolbar.jsx                # Left toolbar (tool picker) (115 lines)
+    │   ├── DebugOverlay.jsx           # Ctrl+Shift+D debug bbox overlay (87 lines)
+    │   ├── TextOverlay.jsx            # Thin shim for annotation placement (108 lines)
+    │   ├── DraggableItem.jsx          # Drag-and-drop wrapper for annotations (111 lines)
+    │   └── superscriptUtils.js        # Unicode super/sub char maps (shared, non-JSX) (36 lines)
     ├── stores/
-    │   ├── pdfEditStore.js            # Observable edit store (undo/redo)
-    │   └── pdfTypographyStore.js      # Observable typography/paragraph store
+    │   ├── pdfEditStore.js            # Observable edit store (undo/redo) (128 lines)
+    │   └── pdfTypographyStore.js      # Observable typography/paragraph store (229 lines)
     └── utils/
-        ├── pdfCoords.js               # pdfToScreen() coordinate transform helper
-        └── pdfFontLoader.js           # @font-face injection + stem-vw cache
+        ├── pdfCoords.js               # pdfToScreen() coordinate transform helper (19 lines)
+        └── pdfFontLoader.js           # @font-face injection + stem-vw cache (89 lines)
 ```
 
 ---
 
-## 3. Backend — `backend/pdf_routes/editor.py`
+## 3. Backend Architecture
 
-This is the core of the system. All PDF geometry extraction, region grouping, font extraction, and text baking happen here via **PyMuPDF** (`fitz`).
+Backend routes are mounted under `/api/pdf` via FastAPI (`backend/main.py`). The backend logic is split cleanly between layout extraction (`pdf_routes/editor.py`), font synthesis (`converter/font_utils.py`), and the PDF modification/bake engine (`converter/pdf_edit.py`).
 
 ### 3.1 API Routes
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/pdf/extract-spacing` | **Main entry point.** Sends full typography payload (blocks, columns, inline images) for every page. Also caches in `TYPOGRAPHY_CACHE`. |
-| `POST` | `/pdf/extract-typography` | Identical to extract-spacing but returns a wrapped `{doc_id, pages, total_paragraphs}` object. |
-| `GET`  | `/pdf/typography/{doc_id}` | Retrieves a previously cached typography payload by its SHA-256 doc_id. |
-| `POST` | `/pdf/extract-fonts` | Extracts all embedded fonts from the PDF as base64-encoded OTF/TTF blobs for `@font-face` injection. |
-| `POST` | `/pdf/detect_font` | Hit-test a raw (x, y) coordinate — returns font name, size, and text of the nearest span. |
-| `POST` | `/pdf/run_ocr` | Runs OCRmyPDF on a scanned PDF to add a text layer, returns selectable PDF. |
-| `POST` | `/pdf/encrypt` | Encrypts a PDF with a password using pypdf. |
-| `POST` | `/pdf/bake` | Receives edit instructions, uses PyMuPDF redact+insert to produce a modified PDF. |
+| Method | Route Path | Defined In | Purpose |
+|--------|------------|------------|---------|
+| `POST` | `/api/pdf/extract-spacing` | `editor.py` | **Main entry point.** Sends full typography payload (blocks, columns, inline images) for every page. Also caches in `TYPOGRAPHY_CACHE`. |
+| `POST` | `/api/pdf/extract-typography` | `editor.py` | Identical to extract-spacing but returns a wrapped `{doc_id, pages, total_paragraphs}` object. |
+| `GET`  | `/api/pdf/typography/{doc_id}` | `editor.py` | Retrieves a previously cached typography payload by its SHA-256 doc_id. |
+| `POST` | `/api/pdf/extract-fonts` | `editor.py` | Extracts all embedded fonts from the PDF as base64-encoded OTF/TTF blobs for `@font-face` injection. |
+| `POST` | `/api/pdf/detect_font` | `editor.py` | Hit-test a raw (x, y) coordinate — returns font name, size, and text of the nearest span. |
+| `POST` | `/api/pdf/run_ocr` | `editor.py` | Runs OCRmyPDF on a scanned PDF to add a text layer, returns selectable PDF. |
+| `POST` | `/api/pdf/encrypt` | `editor.py` | Encrypts a PDF with a password using pypdf. |
+| `POST` | `/api/pdf/apply-edits` | `pdf_edit.py` | **Primary bake route.** Receives text/paragraph edit payloads, redacts original rects, and re-inserts styled text. |
+| `POST` | `/api/pdf/bake-annotations` | `pdf_edit.py` | Bakes freehand drawings, highlights, shapes, and images directly into the PDF streams. |
 
-### 3.2 Typography Engine Pipeline
+### 3.2 Typography Engine Pipeline (`editor.py`)
 
 **Entry function:** `get_pdf_spacing_payload(pdf_bytes, doc_id)`
 
@@ -152,7 +161,7 @@ Called by both `/extract-spacing` and `/extract-typography`. For every page:
 }
 ```
 
-### 3.3 Region Extraction (3-Tier System)
+### 3.3 Region Extraction Engine (3-Tier System)
 
 **Function:** `extract_page_spacing_data(page, page_idx, page_images, page_drawings, pdf_bytes)`
 
@@ -211,27 +220,34 @@ After sorting regions by `(column_index, y0, x0)`, for each region the function:
 5. Find the two most popular buckets
 6. **Two-column test:** both clusters ≥15% of lines AND ≥50pt apart
 7. If two-column: find actual gap between columns → `split_x = midpoint`
-8. Return `[[text_x_min, split_x], [split_x, text_x_max]]` or `[[text_x_min, text_x_max]]`
+8. Return `[[text_x_min, split_x], [split_x, text_x_max]]` or `[[text_x_max]]`
 
-### 3.5 Font Extraction Route
+### 3.5 Font Extraction & CFF->OTF Wrapping (`font_utils.py`)
 
-**Route:** `POST /pdf/extract-fonts`
+**Route:** `POST /api/pdf/extract-fonts`
 
 For every embedded font xref:
 1. Extracts raw font bytes via `doc.extract_font(xref)`
-2. CFF format: wraps in OTF container via `wrap_cff_in_otf()` (browsers can't load bare `.cff` files via `@font-face`)
-3. Injects a valid `cmap` subtable via `_inject_cmap()` so the browser can map Unicode → glyph IDs
-4. Skips Type1, Type3, and other browser-incompatible formats
+2. CFF format: wraps in OTF container via `wrap_cff_in_otf(cff_bytes, basefont_name)` (browsers can't load bare `.cff` files via `@font-face`)
+3. **OTF Name Table Fix:** Populates OTF `name` table with nameID 1 (family), nameID 2 (subfamily: Regular/Bold/Italic), nameID 3 (unique ID), nameID 4 (Full Name: verbatim `basefont_name`), and nameID 6 (PostScript name: verbatim `basefont_name`). This guarantees `fitz.Font(fontbuffer=...).name` matches `basefont_name` during backend font registration.
+4. Injects a valid `cmap` subtable via `_inject_cmap()` so the browser can map Unicode → glyph IDs
 5. Extracts **StdVW stem-width ratio** for canvas stem darkening compensation
 6. Returns `{ basename: { data, format, postscript_name, subset_tag, stem_vw_ratio } }`
 
-### 3.6 Bake Route
+### 3.6 Edit & Bake Engine (`pdf_edit.py`)
 
-Receives a list of edit instructions. For each edit:
+**Route:** `POST /api/pdf/apply-edits`
 
-1. **Redact** with `page.add_redact_annot(rect)` + `page.apply_redactions(images=PDF_REDACT_IMAGE_NONE, graphics=PDF_REDACT_LINE_ART_NONE)` — removes text while preserving inline images and vector art
-2. **Reinsert** with `page.insert_text(origin, new_text, fontname, fontsize, color)`
-3. Returns modified PDF bytes
+Processes text and paragraph edits with run-level style fidelity:
+
+1. **Span Run Extraction (`_span_runs_in_rect`):** Before redacting, extracts every span run inside the edit rectangle, capturing `text`, `font`, `size`, `color_rgb`, origin `x`, `line_baseline_y`, and `line_y`.
+2. **Redaction:** Calls `page.add_redact_annot(rect)` + `page.apply_redactions(images=PDF_REDACT_IMAGE_NONE, graphics=PDF_REDACT_LINE_ART_NONE)` to erase original text while preserving images and vector graphics.
+3. **Font Registration:** Calls `page.insert_font(fontname, fontbuffer)` with the stored embedded font buffer.
+4. **Run-Faithful Paragraph Insertion:**
+   - Resolves superscript ranges from `plan["super_ranges"]` (reading `charStart`/`charEnd` and carried `fontSize`) or derives them from extracted runs.
+   - Computes left/right margins and `orig_baselines[]` from the extracted runs.
+   - Reflows word tokens over original line boundaries.
+   - Emits characters via `page.insert_text(fitz.Point(x, y_pos), token["text"], ...)` anchored to original baselines with `y_pos = baseline - rise`.
 
 ---
 
@@ -282,7 +298,7 @@ redoStacks = Map<fileId, Edit[][]>
 
 ## 5. Frontend — `Viewer.jsx`
 
-The largest frontend file (1548 lines). Responsible for rendering the PDF, transforming `spacingData` into editor-ready `paragraphItems`, overlaying `CanvasInlineEditor` instances, and handling all canvas tool interactions.
+The main PDF display orchestrator (1582 lines). Responsible for rendering the PDF, transforming `spacingData` into editor-ready `paragraphItems`, overlaying `CanvasInlineEditor` instances, and handling all canvas tool interactions.
 
 ### 5.1 Dual-Document Flash Prevention
 
@@ -290,7 +306,7 @@ When a baked PDF arrives the viewer keeps the old document rendered as an opaque
 
 ### 5.2 Font Injection
 
-On every new PDF load: calls `POST /pdf/extract-fonts` → passes to `loadPDFFonts(fontsData)` in `utils/pdfFontLoader.js` → creates `@font-face` CSS rules → awaits `document.fonts.ready` → stores `stem_vw_ratio` per font name for canvas stem darkening.
+On every new PDF load: calls `POST /api/pdf/extract-fonts` → passes to `loadPDFFonts(fontsData)` in `utils/pdfFontLoader.js` → creates `@font-face` CSS rules → awaits `document.fonts.ready` → stores `stem_vw_ratio` per font name for canvas stem darkening.
 
 ### 5.3 spacingData → paragraphItems Pipeline
 
@@ -325,8 +341,6 @@ Each backend block is matched to line items by `(y ± 3.5pt, x ± 40pt)`. If a b
 }
 ```
 
-**Post-render enrichment:** After React renders the page, a `useEffect` matches each item to a PDF.js text-layer `<span>` by text content. For each matched span it captures rendered `pdfW`, `renderedFontFamily`, `color`, `isBold`, `isItalic` — used as fallbacks only if the authoritative backend flags are undefined.
-
 ### 5.4 Canvas Tool System
 
 Pointer events on each page container handle:
@@ -343,114 +357,97 @@ All coordinates are in PDF points (divided by `scale`). Annotations stored in Re
 
 ## 6. Frontend — `CanvasInlineEditor.jsx`
 
-The most complex frontend file (1989 lines). Each `paragraphItem` gets its own instance when clicked. Uses a **headless `<textarea>` + `<canvas>`** pattern:
-- Textarea positioned offscreen captures all keyboard input
-- Canvas is the visual rendering surface (text, selections, caret)
+The core canvas editing engine (2098 lines). Each `paragraphItem` gets its own instance when clicked. Uses a **headless `<textarea>` + `<canvas>`** architecture:
+- Offscreen `<textarea>` captures all raw keyboard input, focus, composition, and selection
+- HTML5 Canvas renders text, baseline-shifted superscripts, selection highlights, and blinking caret
 
-### 6.1 Geometry Safety-Net (bbox Union)
+### 6.1 Authoritative Character Attribute Model (`charMetaRef`)
 
-Before any rendering, `item` is expanded via `useMemo` to include all char bboxes and inline image bboxes. This prevents bullet glyphs, Symbol-font characters (⇒, ►), and ORCID badges from rendering at negative canvas coordinates.
+Rich-text character attributes are **never re-derived by positional re-matching after mount**.
+- At mount only: `parseCharMetadata(rawInitialStr, rawInitialRanges, origLines)` runs once to create `initialParsed.charMeta`.
+- `const charMetaRef = useRef(initialParsed.charMeta)` holds the single-source-of-truth parallel attribute array.
+- On keystrokes (`textarea onChange`): computes common prefix `p` and suffix window `so`/`sn`, then splices `charMetaRef.current`. Newly typed characters inherit `'super'` kind only if typed strictly inside an existing superscript run on both sides.
+- `computeLineLayout` and `handleCommit` use `charMetaRef.current` directly. `parseCharMetadata` is never called again after mount.
 
-### 6.2 Character Metadata Pipeline
+### 6.2 Metric-Based Run-Aware Caret
 
-**`parseCharMetadata(rawText, initialRanges, origLines)`**
+The blinking caret is drawn as a 2px-wide vertical bar whose height and vertical position are calculated dynamically from the font metrics of the run under the selection:
 
-Builds `charMeta[]` — one entry per character — recording kind (normal/super/sub), color, per-char font, and PDF origin coordinates.
+```js
+const pos = layout.globalCharMap[selection.start] ?? layout.globalCharMap.at(-1);
+if (pos) {
+  const isSup = pos.kind === 'super' || pos.kind === 'sub';
+  const runPt = isSup ? (pos.charFontSize || baseFontPt * 0.65) : baseFontPt;
+  const rise  = pos.kind === 'super' ? baseFontPt * 0.30 : (pos.kind === 'sub' ? -baseFontPt * 0.10 : 0);
+  ctx.font = `${isItalic?'italic ':''}${isBold?'bold ':''}${runPt}px ${currentFontFamily}`;
+  const m = ctx.measureText('|');
+  const asc = m.actualBoundingBoxAscent ?? runPt * 0.75;
+  const desc = m.actualBoundingBoxDescent ?? runPt * 0.20;
+  ctx.fillStyle = color || '#000';
+  ctx.fillRect(pos.x, pos.yBaseline - rise - asc, 2 / scale, asc + desc);
+}
+```
 
-Algorithm:
-1. Build `rawNonSpace[]` and `backendNonSpace[]` (non-whitespace chars from both sources)
-2. Walk **prefix match** from left — count aligned chars
-3. Walk **suffix match** from right — count aligned chars
-4. Build `rawToBackendMap: rawCharIdx → backendCharMeta`
-5. For each raw char, look up its backend metadata
+No text or label badges ("SUP"/"SUB") are ever painted onto the visual editing surface.
 
-The prefix/suffix approach is robust to text edits: inserted/deleted chars in the middle don't corrupt alignment at the start/end.
+### 6.3 Geometry Safety-Net (bbox Union)
 
-### 6.3 Ligature Expansion
+Before rendering, `item` is expanded via `useMemo` to include all char bboxes and inline image bboxes. This prevents bullet glyphs, Symbol-font characters (⇒, ►), and ORCID badges from rendering at negative canvas coordinates.
+
+### 6.4 Ligature Expansion
 
 **`expandMultiCharEntries(chars)`**
 
-PyMuPDF emits ligatures (fi, fl, ffi) as a single entry with multi-codepoint `c`. This breaks the 1:1 assumption. The helper splits each into individual entries with **linearly interpolated geometry**:
+PyMuPDF emits ligatures (fi, fl, ffi) as a single entry with multi-codepoint `c`. The helper splits each into individual entries with **linearly interpolated geometry**:
 
 ```js
 const sx0 = x0 + ((x1 - x0) * k) / c.length;
 const sx1 = x0 + ((x1 - x0) * (k + 1)) / c.length;
 ```
 
-Applied at:
-- `backendChars` in `parseCharMetadata`
-- `pdfChars` in `computeLineLayout`'s `pushLine`
+### 6.5 Layout Engine (`computeLineLayout`)
 
-### 6.4 Layout Engine (`computeLineLayout`)
+Called on render. Performs full text layout:
 
-Called on every render. Performs full text layout:
-
-1. **Font construction** — CSS font string: `"italic bold 9px MetaProLight-Regular, serif"`
-2. **Ascender measurement** — `ctx.measureText('Hpx').actualBoundingBoxAscent` for pixel-perfect baseline
-3. **Line splitting** — splits `text` on `\n` (hard PDF line boundaries)
-4. **Unit building** — groups chars into word units with measured widths
-5. **Overflow reflow** — units exceeding `targetWidth` carry to the next canvas line
-6. **Atomic citation binding** — orphaned superscript units are merged back into the previous unit
-7. For each canvas line: calls `pushLine()` for PDF coordinate anchoring
-
-### 6.5 PDF Coordinate Anchoring
-
-In `pushLine()`, for unedited lines:
-
-1. Build `pdfWords[]` and `lineWords[]`
-2. Walk **word-level prefix match** (how many words from the start still match the PDF)
-3. Walk **suffix match** (how many words from the end still match)
-4. Prefix chars → draw at original `origin_x` from PyMuPDF (exact PDF glyph placement)
-5. Suffix chars → draw at `lastPrefixX + canvasFlow + deltaX` (PDF suffix anchoring)
-6. Middle (edited) chars → pure canvas flow layout
-
-This preserves pixel-perfect glyph placement for unchanged text while allowing freely-typed text to flow naturally.
+1. Uses `charMetaRef.current` directly.
+2. Measures HTML ascender via `ctx.measureText('Hpx').actualBoundingBoxAscent`.
+3. Splits text on `\n` (hard PDF line boundaries).
+4. Groups chars into word units with measured widths.
+5. Reflows overflowing units across canvas lines.
+6. Merges orphaned superscript units back into preceding units.
+7. Calls `pushLine()` for word-level PDF prefix/suffix anchoring on unedited lines.
 
 ### 6.6 Canvas Drawing (`drawCanvas`)
 
-Sequence on every render:
+Sequence on render:
 1. `ctx.clearRect()`
-2. Draw **underlay PNG** (non-text content background, e.g. containing a formula image)
+2. Draw **underlay PNG** (background non-text content)
 3. Draw **inline images** (ORCID badges, decoded and cached in `imgCache` ref)
 4. For each layout line:
-   - Set `ctx.font`
    - Apply **stem darkening offset** to baseline Y (CFF fonts only)
-   - Draw **selection highlight** rectangle if selection overlaps
-   - For each char: `ctx.fillText(displayChar, x, baselineY)`, advance `x` by measured width
-5. Draw **blinking caret** (1px vertical line, 500ms interval)
+   - Draw **selection highlight** rectangle
+   - `ctx.fillText(displayChar, x, baselineY)` per char
+5. Draw **blinking caret** bar using `ctx.measureText` run metrics
 
-**DPR:** Canvas physical size = `Math.round(r.w * dpr)` × `Math.round(r.h * dpr)`. CSS size = `physical / dpr`. All drawing is in CSS pixels — no `ctx.scale(dpr, dpr)` needed.
+### 6.7 Commit / Bake Flow
 
-### 6.7 Stem Darkening / Font Weight Compensation
-
-CFF fonts have FreeType synthetic stem darkening that the browser canvas does not replicate, making canvas text appear thinner. Compensation:
-
-1. Backend extracts `StdVW` from CFF Private dict → `stem_vw_ratio = StdVW / 1000`
-2. `targetStemWidthPx = stemVwRatio × fontSizePx`
-3. `nativeStemWidthPx = measureNativeStemWidthPx()` — renders `'l'` at 256px on a probe canvas, counts alpha-covered pixels
-4. `offset = max(0, targetStemWidthPx - nativeStemWidthPx)` added to canvas baseline Y
-
-TrueType / Base-14 fonts (`stemVwRatio == null`): zero darkening — browser hinting handles these.
-
-### 6.8 Commit / Bake Flow
-
-**Commit:** click outside (captured in document mousedown capture phase) or Enter in single-line mode:
+**Commit:** outside click (document mousedown capture phase) or Enter in single-line mode:
 1. `sanitizeForCommit(text)` — converts `\u00A0` → regular spaces
-2. `extractRangesFromCharMeta()` — rebuilds superscriptRanges from charMeta
+2. `extractRangesFromCharMeta(charMetaRef.current)` — rebuilds `superscriptRanges` carrying `fontSize` and `color`
 3. `onCommit(edit)` → `pdfEditStore.commitEdit(fileId, edit)`
 
 **Bake:** user clicks "Finish & Export":
 1. Collect all edits from `pdfEditStore.getEdits()`
-2. `POST /pdf/bake` with edit list + original PDF bytes
-3. Receive new PDF bytes → update `file` prop → dual-doc transition
-4. `POST /pdf/extract-spacing` on new PDF → new `spacingData` → new boxes
+2. `POST /api/pdf/apply-edits` with edit list + original PDF bytes
+3. Receive new PDF bytes → dual-doc transition (no flash)
+4. `POST /api/pdf/extract-spacing` on new PDF → fresh `spacingData`
 5. `pdfEditStore.clearEdits()` — stale pre-bake edits removed
 
 ---
 
 ## 7. Frontend — `InlineEditor.jsx`
 
-The **legacy** inline editor (727 lines). Uses `contentEditable` instead of canvas. Used for drag-and-drop text annotations and legacy simple edit mode.
+The **legacy** inline editor (726 lines). Uses `contentEditable` instead of canvas. Used for drag-and-drop text annotations and legacy simple edit mode.
 
 Key utilities:
 - `buildInitialChildren(str, superscriptRanges)` — renders `<sup>` / `<sub>` HTML inside the contentEditable span
@@ -461,14 +458,14 @@ Key utilities:
 
 ## 8. Frontend — Supporting Components
 
-| Component | Role |
-|-----------|------|
-| `RightPanel.jsx` | Tool settings sidebar (color pickers, opacity, shape type). Contains "Finish & Export" button. |
-| `Toolbar.jsx` | Left-side vertical toolbar. Sets `activeTool`. |
-| `DebugOverlay.jsx` | Activated by `Ctrl+Shift+D`. Renders red bbox overlays with `paragraph_id`, font name, size labels. |
-| `TextOverlay.jsx` | Positions an element at a PDF-space coordinate. Used for annotation overlays. |
-| `DraggableItem.jsx` | Pointer-event drag wrapper. Translates drag deltas to PDF-space coordinate updates. |
-| `superscriptUtils.js` | Exports `SUPER_MAP`, `UNICODE_SUPER_MAP`, `UNICODE_SUB_MAP`. Non-JSX (required for Vite Fast Refresh). |
+| Component | File Line Count | Role |
+|-----------|-----------------|------|
+| `RightPanel.jsx` | 346 lines | Tool settings sidebar (color pickers, opacity, shape type). Contains "Finish & Export" button. |
+| `Toolbar.jsx` | 115 lines | Left-side vertical toolbar. Sets `activeTool`. |
+| `DebugOverlay.jsx` | 87 lines | Activated by `Ctrl+Shift+D`. Renders red bbox overlays with `paragraph_id`, font name, size labels. |
+| `TextOverlay.jsx` | 108 lines | Positions an element at a PDF-space coordinate. Used for annotation overlays. |
+| `DraggableItem.jsx` | 111 lines | Pointer-event drag wrapper. Translates drag deltas to PDF-space coordinate updates. |
+| `superscriptUtils.js` | 36 lines | Exports `SUPER_MAP`, `UNICODE_SUPER_MAP`, `UNICODE_SUB_MAP`. Non-JSX. |
 
 ---
 
@@ -494,7 +491,7 @@ PDF Upload
     │
     ▼
 PDFEditorPage.jsx
-    ├── POST /pdf/extract-spacing ─────────────────────────────────────────────┐
+    ├── POST /api/pdf/extract-spacing ──────────────────────────────────────────┐
     │       │                                                                  │
     │   editor.py: get_pdf_spacing_payload()                                   │
     │       ├── _get_column_boundaries(page)                                   │
@@ -506,8 +503,8 @@ PDFEditorPage.jsx
     │       └── union bbox + underlay PNG per block                            │
     │   → spacingData ◄─────────────────────────────────────────────────────────┘
     │
-    ├── POST /pdf/extract-fonts
-    │       └── fitz.extract_font() → CFF→OTF → cmap inject → base64
+    ├── POST /api/pdf/extract-fonts
+    │       └── fitz.extract_font() → CFF→OTF → OTF name table fix → cmap inject → base64
     │   → fontsData → loadPDFFonts() → @font-face in <head>
     │
     ▼
@@ -522,19 +519,16 @@ Viewer.jsx
     │     ├── Map backend blocks → paragraphItems
     │     └── setPageMetadata(pageNum, { items })
     │
-    ├── useEffect([pageMetadata, scale])     [post-render color sampling]
-    │     Match items to PDF.js <span> by text → capture rendered width/color/font
-    │
     ▼
 Per-paragraphItem: CanvasInlineEditor
     ├── expandMultiCharEntries()             [ligature splitting]
-    ├── parseCharMetadata()                  [prefix/suffix char→backend mapping]
+    ├── charMetaRef (useRef)                 [authoritative parallel attribute model]
     ├── useMemo: bbox union safety-net
     │
     ├── computeLineLayout(ctx)
+    │     ├── Uses charMetaRef.current directly (never re-parses rawText)
     │     ├── measureText() per char/unit
     │     ├── Overflow reflow across lines
-    │     ├── expandMultiCharEntries() on pdfChars
     │     ├── Word-level prefix/suffix PDF anchoring
     │     └── Return lines[] with per-char x positions
     │
@@ -543,21 +537,22 @@ Per-paragraphItem: CanvasInlineEditor
           ├── Draw inline images (ORCID, formula images)
           ├── Draw selection highlights
           ├── fillText() per char with stem-darkening offset
-          └── Draw blinking caret
+          └── Draw blinking caret bar (measured via ctx.measureText('|'))
 
-User types → pdfEditStore.commitEdit()   [undo stack maintained]
+User types → onChange splices charMetaRef → pdfEditStore.commitEdit()
 
 "Bake" clicked
     │
     ▼
-POST /pdf/bake
+POST /api/pdf/apply-edits
+    ├── _span_runs_in_rect()                 [extract per-span font/size/color/baselines]
     ├── page.add_redact_annot(rect)
     ├── page.apply_redactions(images=NONE, graphics=NONE)
-    └── page.insert_text(origin, newStr, fontname, fontsize, color)
+    └── page.insert_text()                   [run-faithful baseline & size emission]
     → new PDF bytes
 
 New PDF → Viewer (dual-doc transition, no flash)
-POST /pdf/extract-spacing (new PDF) → new spacingData → new boxes
+POST /api/pdf/extract-spacing (new PDF) → new spacingData → new boxes
 pdfEditStore.clearEdits()
 ```
 
@@ -573,7 +568,7 @@ pdfEditStore.clearEdits()
 
 **Transform:** `screenPx = pdfPt × scale`
 
-**DPR:** Canvas physical size = `round(cssPx × DPR)`. Drawing coordinates are in CSS pixels. No `ctx.scale()` needed because physical canvas size maps 1:1 to DPR-scaled pixels.
+**DPR:** Canvas physical size = `round(cssPx × DPR)`. Drawing coordinates are in CSS pixels. Physical canvas size maps 1:1 to DPR-scaled pixels.
 
 All coordinates use **Y-down** convention (Y=0 at top of page) at every layer — no axis flip is ever needed.
 
@@ -598,6 +593,21 @@ if idx is None:
 ```
 Short lines' centers drift toward the column split; left edges never do.
 
+### Authoritative Attribute Splicing
+```js
+// Textarea onChange: compute common prefix p and suffix window so / sn
+const inserted = Array.from(neu.slice(p, sn), (ch, i) => ({
+  origChar: ch, displayChar: ch,
+  kind: inside ? 'super' : 'normal',
+  color: inside ? oldMeta[p - 1]?.color : undefined,
+  pdfSize: inside ? oldMeta[p - 1]?.pdfSize : undefined,
+  charIndex: p + i,
+}));
+charMetaRef.current = [...oldMeta.slice(0, p), ...inserted, ...oldMeta.slice(so)]
+  .map((m, i) => ({ ...m, charIndex: i }));
+```
+Prevents text-based positional re-matching from corrupting formatting attributes after edits. Newly typed chars inherit `'super'` strictly inside an existing superscript run.
+
 ### Prefix/Suffix PDF Anchoring
 Canvas lines byte-identical to the original PDF line use `origin_x` from PyMuPDF for character placement. Preserved: exact glyph positions, inter-character kerning. Edited text: pure canvas flow. Result: unchanged text sits pixel-perfectly over the PDF.js render.
 
@@ -615,11 +625,3 @@ const nativeStemWidthPx = measureNativeStemWidthPx(fontString, dpr);
 const offset = Math.max(0, targetStemWidthPx - nativeStemWidthPx);
 ```
 CFF-only. Aligns canvas stroke weight with FreeType's automatic stem darkening for visual consistency between the PDF.js layer and the canvas editor.
-
-### Alignment Detection
-```python
-# Justified: non-last lines touch both left AND right column edges (within 18pt)
-# Centered: all line midpoints within 5pt of block center
-# Right: all line right-edges within 5pt of block right edge
-# Default: left
-```

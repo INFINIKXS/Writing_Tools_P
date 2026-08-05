@@ -407,7 +407,10 @@ export function InlineEditor({ item, scale, existingEdit, onCommit, onCancel }) 
   //   "MetaProLight-Regular"        (stripped)
   //   whatever the backend calls item.fontPostScriptName
   const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
-  const sanitizeFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
+  const sanitizeFontName = (name) =>
+    (name || '')
+      .replace(/\s*-\s*/g, '-')
+      .replace(/\s+(Regular|Reg|Bold|Italic|Oblique)$/i, '');
   const fontCandidates = [
     item.fontPostScriptName,
     stripSubset(item.fontPostScriptName),

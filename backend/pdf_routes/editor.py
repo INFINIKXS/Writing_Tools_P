@@ -292,7 +292,7 @@ def _get_column_boundaries(page):
         else:
             split_x = (left_start + right_start) / 2
 
-        logger.info(
+        logger.debug(
             f"Column detection: two columns "
             f"(left starts at x≈{left_start:.0f} [{b1_count} lines], "
             f"right starts at x≈{right_start:.0f} [{b2_count} lines], "
@@ -300,7 +300,7 @@ def _get_column_boundaries(page):
         )
         return [[text_x_min, split_x], [split_x, text_x_max]]
 
-    logger.info(
+    logger.debug(
         f"Column detection: single column "
         f"(top bucket x≈{b1_x:.0f} has {b1_count}/{total_lines} lines, "
         f"2nd bucket x≈{b2_x:.0f} has {b2_count} — not enough for 2 cols)"
@@ -393,7 +393,7 @@ def _cluster_free_lines(free):
         # Allow merge if: same family OR size difference <= 1.0
         merge_ok = size_ok or (abs(prev["size"] - nxt["size"]) <= 1.0 and family_similar)
 
-        print(f"[CLUSTER-DEBUG] gap={v_gap:.2f} tol={v_tol:.2f} | x_close={x_close} | "
+        logger.debug(f"[CLUSTER-DEBUG] gap={v_gap:.2f} tol={v_tol:.2f} | x_close={x_close} | "
               f"sz={prev['size']:.1f}->{nxt['size']:.1f} | merge={merge_ok} | "
               f"Text: {prev.get('text', '')[:20]!r} -> {nxt.get('text', '')[:20]!r}")
 
@@ -700,7 +700,7 @@ def extract_page_spacing_data(page, page_idx: int = None,
                 idx = min(range(len(cols)), key=lambda i: abs(x0 - cols[i][0]))
             buckets[idx].append(ln)
 
-        logger.info(
+        logger.debug(
             f"[REGIONS-DEBUG] page {page_idx}: "
             f"cols={[(round(a, 1), round(b, 1)) for a, b in cols]} "
             f"bucket_sizes={ {i: len(v) for i, v in buckets.items()} }"
@@ -720,7 +720,7 @@ def extract_page_spacing_data(page, page_idx: int = None,
             if buckets[i]:
                 subs = _split_bucket_by_left_edge(buckets[i])
                 # Unconditional — prints even for 1-sub-bucket (proves the path ran)
-                logger.info(
+                logger.debug(
                     f"[SUBBUCKET] page {page_idx} bucket {i}: {len(subs)} sub-bucket(s) "
                     f"sizes={[len(s) for s in subs]} "
                     f"anchors={[round(s[0]['line_x0'], 1) for s in subs]}"
@@ -732,7 +732,7 @@ def extract_page_spacing_data(page, page_idx: int = None,
         if not region_tuples:
             region_tuples = [([l], "line", 0) for l in all_lines]
 
-        logger.info(
+        logger.debug(
             f"[REGIONS] page {page_idx}: rect_regions={len(grouped)} "
             f"free_lines={len(free)} regions={len(region_tuples)}"
         )
@@ -957,8 +957,8 @@ def get_pdf_spacing_payload(pdf_bytes, doc_id: str = None):
             preview = blk["text"].replace("\n", " ")
             if len(preview) > 40:
                 preview = preview[:40] + "..."
-            logger.info(
-                f"[INFO] [TYPOGRAPHY] Page P{page_index + 1} | Paragraph #{p_idx + 1} ({blk['paragraph_id']}) | "
+            logger.debug(
+                f"[TYPOGRAPHY] Page P{page_index + 1} | Paragraph #{p_idx + 1} ({blk['paragraph_id']}) | "
                 f"Font: {blk['font_family']} ({blk['font_size']}pt) | Color: {blk['font_color']}/{blk['hex_color']} | "
                 f"Align: {blk['align']} | Text: \"{preview}\""
             )
@@ -1110,7 +1110,7 @@ async def extract_fonts(file: UploadFile = File(...)):
                     # (Browsers don't load naked .cff files via @font-face.)
                     if ext == "cff":
                         try:
-                            buffer = wrap_cff_in_otf(buffer)
+                            buffer = wrap_cff_in_otf(buffer, basefont_name=basename)
                             if buffer:
                                 ext = "otf"
                             else:
@@ -1148,16 +1148,19 @@ async def extract_fonts(file: UploadFile = File(...)):
                         "subset_tag": subset_tag,
                         "stem_vw_ratio": stem_vw_ratio,
                     }
-                    logger.info(f"Extracted font {basename} ({len(buffer)} bytes, {ext}, stem_vw_ratio: {stem_vw_ratio})")
+                    # Also register under the bare (tag-stripped) name so the canvas
+                    # fontCandidates list matches across bake generations when PyMuPDF
+                    # re-subsets the font under a new prefix.
+                    if subset_tag and postscript_name and postscript_name not in fonts_out:
+                        fonts_out[postscript_name] = fonts_out[basename]
+                    logger.debug(f"Extracted font {basename} ({len(buffer)} bytes, {ext}, stem_vw_ratio: {stem_vw_ratio})")
                 except Exception as e:
                     logger.warning(f"Failed to extract font {basename}: {e}")
         
         doc.close()
-        logger.info("=" * 70)
-        logger.info(f"   [FONT ENGINE] SUCCESS: Serving {len(fonts_out)} embedded PDF fonts to frontend:")
+        logger.info(f"   [FONT ENGINE] SUCCESS: Serving {len(fonts_out)} embedded PDF fonts to frontend")
         for fn in fonts_out.keys():
-            logger.info(f"      • {fn}")
-        logger.info("=" * 70)
+            logger.debug(f"      • {fn}")
         return JSONResponse(status_code=200, content=fonts_out)
     except Exception as e:
         logger.error(f"extract-fonts failed: {e}")

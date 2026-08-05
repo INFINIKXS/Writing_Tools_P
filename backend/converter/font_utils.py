@@ -219,29 +219,98 @@ def _ensure_browser_required_tables(tt: TTFont):
         name.names = []
         tt['name'] = name
 
-def wrap_cff_in_otf(cff_bytes: bytes) -> Optional[bytes]:
-    """Wraps bare CFF bytes into an OTF (SFNT) shell."""
+def wrap_cff_in_otf(cff_bytes: bytes, basefont_name: str = "") -> Optional[bytes]:
+    """Wraps bare CFF bytes into an OTF (SFNT) shell, embedding name table."""
     try:
         from fontTools import cffLib, ttLib
-        
-        # Parse pristine CFF stream designed strictly for binary pass-through
+
+        # ── Compute the canonical bare name once ───────────────────────────────
+        # bare = tag-stripped, space-free PostScript name. Written into EVERY
+        # name slot (CFF Top DICT + OTF name table) so PyMuPDF always reads a
+        # short, stable string that fits inside the 31-char BaseFont limit.
+        bare = re.sub(r"^[A-Z]{6}\+", "", (basefont_name or "")).strip() or "WrappedFont"
+
+        # ── Parse pristine CFF stream for binary pass-through ─────────────────
         cff_reader_pristine = cffLib.CFFFontSet()
         cff_reader_pristine.decompile(io.BytesIO(cff_bytes), otFont=None, isCFF2=False)
-        
-        # Parse disposable CFF stream strictly for dimensional width extraction
+
+        # ── Patch CFF Top DICT BEFORE renaming fontNames ──────────────────────
+        if hasattr(cff_reader_pristine, "fontNames") and cff_reader_pristine.fontNames:
+            original_cff_name = cff_reader_pristine.fontNames[0]
+            try:
+                top_dict = cff_reader_pristine[original_cff_name]
+                if hasattr(top_dict, "FontName"):
+                    top_dict.FontName = bare
+                top_dict.FullName = bare
+                top_dict.FamilyName = bare
+            except Exception:
+                pass
+            cff_reader_pristine.fontNames = [bare]
+
+        # ── Parse disposable CFF stream for width metrics only ────────────────
         metrics_reader = cffLib.CFFFontSet()
         metrics_reader.decompile(io.BytesIO(cff_bytes), otFont=None, isCFF2=False)
-        
-        otf = TTFont(sfntVersion='OTTO')
-        cff_table = ttLib.newTable('CFF ')
+
+        otf = TTFont(sfntVersion="OTTO")
+        cff_table = ttLib.newTable("CFF ")
         cff_table.cff = cff_reader_pristine
-        otf['CFF '] = cff_table
-        
+        otf["CFF "] = cff_table
+
         _synthesize_required_otf_tables(otf, metrics_reader)
-        
+
+        # ── Set CFF Top DICT & OTF name table on serialized TTFont instance ────
+        if "CFF " in otf and hasattr(otf["CFF "], "cff"):
+            cff_obj = otf["CFF "].cff
+            cff_obj.fontNames = [bare]
+            if hasattr(cff_obj, "topDictIndex") and len(cff_obj.topDictIndex) > 0:
+                td = cff_obj.topDictIndex[0]
+                if hasattr(td, "FontName"):
+                    td.FontName = bare
+                td.FullName = bare
+                td.FamilyName = bare
+
+        subfamily = "Regular"
+        fname_lower = bare.lower()
+        if "bold" in fname_lower:
+            subfamily = "Bold"
+        elif "italic" in fname_lower or "oblique" in fname_lower:
+            subfamily = "Italic"
+
+        unique_id = f"{bare}-PDFEditorWrap"
+
+        nt = ttLib.newTable("name")
+        nt.names = []
+        for nid, val in [(1, bare), (2, subfamily), (3, unique_id),
+                         (4, bare), (6, bare)]:
+            nt.setName(val, nid, 3, 1, 0x409)   # Windows BMP Unicode
+            nt.setName(val, nid, 1, 0, 0)        # Mac Roman
+        otf["name"] = nt
+
         out = io.BytesIO()
         otf.save(out)
-        return out.getvalue()
+        out_bytes = out.getvalue()
+
+        # ── Post-serialization validation ─────────────────────────────────────
+        try:
+            verify_tt = TTFont(io.BytesIO(out_bytes))
+            v_name4 = verify_tt["name"].getDebugName(4)
+            v_name6 = verify_tt["name"].getDebugName(6)
+            check_font = fitz.Font(fontbuffer=out_bytes)
+
+            acceptable = {bare, f"{bare} {subfamily}"}
+            if v_name4 == bare and v_name6 == bare and check_font.name in acceptable:
+                logger.debug(
+                    f"Wrapped OTF font name sanity check \u2713: '{check_font.name}'"
+                )
+            else:
+                logger.warning(
+                    f"Wrapped OTF font name sanity check \u2717: '{check_font.name}' "
+                    f"(expected '{bare}' or '{bare} {subfamily}', fontTools name4='{v_name4}', name6='{v_name6}')"
+                )
+        except Exception as check_err:
+            logger.warning(f"Wrapped OTF font sanity check failed: {check_err}")
+
+        return out_bytes
     except Exception as e:
         logger.warning(f"CFF wrapping failed: {e}")
         return None
@@ -318,7 +387,7 @@ def get_stem_darkening_ratio(cff_font):
             units_per_em_val = 1000
 
         ratio = float(std_vw / units_per_em_val)
-        logger.info(f"[CFF STEM] Extracted std_vw={std_vw} via {source} (units_per_em={units_per_em_val}) -> ratio={ratio:.4f}")
+        logger.debug(f"[CFF STEM] Extracted std_vw={std_vw} via {source} (units_per_em={units_per_em_val}) -> ratio={ratio:.4f}")
         return ratio
     except Exception:
         return None
@@ -372,14 +441,14 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
         
         # ── Step 1.2: Layer 2 Detection & OTF Wrapping ──────────────────────
         fmt = detect_font_format(font_bytes)
-        logger.info(f"Extracted font '{matched_basefont}' (xref={xref}) detected as: {fmt}")
+        logger.debug(f"Extracted font '{matched_basefont}' (xref={xref}) detected as: {fmt}")
         
         if fmt == 'cff':
-            logger.info("Bare CFF detected. Attempting OTF wrapper injection...")
-            otf_bytes = wrap_cff_in_otf(font_bytes)
+            logger.debug("Bare CFF detected. Attempting OTF wrapper injection...")
+            otf_bytes = wrap_cff_in_otf(font_bytes, basefont_name=matched_basefont)
             if otf_bytes:
                 font_bytes = otf_bytes
-                logger.info("CFF successfully wrapped in OTF container.")
+                logger.debug("CFF successfully wrapped in OTF container.")
             else:
                 reason = f"Embedded CFF font '{matched_basefont}' could not be wrapped into OTF."
                 logger.warning(reason)
@@ -445,8 +514,17 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
                 missing_glyphs=missing,
             )
 
+        # ── Step 3.5: Round-trip guard for paragraph chars ──────────────────
+        if new_text:
+            unmapped = [c for c in set(new_text) if ord(c) > 32 and not test_font.has_glyph(ord(c))]
+            if unmapped:
+                logger.warning(
+                    f"Font round-trip guard warning for '{matched_basefont}': "
+                    f"{len(unmapped)} chars have no glyph: {unmapped}"
+                )
+
         # ── Step 4: All good — return embedded font ──────────────────────────
-        logger.info(f"Using embedded font '{matched_basefont}' for edit.")
+        logger.debug(f"Using embedded font '{matched_basefont}' for edit.")
         return FontResult(
             fontname=f"emb_{matched_basefont[:20]}",
             font_buffer=font_bytes,
@@ -456,7 +534,7 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
     # ── Step 5: No extractable font found — try Base-14 match first ─────────
     base14 = _match_base14(font_name)
     if base14:
-        logger.info(f"Using Base-14 font '{base14}' matched from '{font_name}'.")
+        logger.debug(f"Using Base-14 font '{base14}' matched from '{font_name}'.")
         return FontResult(fontname=base14, fallback_used=False)
 
     # ── Step 6: Full fallback to pymupdf-fonts ───────────────────────────────
@@ -905,7 +983,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
             _ensure_browser_required_tables(tt)
             out = io.BytesIO()
             tt.save(out)
-            logger.info(f"==== HMTX-ONLY PATH SUCCESS ====")
+            logger.debug(f"==== HMTX-ONLY PATH SUCCESS ====")
             return out.getvalue()
         except Exception as e:
             logger.warning(
@@ -915,17 +993,17 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
     # ───────────────────────────────────────────────────────────────────────
 
     try:
-        logger.info(f"==== INJECT_CMAP START: {basefont_name} (page {page.number if page else 'none'}) ====")
+        logger.debug(f"==== INJECT_CMAP START: {basefont_name} (page {page.number if page else 'none'}) ====")
         single_map, multi_map = _parse_tounicode(doc, xref)
-        logger.info(f"Parse ToUnicode: single_map={len(single_map)}, multi_map={len(multi_map)}")
+        logger.debug(f"Parse ToUnicode: single_map={len(single_map)}, multi_map={len(multi_map)}")
         
         cidtogid_map = _extract_cidtogidmap(doc, xref)
-        logger.info(f"Extracted CIDToGIDMap: {'YES (' + str(len(cidtogid_map)) + ')' if cidtogid_map else 'NO'}")
+        logger.debug(f"Extracted CIDToGIDMap: {'YES (' + str(len(cidtogid_map)) + ')' if cidtogid_map else 'NO'}")
         
         tt = TTFont(io.BytesIO(font_bytes))
         glyph_order = tt.getGlyphOrder()
         n_glyphs = len(glyph_order)
-        logger.info(f"TTFont loaded. n_glyphs={n_glyphs}")
+        logger.debug(f"TTFont loaded. n_glyphs={n_glyphs}")
         
         cid_to_gid = cidtogid_map if cidtogid_map else {}
 
@@ -946,9 +1024,9 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
             for cp, gname in existing_cmap.items():
                 if gname in glyph_name_to_idx:
                     font_cmap_gids[cp] = glyph_name_to_idx[gname]
-            logger.info(f"Built font_cmap_gids with {len(font_cmap_gids)} entries from existing cmap")
+            logger.debug(f"Built font_cmap_gids with {len(font_cmap_gids)} entries from existing cmap")
         else:
-            logger.info("No existing cmap in font — font_cmap_gids is empty")
+            logger.debug("No existing cmap in font — font_cmap_gids is empty")
         
         # BUG 3 FIX: Initialize unicode_to_gid BEFORE the try block so it
         # always exists, regardless of whether trace recovery succeeds.
@@ -957,7 +1035,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
         
         pages_to_scan = doc if doc is not None else ([page] if page else [])
         if pages_to_scan and basefont_name:
-            logger.info(f"Attempting Trace CID Recovery for: {basefont_name} (scanning {len(pages_to_scan)} pages)")
+            logger.debug(f"Attempting Trace CID Recovery for: {basefont_name} (scanning {len(pages_to_scan)} pages)")
             try:
                 _warned_conflicts = set()
                 target_short = basefont_name.split("+")[-1].lower().replace(" ", "").replace("-", "")
@@ -989,7 +1067,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                                         unicode_to_gid[ucp] = gid
                                     
                 trace_has_data = len(unicode_to_gid) > 0
-                logger.info(f"Trace extracted {len(unicode_to_gid)} unique (UCP -> GID) pairs.")
+                logger.debug(f"Trace extracted {len(unicode_to_gid)} unique (UCP -> GID) pairs.")
                 changed_cids = 0
                 for cid, uchar in single_map.items():
                     ucp = ord(uchar)
@@ -998,7 +1076,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                         if cid != gid:
                             cid_to_gid[cid] = gid
                             changed_cids += 1
-                logger.info(f"Adjusted {changed_cids} mismatched CID->GID mappings.")
+                logger.debug(f"Adjusted {changed_cids} mismatched CID->GID mappings.")
             except Exception as e:
                 logger.warning(f"Trace recovery failed entirely: {e}")
                 
@@ -1028,7 +1106,7 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                 # guessing gid = cid risks a WRONG-BUT-VALID glyph (e.g. '%' silently
                 # rendering as 'J') rather than a visibly-missing one. Leave unmapped —
                 # better to show a visible .notdef box than a confident wrong letter.
-                logger.warning(f"No reliable GID for U+{ucp:04X} ({uchar!r}) — leaving unmapped rather than guessing.")
+                logger.debug(f"No reliable GID for U+{ucp:04X} ({uchar!r}) — leaving unmapped rather than guessing.")
                 continue
             if 0 < gid < n_glyphs:
                 unicode_to_glyph[ucp] = glyph_order[gid]
@@ -1109,16 +1187,16 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
             return font_bytes
 
         # BUG 4 FIX: Diagnostic logging for commonly-broken codepoints
-        logger.info(f"Generated unicode_to_glyph with {len(unicode_to_glyph)} entries")
+        logger.debug(f"Generated unicode_to_glyph with {len(unicode_to_glyph)} entries")
         _SUSPECT_CHARS = {
             'f': 0x66, 'l': 0x6C, 'k': 0x6B, 'i': 0x69, ' ': 0x20,
             '9': 0x39, '%': 0x25
         }
         for label, ucp in _SUSPECT_CHARS.items():
             if ucp in unicode_to_glyph:
-                logger.info(f"  DIAG: U+{ucp:04X} '{label}' → glyph '{unicode_to_glyph[ucp]}'")
+                logger.debug(f"  DIAG: U+{ucp:04X} '{label}' → glyph '{unicode_to_glyph[ucp]}'")
             else:
-                logger.info(f"  DIAG: U+{ucp:04X} '{label}' → NOT MAPPED")
+                logger.debug(f"  DIAG: U+{ucp:04X} '{label}' → NOT MAPPED")
             
         # 3. Sync hmtx advance widths to CFF charstring widths.
         # CFF-flavoured OTF fonts store widths in TWO places: the hmtx table
@@ -1159,9 +1237,9 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
                         pass
 
                 if fixed_count > 0:
-                    logger.info(f"CFF hmtx sync: fixed {fixed_count} advance widths (FontMatrix scale={scale_x:.3f})")
+                    logger.debug(f"CFF hmtx sync: fixed {fixed_count} advance widths (FontMatrix scale={scale_x:.3f})")
                 else:
-                    logger.info("CFF hmtx sync: all widths already consistent")
+                    logger.debug("CFF hmtx sync: all widths already consistent")
             except Exception as e:
                 logger.warning(f"CFF hmtx sync failed (non-fatal): {e}")
 
@@ -1212,12 +1290,12 @@ def _inject_cmap(font_bytes: bytes, doc: fitz.Document, xref: int, page: Optiona
             if 'cmap' not in verify_tt or not verify_tt.getBestCmap():
                 logger.error(f"Refusing to serve '{basefont_name}' — no valid cmap table produced!")
                 return None
-            logger.info(f"Post-serialization cmap validated: {len(verify_tt.getBestCmap())} entries")
+            logger.debug(f"Post-serialization cmap validated: {len(verify_tt.getBestCmap())} entries")
         except Exception as e:
             logger.error(f"Refusing to serve '{basefont_name}' — font validation error: {e}")
             return None
 
-        logger.info(f"==== INJECT_CMAP SUCCESS. Injected ToUnicode CMap matrix + hmtx patch into {len(unicode_to_glyph)} subsets. ====")
+        logger.debug(f"==== INJECT_CMAP SUCCESS. Injected ToUnicode CMap matrix + hmtx patch into {len(unicode_to_glyph)} subsets. ====")
         return out_bytes
         
     except Exception as e:

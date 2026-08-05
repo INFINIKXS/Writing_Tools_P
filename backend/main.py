@@ -15,8 +15,26 @@ This file:
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
+import logging
+
+# Silence fontTools internals (the "'created' timestamp" warnings)
+logging.getLogger("fontTools").setLevel(logging.ERROR)
+
+# Suppress health-poll routes from uvicorn access log
+class _AccessFilter(logging.Filter):
+    _QUIET = ("/api-key-usage", "/api/style/profile")
+    def filter(self, rec):
+        return not any(p in rec.getMessage() for p in self._QUIET)
+logging.getLogger("uvicorn.access").addFilter(_AccessFilter())
+
+# Verbose opt-in: PDF_VERBOSE=1 restores all detail
+if os.environ.get("PDF_VERBOSE") == "1":
+    for _n in ("pdf_routes.editor", "converter.font_utils", "converter.pdf_edit"):
+        logging.getLogger(_n).setLevel(logging.DEBUG)
 
 # ─── App creation ─────────────────────────────────────────────────────────
+
 app = FastAPI(title="Writing Tools API")
 
 ALLOWED_ORIGINS = [

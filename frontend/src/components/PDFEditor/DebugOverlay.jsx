@@ -2,7 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { pdfToScreen } from '../../utils/pdfCoords';
 
 const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
-const sanitizeFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
+const sanitizeFontName = (name) =>
+  (name || '')
+    .replace(/\s*-\s*/g, '-')
+    .replace(/\s+(Regular|Reg|Bold|Italic|Oblique)$/i, '');
 
 /**
  * Developer Debug Overlay

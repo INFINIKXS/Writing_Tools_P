@@ -180,14 +180,17 @@ const isCJKChar = (ch) => {
  */
 const sanitizeForCommit = (text) => {
   if (!text) return '';
-  return text.replace(/\u00A0/g, ' ');
+  return text.replace(/\u00A0/g, ' ').replace(/\u00AD/g, '');
 };
 
 /**
  * Strip 6-letter subset tag prefix (e.g. "NBUDXT+MetaProLight-Regular" -> "MetaProLight-Regular")
  */
 const stripSubset = (name) => (name || '').replace(/^[A-Z]{6}\+/, '');
-const sanitizeFontName = (name) => (name || '').replace(/\s*-\s*/g, '-');
+const sanitizeFontName = (name) =>
+  (name || '')
+    .replace(/\s*-\s*/g, '-')
+    .replace(/\s+(Regular|Reg|Bold|Italic|Oblique)$/i, '');
 
 const LIGATURE_MAP = {
   '\uFB00': ['f', 'f'],
@@ -205,6 +208,7 @@ const expandMultiCharEntries = (chars) => {
   const out = [];
   for (const meta of chars) {
     const c = meta?.c ?? meta?.char ?? '';
+    if (c === '\u00AD') continue;
     const ligSplit = LIGATURE_MAP[c];
     if (ligSplit) {
       const x0 = Number.isFinite(meta.x0) ? meta.x0 : meta.origin_x;
@@ -264,6 +268,7 @@ const isSaneChar = (c, pageW = 2000) =>
  */
 function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
   if (!rawText) return { cleanText: '', charMeta: [] };
+  rawText = rawText.replace(/\u00AD/g, '');
 
   const backendChars = (origLines && Array.isArray(origLines))
     ? expandMultiCharEntries(origLines.flatMap(l => l.chars || []))
@@ -476,7 +481,10 @@ function extractRangesFromCharMeta(charMeta) {
           kind: meta.kind,
           charStart: i,
           charEnd: i + 1,
-          color: meta.color
+          color: meta.color,
+          // Carry the PDF-measured font size for this run so the backend
+          // paragraph bake can emit the correct superscript size.
+          fontSize: meta.pdfSize || null,
         };
       }
     } else {
@@ -529,12 +537,13 @@ const extractColor = (item) => {
 
 export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange }) {
   const getInitialText = useCallback(() => {
-    if (existingEdit && existingEdit.newStr) return existingEdit.newStr;
-    if (item.lines && item.lines.length > 0) {
-      return item.lines.map(lineToStr).join('\n');
-    }
-    if (item.rawPdfLines && item.rawPdfLines.length > 0) return item.rawPdfLines.join('\n');
-    return item.str || item.text || '';
+    let raw = '';
+    if (existingEdit && existingEdit.newStr) raw = existingEdit.newStr;
+    else if (item.lines && item.lines.length > 0) {
+      raw = item.lines.map(lineToStr).join('\n');
+    } else if (item.rawPdfLines && item.rawPdfLines.length > 0) raw = item.rawPdfLines.join('\n');
+    else raw = item.str || item.text || '';
+    return raw.replace(/\u00AD/g, '');
   }, [existingEdit, item]);
 
   const rawInitialStr = getInitialText();
@@ -594,6 +603,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const textRef = useRef(initialStr);
   const selectionRef = useRef({ start: initialStr.length, end: initialStr.length });
   const isTypingRef = useRef(false);
+  // ── Single-source-of-truth char attribute model ──────────────────────────
+  // Seeded once at mount from parseCharMetadata; thereafter spliced on each
+  // keystroke in the onChange handler. NEVER re-parsed after mount.
+  const charMetaRef = useRef(initialParsed.charMeta);
 
   const canvasRef = useRef(null);
   const textareaRef = useRef(null);
@@ -672,12 +685,16 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const fontCandidates = [
     item.fontPostScriptName,
     stripSubset(item.fontPostScriptName),
+    sanitizeFontName(stripSubset(item.fontPostScriptName)),
     item.fontName,
     stripSubset(item.fontName),
+    sanitizeFontName(stripSubset(item.fontName)),
     item.font,
     stripSubset(item.font),
+    sanitizeFontName(stripSubset(item.font)),
     firstCharFont,
     stripSubset(firstCharFont),
+    sanitizeFontName(stripSubset(firstCharFont)),
   ].filter(Boolean);
   const uniqueCandidates = [...new Set(fontCandidates)];
   const sanitizedCandidates = uniqueCandidates.map(sanitizeFontName);
@@ -808,7 +825,8 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    * measures character X offsets, and calculates dual-baseline vertical positions.
    */
   const computeLineLayout = useCallback((ctx) => {
-    const { charMeta } = parseCharMetadata(text, initialRanges, origLines);
+    // Use the authoritative charMeta ref — never re-parse from text after mount.
+    const charMeta = charMetaRef.current;
     
     const baseFontSizePt = item.fontSize + (fontSizeAdj / scale);
     // Font specs
@@ -1329,7 +1347,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
             yTop: lineObj.yTop,
             yBaseline: lineObj.yBaseline,
             lineHeightPt: lineObj.lineHeightPt,
-            lineIndex: lineIdx
+            lineIndex: lineIdx,
+            // Run-aware caret metadata
+            kind: cm.kind || 'normal',
+            charFontSize: cm.pdfSize || null,
           };
         }
       });
@@ -1383,7 +1404,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const nativeDpr = window.devicePixelRatio || 1;
     const dpr = Math.min(nativeDpr * SUPERSAMPLE_FACTOR, MAX_EFFECTIVE_DPR);
     return { lines, baseFont, superFont, ascenderPx, lineHeightPt, globalCharMap, dpr };
-  }, [text, initialRanges, origLines, item, scale, fontSizeAdj, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h, initialLinesText]);
+  }, [text, item, scale, fontSizeAdj, currentFontFamily, isBold, isItalic, blockAlign, getOrigLineBounds, r.h, initialLinesText]);
 
   /**
    * Sequential X-Advance Tracking & Superscript Y-Elevation rendering per line
@@ -1587,14 +1608,27 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
       // 6. Blinking Caret Bar (2 CSS pixels wide = 2 / scale PDF points)
       if (isFocused && selection.start === selection.end && caretVisible) {
-        const targetOffset = selection.start;
-        const caretPos = (layout.globalCharMap && layout.globalCharMap[targetOffset])
-          ? layout.globalCharMap[targetOffset]
-          : (layout.globalCharMap ? layout.globalCharMap[layout.globalCharMap.length - 1] : null);
-
-        if (caretPos) {
-          ctx.fillStyle = color || '#000000';
-          ctx.fillRect(caretPos.x, caretPos.yTop, 2 / scale, caretPos.lineHeightPt);
+        const pos = layout.globalCharMap[selection.start] ?? layout.globalCharMap.at(-1);
+        if (pos) {
+          const baseFontPt = item.fontSize + (fontSizeAdj / scale);
+          const isSup = pos.kind === 'super' || pos.kind === 'sub';
+          // Run-sized font string for measuring the caret's actual ascent/descent
+          const runPt = isSup ? (pos.charFontSize || baseFontPt * 0.65) : baseFontPt;
+          const rise  = pos.kind === 'super' ? baseFontPt * 0.30
+                      : pos.kind === 'sub'   ? -baseFontPt * 0.10
+                      : 0;
+          ctx.font = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${runPt}px ${currentFontFamily}`;
+          let asc = runPt * 0.75;
+          let desc = runPt * 0.20;
+          try {
+            const m = ctx.measureText('|');
+            if (m.actualBoundingBoxAscent != null && !isNaN(m.actualBoundingBoxAscent)) {
+              asc  = m.actualBoundingBoxAscent;
+              desc = m.actualBoundingBoxDescent ?? runPt * 0.20;
+            }
+          } catch { /* keep estimates */ }
+          ctx.fillStyle = color || '#000';
+          ctx.fillRect(pos.x, pos.yBaseline - rise - asc, 2 / scale, asc + desc);
         }
       }
     } catch (err) {
@@ -1602,7 +1636,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
       onCancel();
       return;
     }
-  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj, cssW, onCancel]);
+  }, [r.w, r.h, computeLineLayout, selection, drawCanvasLine, color, isFocused, caretVisible, item.pdfY, onHeightChange, scale, item.fontSize, fontSizeAdj, cssW, onCancel, isItalic, isBold, currentFontFamily]);
 
   useLayoutEffect(() => {
     renderCanvas();
@@ -1793,9 +1827,11 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
    */
   const handleCommit = () => {
     const cleanText = sanitizeForCommit(text);
-    const origLines = item?.origLines || (Array.isArray(item?.lines) && item.lines[0]?.chars ? item.lines : null) || item?.blockData?.origLines;
-    const { charMeta } = parseCharMetadata(text, initialRanges, origLines);
-    const newRanges = extractRangesFromCharMeta(charMeta);
+    // Use the authoritative charMeta model — never re-parse from text.
+    const newRanges = extractRangesFromCharMeta(charMetaRef.current);
+    if (process.env.NODE_ENV !== 'production') {
+      console.debug('[CanvasInlineEditor commit]', cleanText, newRanges);
+    }
 
     const canvas = canvasRef.current;
     let computedLines = [];
@@ -1805,7 +1841,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     onCommit(
       cleanText,
-      { fontSizeAdj, color, fontFamily, isBold, isItalic, lines: computedLines },
+      { fontSizeAdj, color, fontFamily, isBold, isItalic, lines: computedLines, align: blockAlign },
       newRanges
     );
   };
@@ -1979,18 +2015,73 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           isTypingRef.current = true;
           const newText = e.target.value;
           const newStart = e.target.selectionStart;
-          const newEnd = e.target.selectionEnd;
+          const newEnd   = e.target.selectionEnd;
 
-          textRef.current = newText;
+          // ── Splice charMeta parallel array (keeps attribute model authoritative) ──
+          // Compute common prefix p and suffix window so we know what changed.
+          const old = textRef.current;
+          const neu = newText;
+          let p = 0;
+          while (p < old.length && p < neu.length && old[p] === neu[p]) p++;
+          let so = old.length, sn = neu.length;
+          while (so > p && sn > p && old[so - 1] === neu[sn - 1]) { so--; sn--; }
+
+          const oldMeta = charMetaRef.current;
+          const leftMeta  = p > 0 ? oldMeta[p - 1] : null;
+          const rightMeta = so < old.length ? oldMeta[so] : null;
+          const leftKind  = leftMeta?.kind  ?? 'normal';
+          const rightKind = rightMeta?.kind ?? 'normal';
+
+          // Characters that plausibly extend a citation run: digits + citation separators.
+          const CIT_CHAR = /[0-9,.\-–—]/;
+
+          // Build inserted meta sequentially so multi-char pastes evaluate left-to-right.
+          const inserted = [];
+          let prevKind = leftKind;
+          let prevMeta = leftMeta;
+          for (const ch of neu.slice(p, sn)) {
+            let kind = 'normal';
+            let color = undefined;
+            let pdfSize = undefined;
+
+            const strictlyInside =
+              (prevKind === 'super' || prevKind === 'sub') && prevKind === rightKind;
+
+            // NEW — run-END continuation: caret at the end of a super/sub run extends
+            // the run, but only for citation-class characters (prevents format bleed
+            // into body text typed immediately after a citation).
+            const tailExtend =
+              (prevKind === 'super' || prevKind === 'sub') &&
+              prevKind !== rightKind &&
+              CIT_CHAR.test(ch) &&
+              prevMeta?.origChar != null &&
+              CIT_CHAR.test(prevMeta.origChar);
+
+            if (strictlyInside || tailExtend) {
+              kind = prevKind;
+              color = prevMeta?.color;
+              pdfSize = prevMeta?.pdfSize;
+            }
+            const meta = { origChar: ch, displayChar: ch, kind, color, pdfSize, charIndex: 0 };
+            inserted.push(meta);
+            prevKind = kind;
+            prevMeta = meta;
+          }
+
+          charMetaRef.current = [
+            ...oldMeta.slice(0, p),
+            ...inserted,
+            ...oldMeta.slice(so),
+          ].map((m, i) => ({ ...m, charIndex: i }));
+
+          textRef.current    = newText;
           selectionRef.current = { start: newStart, end: newEnd };
 
           setText(newText);
           setSelection({ start: newStart, end: newEnd });
           setCaretVisible(true);
 
-          requestAnimationFrame(() => {
-            isTypingRef.current = false;
-          });
+          requestAnimationFrame(() => { isTypingRef.current = false; });
         }}
         onSelect={e => {
           if (isTypingRef.current || isProgrammaticSelectionRef.current) return;
