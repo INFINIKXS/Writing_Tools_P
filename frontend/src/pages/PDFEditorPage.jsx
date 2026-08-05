@@ -1,34 +1,34 @@
-import React, { useState, useCallback, useRef, useMemo, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useMemo, useEffect, useSyncExternalStore } from 'react';
 import Toolbar from '../components/PDFEditor/Toolbar';
 import RightPanel from '../components/PDFEditor/RightPanel';
 import PDFViewer from '../components/PDFEditor/Viewer';
+import GlobalFormatToolbar from '../components/PDFEditor/GlobalFormatToolbar';
 import { applyTextAnnotations } from '../utils/pdfModifier';
 import { pdfEditStore, activeFileId } from '../stores/pdfEditStore';
 import { pdfTypographyStore } from '../stores/pdfTypographyStore';
+import { subscribe as subscribeActiveEditor, getDirtySnapshot } from '../stores/activeEditorStore';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────────
 class PDFErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false };
+  state = { hasError: false, error: null };
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
   }
-  static getDerivedStateFromError() { return { hasError: true }; }
-  componentDidCatch(error, info) { console.error('PDF render error caught by boundary:', error, info); }
+  componentDidCatch(error, info) {
+    console.error('PDFViewer Error Boundary caught:', error, info);
+  }
   render() {
     if (this.state.hasError) {
       return (
-        <div className="flex items-center justify-center h-full text-slate-400">
-          <div className="text-center p-8">
-            <div className="text-5xl mb-4 opacity-30">⚠️</div>
-            <p className="text-lg font-semibold mb-2 text-slate-300">PDF failed to render</p>
-            <p className="text-sm text-slate-500 mb-6">An unexpected error occurred in the PDF viewer.</p>
-            <button
-              className="text-sm underline text-blue-400 hover:text-blue-300 transition-colors"
-              onClick={() => this.setState({ hasError: false })}
-            >
-              Try again
-            </button>
-          </div>
+        <div className="flex flex-col items-center justify-center h-full p-8 text-center bg-white dark:bg-[#111] text-slate-800 dark:text-slate-200">
+          <h2 className="text-lg font-bold text-rose-600 mb-2">PDF Viewer Error</h2>
+          <p className="text-sm text-slate-500 mb-4 max-w-md">{this.state.error?.message || 'An unexpected error occurred rendering the PDF.'}</p>
+          <button
+            onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg font-semibold hover:bg-purple-700 text-xs transition-all"
+          >
+            Retry Viewer
+          </button>
         </div>
       );
     }
@@ -38,7 +38,7 @@ class PDFErrorBoundary extends React.Component {
 
 export default function PDFEditorPage({ initialToolId = null }) {
   const [currentFile, setCurrentFile] = useState(null);
-  const [fileBytes, setFileBytes] = useState(null);
+  const [_fileBytes, setFileBytes] = useState(null);
   const [scale, setScale] = useState(1.0);
   const [spacingData, setSpacingData] = useState(null);
 
@@ -57,6 +57,12 @@ export default function PDFEditorPage({ initialToolId = null }) {
   const objectUrlRef = useRef(null);
   const prevLiveUrlRef = useRef(null);
   const [fontWarnings, setFontWarnings] = useState([]);
+
+  // ── bakeAll: ref populated by PDFViewer via onBakeAllReady ───────────────
+  const bakeAllRef = useRef(null);
+
+  // Reactively subscribe to dirty staged edits for Done button enabled state
+  const hasStaged = useSyncExternalStore(subscribeActiveEditor, getDirtySnapshot);
 
   // ── Active tool & settings ────────────────────────────────────────────────
   // activeTool: 'select' | 'text' | 'highlight' | 'draw' | 'shape' | 'eraser' | 'sticky' | 'image' | 'signature'
@@ -198,7 +204,7 @@ export default function PDFEditorPage({ initialToolId = null }) {
       setCurrentFile(newUrl);
       setFileBytes(bakedBytes);
       setLivePreviewUrl(null);
-    } catch (err) { console.error('Live preview error:', err); } finally { setIsLiveBaking(false); }
+    } catch (err) { console.error('Live preview error:', err); throw err; } finally { setIsLiveBaking(false); }
   }, [currentFile]);
 
   const handleAddText = () => {
@@ -340,15 +346,15 @@ export default function PDFEditorPage({ initialToolId = null }) {
       {/* Center: top bar + PDF canvas */}
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         {/* Top bar */}
-        <div className="flex items-center justify-between px-5 py-2 border-b border-slate-200 dark:border-white/8 bg-white dark:bg-[#111] shrink-0 gap-4">
-          <span className="text-sm font-semibold text-slate-700 dark:text-white truncate max-w-xs">
+        <div className="flex items-center justify-between px-5 py-2.5 border-b border-slate-200 dark:border-neutral-800 bg-white dark:bg-[#111] shrink-0 gap-4">
+          <span className="text-sm font-bold text-slate-800 dark:text-slate-100 truncate max-w-xs">
             {currentFile
               ? (typeof currentFile === 'string' ? 'Edited Document' : currentFile.name)
               : 'No file loaded — open a PDF to begin'}
           </span>
           {isLiveBaking && (
-            <span className="flex items-center gap-1.5 text-xs text-blue-600 dark:text-blue-400 font-medium shrink-0">
-              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+            <span className="flex items-center gap-1.5 text-xs text-blue-700 dark:text-blue-400 font-semibold shrink-0">
+              <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
               </svg>
@@ -356,28 +362,55 @@ export default function PDFEditorPage({ initialToolId = null }) {
             </span>
           )}
           {isAnalyzing && !isLiveBaking && (
-            <span className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400 font-medium shrink-0">
-              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+            <span className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400 font-semibold shrink-0">
+              <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
               </svg>
               Analyzing document…
             </span>
           )}
+
+          {/* Global format toolbar — operates on the active CanvasInlineEditor */}
+          <div className="flex-1 flex justify-center">
+            <GlobalFormatToolbar />
+          </div>
+
           <div className="flex items-center gap-2 ml-auto shrink-0">
             <button
               onClick={() => setScale(s => Math.max(0.4, s - 0.25))}
-              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-white/5 border border-slate-300 dark:border-white/10 text-slate-800 dark:text-white text-sm font-bold hover:bg-slate-200 dark:hover:bg-white/10 transition-all"
+              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center"
+              title="Zoom out"
             >−</button>
-            <span className="text-xs font-mono text-slate-600 dark:text-neutral-400 min-w-[44px] text-center">{Math.round(scale * 100)}%</span>
+            <span className="text-xs font-mono font-bold text-slate-700 dark:text-slate-200 min-w-[44px] text-center">{Math.round(scale * 100)}%</span>
             <button
               onClick={() => setScale(s => s + 0.25)}
-              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-white/5 border border-slate-300 dark:border-white/10 text-slate-800 dark:text-white text-sm font-bold hover:bg-slate-200 dark:hover:bg-white/10 transition-all"
+              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center"
+              title="Zoom in"
             >+</button>
+
+            {/* Done — bakes all staged edits at once */}
+            <button
+              onClick={() => bakeAllRef.current?.()}
+              disabled={!hasStaged || isLiveBaking}
+              className={`ml-1 px-3.5 py-1.5 rounded-xl text-sm font-bold transition-all ${
+                hasStaged && !isLiveBaking
+                  ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-md active:scale-95 cursor-pointer'
+                  : 'bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-400 dark:text-neutral-500 shadow-none cursor-not-allowed'
+              }`}
+              title="Bake all staged paragraph edits"
+            >
+              ✓ Done
+            </button>
+
             <button
               onClick={handleFinishAndExport}
               disabled={!currentFile}
-              className="ml-2 px-4 py-1.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 text-white text-sm font-bold shadow-md hover:from-purple-700 hover:to-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+              className={`ml-1 px-4 py-1.5 rounded-xl text-sm font-bold transition-all ${
+                currentFile
+                  ? 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white shadow-md active:scale-95 cursor-pointer'
+                  : 'bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-400 dark:text-neutral-500 shadow-none cursor-not-allowed'
+              }`}
             >
               ✓ Finish &amp; Export
             </button>
@@ -403,6 +436,7 @@ export default function PDFEditorPage({ initialToolId = null }) {
               toolSettings={toolSettings}
               onAddCanvasAnnotation={addCanvasAnnotation}
               onDeleteCanvasAnnotation={deleteCanvasAnnotation}
+              onBakeAllReady={(fn) => { bakeAllRef.current = fn; }}
             />
           </PDFErrorBoundary>
         </div>

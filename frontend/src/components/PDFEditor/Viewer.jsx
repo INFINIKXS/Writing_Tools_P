@@ -9,6 +9,7 @@ import { useSyncExternalStore } from 'react';
 import { pdfEditStore, activeFileId } from '../../stores/pdfEditStore';
 import { pdfTypographyStore } from '../../stores/pdfTypographyStore';
 import { loadPDFFonts } from '../../utils/pdfFontLoader';
+import { setActiveEditor, getEditorApi } from '../../stores/activeEditorStore';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -277,6 +278,9 @@ export default function PDFViewer({
   toolSettings = {},
   onAddCanvasAnnotation,
   onDeleteCanvasAnnotation,
+  // Phase 1: bakeAll callback — parent (PDFEditorPage) calls this when Done is pressed.
+  // We expose it via the onBakeAll prop so PDFEditorPage can wire it to the Done button.
+  onBakeAllReady,
 }) {
   const [numPages, setNumPages] = useState(null);
   // Drawing state for canvas annotation tools
@@ -304,6 +308,89 @@ export default function PDFViewer({
 
   const [fileGeneration, setFileGeneration] = useState(0);
   const scrollContainerRef = useRef(null);
+
+  // ─── bakeAll: dirty-gating + keep canvases open through the bake ───────────
+  // Called by PDFEditorPage when the Done button is pressed.
+  const bakeAll = async () => {
+    const staged = stagedEditorsRef.current;
+    if (!staged || staged.size === 0) return;
+
+    const allKeys = [...staged.keys()];
+    const dirtyKeys = [];
+    const cleanKeys = [];
+
+    for (const key of allKeys) {
+      const api = getEditorApi(key);
+      if (api && typeof api.isDirty === 'function' && api.isDirty()) {
+        dirtyKeys.push(key);
+      } else {
+        cleanKeys.push(key);
+      }
+    }
+
+    // 1. Unmount clean editors immediately — NO store write, NO bake payload
+    if (cleanKeys.length > 0) {
+      for (const key of cleanKeys) {
+        const api = getEditorApi(key);
+        if (api && typeof api.close === 'function') api.close();
+      }
+      setStagedEditors(prev => {
+        const next = new Map(prev);
+        cleanKeys.forEach(k => next.delete(k));
+        return next;
+      });
+    }
+
+    if (dirtyKeys.length === 0) return; // Skip POST entirely if no dirty editors
+
+    // 2. Commit dirty editors to pdfEditStore (sequential)
+    for (const key of dirtyKeys) {
+      const api = getEditorApi(key);
+      if (api && typeof api.commit === 'function') {
+        api.commit();
+      }
+    }
+
+    // 3. Lock dirty editors (KEEP MOUNTED, read-only, handlers off during bake!)
+    for (const key of dirtyKeys) {
+      const api = getEditorApi(key);
+      if (api && typeof api.setLocked === 'function') {
+        api.setLocked(true);
+      }
+    }
+
+    // 4. Trigger live preview / bake and wait for completion
+    if (onLivePreview) {
+      try {
+        await onLivePreview();
+        // SUCCESS: clear staged editors ONLY AFTER live preview completes!
+        setStagedEditors(prev => {
+          const next = new Map(prev);
+          dirtyKeys.forEach(k => next.delete(k));
+          return next;
+        });
+        setActiveEditor(null);
+        setActiveEditKey(null);
+      } catch (err) {
+        // ERROR: unlock dirty editors so user can continue editing
+        for (const key of dirtyKeys) {
+          const api = getEditorApi(key);
+          if (api && typeof api.setLocked === 'function') {
+            api.setLocked(false);
+          }
+        }
+        console.error('Bake failed:', err);
+      }
+    }
+  };
+
+  // Expose bakeAll to parent via callback prop.
+  // Re-register whenever onBakeAllReady identity changes (only on mount in practice).
+  useEffect(() => {
+    if (onBakeAllReady) onBakeAllReady(bakeAll);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onBakeAllReady]);
+
 
   useEffect(() => {
     // When the file prop changes (new bake arrived), start the loading transition.
@@ -383,7 +470,18 @@ export default function PDFViewer({
   }, [file]);
 
   const [pageMetadata, setPageMetadata] = useState({});
-  const [selectedTextIdx, setSelectedTextIdx] = useState(null);
+
+  // ─── Multi-paragraph staging state ───────────────────────────────────────────
+  // stagedEditors: Map<editKey, { pageNum, itemIdx, item }>
+  // editKey format: "${pageNum}-${itemIdx}" — stable, collision-free.
+  // activeEditKey: the currently focused editor (null when clicking empty canvas).
+  const [stagedEditors, setStagedEditors] = useState(() => new Map());
+  const [activeEditKey, setActiveEditKey] = useState(null);
+
+  // Ref so bakeAll can read the current staged map without stale closure
+  const stagedEditorsRef = useRef(stagedEditors);
+  stagedEditorsRef.current = stagedEditors;
+
   const [activePageNum, setActivePageNum] = useState(null);
 
   // Refs to page container divs — needed for DOM color sampling and span measurement
@@ -1056,6 +1154,13 @@ export default function PDFViewer({
     pdfEditStore.clearEdits(activeFileId);
     setFileGeneration(prev => prev + 1);  // ← SYNCHRONOUS, not in setTimeout
     
+    // Clear any staged editors when a new document loads
+    setStagedEditors(new Map());
+    setActiveEditKey(null);
+    setActiveEditor(null);
+    setActivePageNum(null);
+    setActiveBlockShift(null);
+    
     setPreviousNumPages(n);
     setPreviousFile(file);
     setIsNewDocLoading(false);
@@ -1188,12 +1293,15 @@ export default function PDFViewer({
       ref={scrollContainerRef}
       className="flex flex-col items-center overflow-auto bg-[#000000] p-8 border border-white/5 rounded-xl h-full relative"
       onClick={(e) => {
-        // Do not clear selection if click originated inside an inline editor or canvas
+        // Do not clear active editor if click originated inside an inline editor or canvas
         if (e.target && e.target.closest && (e.target.closest('.canvas-inline-editor') || e.target.closest('canvas'))) {
           return;
         }
         annotations.forEach(a => { if (a.isEditing) onUpdateAnnotation({ ...a, isEditing: false }) });
-        setSelectedTextIdx(null);
+        // Deferred-commit model: clicking empty canvas blurs active editor but does NOT unmount.
+        // Editors stay staged until Done (bakeAll) or X (discard).
+        setActiveEditor(null);
+        setActiveEditKey(null);
       }}
     >
       {/*
@@ -1306,94 +1414,133 @@ export default function PDFViewer({
               />
             )}
 
-            {/* Text hit-testing overlay and inline editor */}
-            {pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && spacingData !== null && (
-              <>
-                {debugMode && (
-                  <DebugOverlay
-                    items={pageMetadata[index + 1].items}
-                    scale={scale}
-                    selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
-                    debugFontWeightCompare={debugFontWeightCompare}
-                  />
-                )}
+                {/* Text hit-testing overlay and inline editors */}
+                {pageMetadata[index + 1]?.items && pageMetadata[index + 1]?.size && spacingData !== null && (() => {
+                  const pageNum = index + 1;
+                  const pageItems = pageMetadata[pageNum].items;
+                  // Build set of item indices that are currently staged on this page.
+                  // TextOverlay uses this to suppress hit-targets for staged items.
+                  const stagedIndicesOnPage = new Set(
+                    [...stagedEditors.entries()]
+                      .filter(([, v]) => v.pageNum === pageNum)
+                      .map(([, v]) => v.itemIdx)
+                  );
 
-                <TextOverlay
-                  items={pageMetadata[index + 1].items}
-                  scale={scale}
-                  selectedIdx={activePageNum === index + 1 ? selectedTextIdx : null}
-                  edits={edits.filter(e => e.pageNum === index + 1)}
-                  fontsLoaded={fontsLoaded}
-                  activeBlockShift={activePageNum === index + 1 ? activeBlockShift : null}
-                  onSelect={(idx) => {
-                    setSelectedTextIdx(idx);
-                    setActivePageNum(index + 1);
-                  }}
-                />
-
-                {activePageNum === index + 1 && selectedTextIdx !== null && pageMetadata[index + 1].items[selectedTextIdx] && (() => {
-                  const item = pageMetadata[index + 1].items[selectedTextIdx];
                   return (
-                    <CanvasInlineEditor
-                      key={`${activePageNum}-${selectedTextIdx}-${item.str}`}
-                      item={item}
-                      scale={scale}
-                      existingEdit={edits.find(e => e.pageNum === index + 1 && e.nodeIndex === selectedTextIdx)}
-                      onHeightChange={(activePdfY, deltaH) => {
-                        setActiveBlockShift(prev => {
-                          if (
-                            prev &&
-                            prev.pageNum === index + 1 &&
-                            prev.activePdfY === activePdfY &&
-                            Math.abs(prev.deltaH - deltaH) < 0.5
-                          ) {
-                            return prev; // bail out — same reference, no re-render triggered
-                          }
-                          return { pageNum: index + 1, activePdfY, deltaH };
-                        });
-                      }}
-                      onCommit={(newVal, formatOptions, newSuperscriptRanges) => {
-                        const origItem = pageMetadata[index + 1].items[selectedTextIdx];
-                        pdfEditStore.commitEdit(activeFileId, {
-                          pageNum: index + 1,
-                          origStr: origItem.str,
-                          newStr: newVal,
-                          lines: formatOptions.lines || [],
-                          origin_y: origItem.pdfY_base,
-                          ascender_h: origItem.ascender_h,
-                          descender_h: origItem.descender_h,
-                          rect: {
-                            x: origItem.pdfX,
-                            y: origItem.pdfY_top,
-                            w: origItem.pdfW,
-                            h: origItem.pdfH
-                          },
-                          origFontSize: origItem.fontSize,
-                          fontSizeAdj: formatOptions.fontSizeAdj,
-                          fontName: origItem.fontName,
-                          color: formatOptions.color,
-                          customFontFamily: formatOptions.fontFamily,
-                          isBold: formatOptions.isBold,
-                          isItalic: formatOptions.isItalic,
-                          isParagraph: origItem.isParagraph || false,
-                          lineCount: origItem.lineCount || 1,
-                          nodeIndex: selectedTextIdx,
-                          // CanvasInlineEditor produces fresh superscriptRanges
-                          superscriptRanges: newSuperscriptRanges || [],
-                        });
-                        setSelectedTextIdx(null);
-                        setActiveBlockShift(null);
-                        if (onLivePreview) setTimeout(onLivePreview, 0);
-                      }}
-                      onCancel={() => {
-                        setSelectedTextIdx(null);
-                        setActiveBlockShift(null);
-                      }}
-                    />
+                    <>
+                      {debugMode && (
+                        <DebugOverlay
+                          items={pageItems}
+                          scale={scale}
+                          selectedIdx={null}
+                          debugFontWeightCompare={debugFontWeightCompare}
+                        />
+                      )}
+
+                      <TextOverlay
+                        items={pageItems}
+                        scale={scale}
+                        stagedIndices={stagedIndicesOnPage}
+                        edits={edits.filter(e => e.pageNum === pageNum)}
+                        fontsLoaded={fontsLoaded}
+                        activeBlockShift={activeBlockShift?.pageNum === pageNum ? activeBlockShift : null}
+                        onSelect={(idx) => {
+                          const key = `${pageNum}-${idx}`;
+                          const item = pageItems[idx];
+                          if (!item) return;
+                          // Stage this editor if not already staged
+                          setStagedEditors(prev => {
+                            if (prev.has(key)) return prev;
+                            const next = new Map(prev);
+                            next.set(key, { pageNum, itemIdx: idx, item });
+                            return next;
+                          });
+                          // Activate this editor (blur any previous)
+                          setActiveEditor(key);
+                          setActiveEditKey(prev => (prev === key ? prev : key));
+                          setActivePageNum(pageNum);
+                        }}
+                      />
+
+                      {/* Render ALL staged editors that belong to this page */}
+                      {[...stagedEditors.entries()]
+                        .filter(([, v]) => v.pageNum === pageNum)
+                        .map(([key, { itemIdx, item }]) => (
+                          <CanvasInlineEditor
+                            key={key}
+                            editKey={key}
+                            item={item}
+                            scale={scale}
+                            isActive={activeEditKey === key}
+                            existingEdit={edits.find(e => e.pageNum === pageNum && e.nodeIndex === itemIdx)}
+                            onActivate={() => {
+                              setActiveEditor(key);
+                              setActiveEditKey(prev => (prev === key ? prev : key));
+                            }}
+                            onHeightChange={(activePdfY, deltaH) => {
+                              setActiveBlockShift(prev => {
+                                if (
+                                  prev &&
+                                  prev.pageNum === pageNum &&
+                                  prev.activePdfY === activePdfY &&
+                                  Math.abs(prev.deltaH - deltaH) < 0.5
+                                ) {
+                                  return prev;
+                                }
+                                return { pageNum, activePdfY, deltaH };
+                              });
+                            }}
+                            onCommit={(newVal, formatOptions, newSuperscriptRanges) => {
+                              const origItem = pageItems[itemIdx];
+                              // Sequential commit: each editor writes its own pdfEditStore entry.
+                              // pdfEditStore.commitEdit pushes a separate undo snapshot per call.
+                              pdfEditStore.commitEdit(activeFileId, {
+                                pageNum,
+                                origStr: origItem.str,
+                                newStr: newVal,
+                                lines: formatOptions.lines || [],
+                                origin_y: origItem.pdfY_base,
+                                ascender_h: origItem.ascender_h,
+                                descender_h: origItem.descender_h,
+                                rect: {
+                                  x: origItem.pdfX,
+                                  y: origItem.pdfY_top,
+                                  w: origItem.pdfW,
+                                  h: origItem.pdfH
+                                },
+                                origFontSize: origItem.fontSize,
+                                fontSizeAdj: formatOptions.fontSizeAdj,
+                                fontName: origItem.fontName,
+                                color: formatOptions.color,
+                                customFontFamily: formatOptions.fontFamily,
+                                isBold: formatOptions.isBold,
+                                isItalic: formatOptions.isItalic,
+                                isParagraph: origItem.isParagraph || false,
+                                lineCount: origItem.lineCount || 1,
+                                nodeIndex: itemIdx,
+                                superscriptRanges: newSuperscriptRanges || [],
+                              });
+                              setActiveBlockShift(null);
+                            }}
+                            onCancel={() => {
+                              // Discard = remove from staged, no pdfEditStore write
+                              setStagedEditors(prev => {
+                                const next = new Map(prev);
+                                next.delete(key);
+                                return next;
+                              });
+                              if (activeEditKey === key) {
+                                setActiveEditKey(null);
+                                setActiveEditor(null);
+                              }
+                              setActiveBlockShift(null);
+                            }}
+                          />
+                        ))
+                      }
+                    </>
                   );
                 })()}
-              </>
-            )}
 
             {/* Draggable free-form annotations */}
             {annotations.filter(a => a.pageIndex === index).map(ann => (

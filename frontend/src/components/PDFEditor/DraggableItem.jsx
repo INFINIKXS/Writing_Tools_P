@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect } from 'react';
 export function DraggableItem({
   item,
   index,
-  selectedIdx,
+  isStaged,
   hasEdit,
   scale,
   r,
@@ -89,14 +89,14 @@ export function DraggableItem({
         height: boxHeight,
         cursor: fontsLoaded ? (isDragging ? 'grabbing' : (hasEdit ? 'grab' : 'text')) : 'wait',
         pointerEvents: 'all',
-        backgroundColor: hasEdit || selectedIdx === index ? 'white' : 'transparent',
+        backgroundColor: hasEdit || isStaged ? 'white' : 'transparent',
         display: 'flex',
         alignItems: 'baseline',
         transform: `translate(${xOffset}px, ${yOffset}px)`,
         userSelect: 'none', // Prevent text selection highlight during drag
       }}
       className={`box-border transition-all duration-150 rounded-[3px] ${
-        selectedIdx === index
+        isStaged
           ? 'opacity-0 pointer-events-none'
           : hasEdit
             ? 'border border-blue-400 bg-white hover:border-blue-600 shadow-sm cursor-pointer'

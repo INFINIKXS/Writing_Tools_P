@@ -25,10 +25,10 @@ function TooltipButton({ children, label, isActive, disabled, onClick }) {
         disabled={disabled}
         className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-150 ${
           disabled
-            ? 'opacity-30 cursor-not-allowed text-slate-400 dark:text-neutral-600'
+            ? 'opacity-40 cursor-not-allowed text-slate-300 dark:text-neutral-700'
             : isActive
               ? 'bg-purple-600/20 text-purple-700 dark:text-purple-400 border border-purple-500/40 shadow-inner'
-              : 'text-slate-500 dark:text-neutral-400 hover:bg-slate-100 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'
+              : 'text-slate-700 dark:text-neutral-300 hover:bg-slate-100 dark:hover:bg-white/10 hover:text-slate-900 dark:hover:text-white'
         }`}
       >
         {children}

@@ -4,6 +4,12 @@ import { SUPER_MAP, UNICODE_SUPER_MAP, UNICODE_SUB_MAP } from './superscriptUtil
 import { pdfTypographyStore } from '../../stores/pdfTypographyStore';
 import { activeFileId } from '../../stores/pdfEditStore';
 import { getFontStemVwRatio } from '../../utils/pdfFontLoader';
+import {
+  registerEditor,
+  unregisterEditor,
+  setActiveEditor,
+  pushState,
+} from '../../stores/activeEditorStore';
 
 const rgbToHex = (colorStr) => {
   if (colorStr == null) return '#000000';
@@ -535,7 +541,7 @@ const extractColor = (item) => {
   return '#000000';
 };
 
-export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange }) {
+export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange, editKey, isActive = true, onActivate }) {
   const getInitialText = useCallback(() => {
     let raw = '';
     if (existingEdit && existingEdit.newStr) raw = existingEdit.newStr;
@@ -597,6 +603,47 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const [fontFamily, setFontFamily] = useState(() => existingEdit?.customFontFamily || 'Original');
   const [isBold, setIsBold] = useState(() => (existingEdit ? existingEdit.isBold : detectBold(item)));
   const [isItalic, setIsItalic] = useState(() => (existingEdit ? existingEdit.isItalic : detectItalic(item)));
+  const [isLocked, setIsLocked] = useState(false);
+
+  // Pristine initial state captured once at mount for dirty checking
+  const initialRef = useRef(null);
+  if (initialRef.current === null) {
+    const initNormText = sanitizeForCommit(initialStr);
+    const initColor = existingEdit?.color || extractColor(item);
+    const initFontFamily = existingEdit?.customFontFamily || 'Original';
+    const initBold = existingEdit ? existingEdit.isBold : detectBold(item);
+    const initItalic = existingEdit ? existingEdit.isItalic : detectItalic(item);
+    const initSuperStr = JSON.stringify(initialRanges || []);
+
+    initialRef.current = {
+      text: initNormText,
+      color: initColor,
+      fontFamily: initFontFamily,
+      isBold: !!initBold,
+      isItalic: !!initItalic,
+      fontSizeAdj: existingEdit ? existingEdit.fontSizeAdj : 0,
+      supers: initSuperStr,
+    };
+  }
+
+  const isDirty = useCallback(() => {
+    const init = initialRef.current;
+    if (!init) return false;
+
+    const currentNormText = sanitizeForCommit(textRef.current || text);
+    const currentRanges = extractRangesFromCharMeta(charMetaRef.current);
+    const currentSuperStr = JSON.stringify(currentRanges || []);
+
+    const textChanged = currentNormText !== init.text;
+    const colorChanged = color !== init.color;
+    const fontChanged = fontFamily !== init.fontFamily;
+    const boldChanged = !!isBold !== init.isBold;
+    const italicChanged = !!isItalic !== init.isItalic;
+    const sizeChanged = fontSizeAdj !== init.fontSizeAdj;
+    const supersChanged = currentSuperStr !== init.supers;
+
+    return textChanged || colorChanged || fontChanged || boldChanged || italicChanged || sizeChanged || supersChanged;
+  }, [color, fontFamily, isBold, isItalic, fontSizeAdj, text]);
 
   const [keyboardOffset, setKeyboardOffset] = useState(0);
 
@@ -757,24 +804,25 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     }
   }, [selection.start, selection.end, text, isFocused]);
 
-  // ── Document-level mousedown: industry-standard "click outside" commit ──────────────
-  // ProseMirror, Fabric.js, Konva.js all use this pattern instead of onBlur.
-  // Reason: clicking the canvas (non-focusable) fires blur with relatedTarget=null,
-  // making it impossible to distinguish a caret reposition from a true exit.
-  // document mousedown (capture phase) fires BEFORE focus changes, giving us
-  // reliable containment checks while keeping the textarea focused.
+  // ── Document-level mousedown: blur-only (deferred commit model) ─────────────────────
+  // In multi-paragraph staging mode, clicking outside does NOT commit the edit.
+  // The editor stays mounted until the user presses Done (bakeAll) or X (discard).
+  // We only update the active-editor registry so the GlobalFormatToolbar switches
+  // to reflect the newly focused paragraph (or clears when clicking empty canvas).
+  // The actual commit is handled by bakeAll in Viewer → PDFEditorPage.
   useEffect(() => {
     const handleDocMouseDown = (e) => {
       const container = editorContainerRef.current;
       if (!container) return;
-      // If click is inside any editor element, keep editing
+      // Click inside this editor's DOM — keep it focused, no action needed.
       if (container.contains(e.target)) return;
-      // Click is outside — commit and exit
-      if (handleCommitRef.current) handleCommitRef.current();
+      // Click is outside this editor — just update focus state visually.
+      // Do NOT commit. The editor stays mounted.
+      setIsFocused(false);
     };
     document.addEventListener('mousedown', handleDocMouseDown, true /* capture */);
     return () => document.removeEventListener('mousedown', handleDocMouseDown, true);
-  }, []); // empty deps: stable via handleCommitRef
+  }, []); // stable — only updates local isFocused state
 
   // Blinking Caret Timer (500ms cycle)
   useEffect(() => {
@@ -1719,6 +1767,10 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     setSelection({ start: offset, end: offset });
     setCaretVisible(true);
 
+    // Signal Viewer that THIS editor should become the active one.
+    // Viewer will call setActiveEditor(editKey) on the store.
+    if (onActivate) onActivate();
+
     if (textareaRef.current) {
       isProgrammaticSelectionRef.current = true;
       // setTimeout(0): defer focus() until AFTER the mousedown event cycle.
@@ -1747,7 +1799,7 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     const focusOffset = getCharOffsetFromPoint(clickX, clickY);
     const anchor = dragAnchorRef.current;
 
-    const selStart = Math.min(anchor, focusOffset);
+const selStart = Math.min(anchor, focusOffset);
     const selEnd = Math.max(anchor, focusOffset);
 
     setSelection({ start: selStart, end: selEnd });
@@ -1761,16 +1813,47 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     isDraggingRef.current = false;
   };
 
+  useEffect(() => {
+    const handleDocMouseDown = (e) => {
+      if (isLocked) return;
+      const container = editorContainerRef.current;
+      if (!container) return;
+      // Click inside this editor's DOM — keep it focused, no action needed.
+      if (container.contains(e.target)) return;
+      // Click is outside this editor — just update focus state visually.
+      // Do NOT commit. The editor stays mounted.
+      setIsFocused(false);
+    };
+    document.addEventListener('mousedown', handleDocMouseDown, true /* capture */);
+    return () => document.removeEventListener('mousedown', handleDocMouseDown, true);
+  }, [isLocked]); // stable — only updates local isFocused state
+
+  // Blinking Caret Timer (500ms cycle)
+  useEffect(() => {
+    if (!isFocused || selection.start !== selection.end) {
+      setCaretVisible(false);
+      return;
+    }
+    const timer = setInterval(() => {
+      setCaretVisible(v => !v);
+    }, 500);
+    return () => clearInterval(timer);
+  }, [isFocused, selection.start, selection.end]);
+
   /**
    * Keydown Event Handling for offscreen textarea
    */
   const handleKeyDown = (e) => {
     e.stopPropagation();
+    if (isLocked) {
+      e.preventDefault();
+      return;
+    }
     setCaretVisible(true);
 
     if (e.key === 'Escape') {
       e.preventDefault();
-      onCancel();
+      if (!isLocked) onCancel();
       return;
     }
 
@@ -1823,7 +1906,12 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   };
 
   /**
-   * Commit Edit Payload to pdfEditStore & Parent Callback
+   * Commit Edit Payload to pdfEditStore & Parent Callback.
+   * In the deferred-commit model this is only called by:
+   *   1. bakeAll (via api.commit) — to gather all staged edits
+   *   2. Escape key (via onCancel) — to discard
+   *   3. Keyboard blur with relatedTarget !== null (Tab key exit)
+   * It is NOT called on outside-click or paragraph-switch.
    */
   const handleCommit = () => {
     const cleanText = sanitizeForCommit(text);
@@ -1849,120 +1937,56 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   // Keep handleCommitRef pointing at the latest handleCommit (avoid stale closure in document listener)
   useEffect(() => { handleCommitRef.current = handleCommit; });
 
+  // ── activeEditorStore registration ────────────────────────────────────────
+  // Register editor API ONCE on mount via a stable ref.
+  // Push state to activeEditorStore only when formatting values change.
+  const apiRef = useRef(null);
+  apiRef.current = {
+    applyBold:     () => !isLocked && setIsBold(v => !v),
+    applyItalic:   () => !isLocked && setIsItalic(v => !v),
+    setColor:      (hex) => !isLocked && setColor(hex),
+    setSizeAdj:    (delta) => !isLocked && setFontSizeAdj(v => v + delta),
+    setFontFamily: (name) => !isLocked && setFontFamily(name),
+    focus:         () => !isLocked && textareaRef.current?.focus(),
+    discard:       () => { if (!isLocked) onCancel(); },
+    commit:        () => handleCommitRef.current?.(),
+    isDirty:       () => isDirty(),
+    setLocked:     (b) => setIsLocked(b),
+    close:         () => { if (!isLocked) onCancel(); },
+  };
+
+  useEffect(() => {
+    if (!editKey) return;
+    registerEditor(editKey, apiRef);
+    return () => unregisterEditor(editKey);
+  }, [editKey]);
+
+  useEffect(() => {
+    if (!editKey) return;
+    pushState(editKey, {
+      fontFamily,
+      isFontEmbeddedAndActive,
+      size: item.fontSize + fontSizeAdj,
+      color,
+      isBold,
+      isItalic,
+      dirty: isDirty(),
+      isLocked,
+    });
+  }, [editKey, fontFamily, isFontEmbeddedAndActive, item.fontSize, fontSizeAdj, color, isBold, isItalic, isDirty, isLocked, text]);
+
   return (
     // Zero-footprint wrapper div: needed so document.mousedown outside-click
     // detection can use container.contains(e.target) for all editor children.
     // display:contents makes the div invisible to CSS layout (no positioning
     // context created), so children remain positioned relative to the Viewer
     // page container — exactly as they were in the Fragment.
+    // NOTE: The per-editor floating toolbar has been removed. Formatting controls
+    // now live in the GlobalFormatToolbar in the top bar (§1.3 of Phase 1 spec).
     <div
       ref={editorContainerRef}
       style={{ display: 'contents' }}
     >
-      {/* Floating Toolbar Controls */}
-      <div
-        style={{
-          position: 'absolute',
-          left: r.x,
-          top: Math.max(0, r.y - 70 - keyboardOffset),
-          zIndex: 102,
-          width: 'max-content'
-        }}
-        className="flex flex-col bg-white border border-gray-300 rounded-md shadow-lg pointer-events-auto divide-y divide-gray-200"
-        onPointerDown={e => e.preventDefault()}
-        onMouseDown={e => e.preventDefault()}
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="px-2 py-1 text-[10px] bg-gray-50 rounded-t-md flex items-center justify-between gap-3">
-          <span className="font-mono text-gray-600">Font: {stripSubset(item.fontPostScriptName || item.fontName) || 'Default'}</span>
-          {isFontEmbeddedAndActive ? (
-            <span className="px-1.5 py-0.5 text-[9px] font-semibold text-emerald-700 bg-emerald-100 border border-emerald-300 rounded flex items-center gap-1" title="Using exact embedded font from PDF file">
-              ✓ Embedded
-            </span>
-          ) : (
-            <span className="px-1.5 py-0.5 text-[9px] font-semibold text-amber-700 bg-amber-100 border border-amber-300 rounded flex items-center gap-1" title="Using browser fallback font">
-              ⚠ Fallback
-            </span>
-          )}
-          <span className="text-gray-500">{Math.round(item.fontSize)}px</span>
-        </div>
-        <div className="flex gap-1 p-1 items-center">
-          <select
-            value={fontFamily}
-            onChange={e => setFontFamily(e.target.value)}
-            className="text-xs border border-gray-300 rounded px-1 py-1 outline-none hover:border-blue-400"
-            onPointerDown={e => e.stopPropagation()}
-          >
-            {FONTS.map(f => (
-              <option key={f} value={f}>{f}</option>
-            ))}
-          </select>
-
-          <input
-            type="color"
-            value={color}
-            onChange={e => setColor(e.target.value)}
-            className="w-6 h-6 p-0 border-0 rounded cursor-pointer"
-            title="Text Color"
-            onPointerDown={e => e.stopPropagation()}
-          />
-
-          <div className="w-px h-4 bg-gray-300 mx-1"></div>
-
-          <button
-            onClick={() => setIsBold(!isBold)}
-            className={`w-6 h-6 flex items-center justify-center text-sm font-bold rounded ${isBold ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100'}`}
-            title="Bold"
-            onPointerDown={e => e.preventDefault()}
-          >
-            B
-          </button>
-          <button
-            onClick={() => setIsItalic(!isItalic)}
-            className={`w-6 h-6 flex items-center justify-center text-sm italic rounded ${isItalic ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100'}`}
-            title="Italic"
-            onPointerDown={e => e.preventDefault()}
-          >
-            I
-          </button>
-
-          <div className="w-px h-4 bg-gray-300 mx-1"></div>
-
-          <button
-            onClick={() => setFontSizeAdj(v => v - 1)}
-            className="px-1.5 py-1 text-xs font-semibold hover:bg-gray-100 rounded"
-            title="Smaller"
-            onPointerDown={e => e.preventDefault()}
-          >
-            A-
-          </button>
-          <button
-            onClick={() => setFontSizeAdj(v => v + 1)}
-            className="px-1.5 py-1 text-xs font-semibold hover:bg-gray-100 rounded"
-            title="Larger"
-            onPointerDown={e => e.preventDefault()}
-          >
-            A+
-          </button>
-
-          <div className="w-px h-4 bg-gray-300 mx-1"></div>
-
-          <button
-            onClick={handleCommit}
-            className="px-2 py-1 text-xs text-blue-600 font-medium hover:bg-blue-50 rounded"
-            onPointerDown={e => e.preventDefault()}
-          >
-            Done
-          </button>
-          <button
-            onClick={onCancel}
-            className="px-2 py-1 text-xs text-gray-500 hover:bg-red-50 hover:text-red-600 rounded"
-            onPointerDown={e => e.preventDefault()}
-          >
-            ✕
-          </button>
-        </div>
-      </div>
 
       {/* Solid White Coverage Rectangle hiding underlying PDF text */}
       <div
@@ -1994,22 +2018,32 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           width: `${cssW}px`,
           height: `${cssH_initial}px`,
           zIndex: 100,
-          cursor: 'text',
-          outline: '1px dashed rgba(148, 163, 184, 0.8)',
+          cursor: isLocked ? 'default' : 'text',
+          // Active editors get a solid blue dashed outline; staged-but-inactive editors
+          // get a dimmed outline so users can see which paragraphs are staged.
+          outline: isLocked
+            ? '1.5px solid rgba(59, 130, 246, 0.5)'
+            : isActive
+              ? '1.5px dashed rgba(59, 130, 246, 0.9)'
+              : '1px dashed rgba(148, 163, 184, 0.35)',
           outlineOffset: '-1px',
           backgroundColor: '#ffffff',
           transform: keyboardOffset ? `translateY(${-keyboardOffset}px)` : undefined,
           willChange: 'transform',
           contain: 'strict',
+          // Dimmed opacity for staged-but-not-active paragraphs
+          opacity: isActive ? 1 : 0.85,
+          pointerEvents: isLocked ? 'none' : undefined,
         }}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
+        onPointerDown={isLocked ? undefined : handlePointerDown}
+        onPointerMove={isLocked ? undefined : handlePointerMove}
+        onPointerUp={isLocked ? undefined : handlePointerUp}
       />
 
       {/* Hidden Offscreen Textarea Bridge */}
       <textarea
         ref={textareaRef}
+        readOnly={isLocked}
         defaultValue={textRef.current}
         onChange={e => {
           isTypingRef.current = true;
@@ -2105,15 +2139,9 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
           const related = e.relatedTarget;
           const container = editorContainerRef.current;
           if (related && container && container.contains(related)) return;
-          // True focus exit via keyboard — commit.
-          // Mouse-triggered exits are handled by the document mousedown listener above.
-          if (related !== null) {
-            setIsFocused(false);
-            handleCommit();
-          }
-          // related === null means a canvas click triggered this blur.
-          // The document mousedown listener will handle commit if needed.
-          // Just update visual state.
+          // Deferred-commit model: NEVER commit on blur, whether from keyboard or mouse.
+          // Editors stay mounted with their local state until Done (bakeAll) or Escape (discard).
+          // Just update the visual caret state.
           setIsFocused(false);
         }}
         autoCapitalize="off"

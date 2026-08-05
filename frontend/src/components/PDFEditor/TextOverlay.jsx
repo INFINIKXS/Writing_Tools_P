@@ -48,7 +48,7 @@ function ScaledTextSpan({ text, origText, fontFamily, fontSize, fontWeight, font
   );
 }
 
-export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], fontsLoaded = true, activeBlockShift = null }) {
+export function TextOverlay({ items, scale, stagedIndices = new Set(), onSelect, edits = [], fontsLoaded = true, activeBlockShift = null }) {
   if (!items || items.length === 0) return null;
 
   return (
@@ -66,13 +66,16 @@ export function TextOverlay({ items, scale, selectedIdx, onSelect, edits = [], f
 
         const boxTop = r.y + shiftY;
         const boxHeight = r.h;
+        // Item is staged if a CanvasInlineEditor is currently mounted for it.
+        // Staged items have their hit-target hidden so clicks go to the canvas editor.
+        const isStaged = stagedIndices.has(i);
 
         return (
           <DraggableItem
             key={i}
             item={item}
             index={i}
-            selectedIdx={selectedIdx}
+            isStaged={isStaged}
             hasEdit={hasEdit}
             scale={scale}
             r={r}
