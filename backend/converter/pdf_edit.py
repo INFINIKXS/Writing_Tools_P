@@ -7,14 +7,56 @@ import math
 from typing import Optional
 from fastapi import APIRouter, UploadFile, Form, File, HTTPException
 from fastapi.responses import StreamingResponse
-from .font_utils import get_font_for_edit, _find_missing_glyphs
+from .font_utils import (
+    get_font_for_edit,
+    _find_missing_glyphs,
+    build_doc_glyph_index,
+    root_family,
+    canonical_family,
+    family_match,
+    cover_for,
+    prepare_for_insert,  # ← Step 2: bake-path font preparation
+    standin_size_scale,  # ← Step 4: x-height calibrated scaling
+)
+from .font_vault import _font_id, vault_full_for, vault_set_alias, vault_cover_for, resolve_promotion_target
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+MANUAL_SIZE_SCALE = {}   # e.g. {"librebaskerville": 0.90} — overrides computed ratio
+
 # Module-level: prevents PyMuPDF from using max ascender/descender heights,
 # which cause redaction boxes to bleed into adjacent lines.
 fitz.TOOLS.set_small_glyph_heights(True)
+
+
+def _log_font_canary(fontname: str, buf: bytes, fontsize: float):
+    """Pre-insert canary: logs font metrics before handing to MuPDF.
+    Diagnoses fontsize/metrics divergence causing 'oversized' or 'glued' text."""
+    try:
+        from fontTools.ttLib import TTFont
+        import io as _io
+        tt = TTFont(_io.BytesIO(buf))
+        upm = tt["head"].unitsPerEm
+        space_adv = tt["hmtx"].metrics.get("space", (0, 0))[0]
+        space_pt = (space_adv / upm) * fontsize if upm > 0 else 0.0
+        logger.info(
+            f"[CANARY] font={fontname!r} bufsize={len(buf)} upm={upm} "
+            f"space_advance={space_adv} space@{fontsize}pt={space_pt:.2f}"
+        )
+    except Exception as e:
+        logger.warning(f"[CANARY] failed for {fontname!r}: {e}")
+
+
+def _safe_insert_font(page, fontname, buf, fontsize):
+    """Wraps page.insert_font to ensure buffer is prepared and metrics are logged.
+    Safely skips preparation for Base-14 fonts (which have no/little buffer)."""
+    if buf and len(buf) > 64:
+        prepared = prepare_for_insert(buf)
+        _log_font_canary(fontname, prepared, fontsize)
+        page.insert_font(fontname=fontname, fontbuffer=prepared)
+    else:
+        page.insert_font(fontname=fontname, fontbuffer=buf)
 
 # Expand Unicode ligature codepoints to their component characters.
 # rawdict always reports ligatures as separate chars (e.g. 'f','i' not 'fi'),
@@ -92,6 +134,225 @@ def _span_runs_in_rect(page: fitz.Page, rect: fitz.Rect) -> list:
 
     runs.sort(key=lambda r: (r["line_y"], r["x"]))
     return runs
+
+
+def _normalize_color_rgb(color_val, default_color=(0.0, 0.0, 0.0)):
+    """
+    Robustly converts color input into a (r, g, b) float tuple in 0.0–1.0 range.
+    Supports hex strings ('#RRGGBB', 'RRGGBB', '#RGB'), 'rgb(r,g,b)', int, or tuple/list.
+    """
+    if color_val is None:
+        return _normalize_color_rgb(default_color)
+    if isinstance(color_val, str):
+        c_str = color_val.strip()
+        if c_str.startswith("#"):
+            c_str = c_str.lstrip("#")
+            if len(c_str) == 3:
+                c_str = "".join(ch * 2 for ch in c_str)
+            if len(c_str) == 6:
+                try:
+                    return (
+                        int(c_str[0:2], 16) / 255.0,
+                        int(c_str[2:4], 16) / 255.0,
+                        int(c_str[4:6], 16) / 255.0,
+                    )
+                except ValueError:
+                    pass
+        elif c_str.startswith("rgb") or c_str.startswith("RGB"):
+            import re
+            m = re.findall(r'\d+', c_str)
+            if len(m) >= 3:
+                return (
+                    min(1.0, max(0.0, int(m[0]) / 255.0)),
+                    min(1.0, max(0.0, int(m[1]) / 255.0)),
+                    min(1.0, max(0.0, int(m[2]) / 255.0)),
+                )
+        elif len(c_str) == 6:
+            try:
+                return (
+                    int(c_str[0:2], 16) / 255.0,
+                    int(c_str[2:4], 16) / 255.0,
+                    int(c_str[4:6], 16) / 255.0,
+                )
+            except ValueError:
+                pass
+    elif isinstance(color_val, (tuple, list)) and len(color_val) == 3:
+        r, g, b = color_val
+        r_f = float(r) if float(r) <= 1.0 else float(r) / 255.0
+        g_f = float(g) if float(g) <= 1.0 else float(g) / 255.0
+        b_f = float(b) if float(b) <= 1.0 else float(b) / 255.0
+        return (min(1.0, max(0.0, r_f)), min(1.0, max(0.0, g_f)), min(1.0, max(0.0, b_f)))
+    elif isinstance(color_val, int):
+        r = ((color_val >> 16) & 255) / 255.0
+        g = ((color_val >> 8) & 255) / 255.0
+        b = (color_val & 255) / 255.0
+        return (r, g, b)
+
+import hashlib
+
+def _font_id(buf: bytes) -> str:
+    return hashlib.sha256(buf).hexdigest()[:16] if buf else ""
+
+
+def _resolve_primary_buffer(plan, font_buffer_map):
+    if plan.get("font_id") and plan["font_id"] in font_buffer_map:
+        return font_buffer_map[plan["font_id"]]
+    fam = canonical_family(plan.get("fontname") or "")
+    for k, v in font_buffer_map.items():
+        if v and family_match(canonical_family(k), fam):
+            return v
+    return None
+
+def _primary_bad_chars(font_obj, buf, text):
+    """Ink-probe every unique char against the primary buffer or font_obj."""
+    from .font_utils import _glyph_has_ink
+    bad = set()
+    for ch in dict.fromkeys(text):
+        if ch.isspace():
+            continue
+        if buf is not None:
+            try:
+                if not _glyph_has_ink(buf, ch):
+                    bad.add(ch)
+                continue
+            except Exception:
+                pass
+        try:
+            if font_obj and not font_obj.has_glyph(ord(ch)):
+                bad.add(ch)
+        except Exception:
+            bad.add(ch)
+    return bad
+
+
+def _build_glyph_resolver(doc, font_buffer_map, primary_name, missing_chars):
+    """ch -> (fontname, fitz.Font). Order: sibling subset in doc -> vault -> (caller falls back)."""
+    resolver = {}
+    if not missing_chars:
+        return resolver
+    idx = build_doc_glyph_index(doc)
+    fam = root_family(primary_name)
+    for ch in missing_chars:
+        source_tier = "SCAVENGE"
+        hit = cover_for(idx, fam, ch)
+        if not hit:
+            hit = vault_cover_for(fam, ch)
+            if hit:
+                source_tier = "VAULT"
+        if not hit:
+            logger.debug(f"VAULT-MISS: {ch!r} not found for family {fam!r} (primary={primary_name!r})")
+            continue
+        basename, buf = hit
+        font_buffer_map.setdefault(basename, buf)
+        try:
+            resolver[ch] = (basename, fitz.Font(fontbuffer=buf))
+            logger.debug(f"{source_tier}: {ch!r} served by {basename}")
+        except Exception:
+            pass
+    return resolver
+
+
+def _build_run_candidates(fam, want_style, font_buffer_map):
+    """Fixed reference set for EVERY bake: paragraph family fonts first,
+    vault full font last as universal catch-all (the bake-1 stand-in)."""
+    cands, seen = [], set()
+    for name, buf in list(font_buffer_map.items()):
+        if not buf or len(buf) <= 64: continue
+        if not family_match(canonical_family(name), fam): continue
+        bid = _font_id(buf)
+        if bid in seen: continue
+        seen.add(bid)
+        try: cands.append((name, fitz.Font(fontbuffer=buf), buf))
+        except Exception: pass
+    t = resolve_promotion_target(fam, want_style)
+    if t is None:
+        leg = vault_full_for(fam, want_style)
+        t = (leg[0], leg[1], fam) if leg else None
+    if t and _font_id(t[1]) not in seen:
+        try: cands.append((t[0], fitz.Font(fontbuffer=t[1]), t[1]))
+        except Exception: pass
+    return cands
+
+_RUN_FONT_CACHE = {}
+def _pick_run_font(text, candidates):
+    """First candidate whose ink-probe covers EVERY char of the run;
+    last candidate (vault full) is the guaranteed fallback."""
+    key = (tuple(_font_id(c[2]) for c in candidates), text)
+    if key in _RUN_FONT_CACHE: return _RUN_FONT_CACHE[key]
+    for name, fo, buf in candidates:
+        if not _find_missing_glyphs(fo, text, font_buffer=buf):
+            _RUN_FONT_CACHE[key] = (name, fo, buf); return name, fo, buf
+    name, fo, buf = candidates[-1]
+    _RUN_FONT_CACHE[key] = (name, fo, buf); return name, fo, buf
+
+
+def _pick_verified_promotion(candidates, bad_chars):
+    """Return (name, buffer, font_obj, still_missing) for the FIRST candidate whose
+    buffer verifiably covers ALL bad chars; if none is perfect, the candidate with
+    the best coverage that improves on zero. Never returns an unverified target."""
+    if not bad_chars:
+        return None
+    bad_set = set(bad_chars)
+    text = "".join(dict.fromkeys(bad_chars))
+    best = None
+    for name, buf in candidates:
+        if not name:
+            continue
+        try:
+            fo = fitz.Font(fontbuffer=buf) if buf else fitz.Font(fontname=name)
+        except Exception:
+            logger.debug(f"GATE: cannot load candidate {name!r}")
+            continue
+        missing = set(_find_missing_glyphs(fo, text, font_buffer=buf)) & bad_set
+        covered = len(bad_set) - len(missing)
+        if missing:
+            logger.warning(f"GATE: rejected {name!r} (still missing {sorted(missing)})")
+        if best is None or covered > best[4]:
+            best = (name, buf, fo, missing, covered)
+        if not missing:          # perfect cover — stop searching
+            break
+    if best is None or best[4] <= 0:
+        return None              # no candidate improves coverage → no promotion
+    name, buf, fo, missing, covered = best
+    return name, buf, fo, missing
+
+
+def _emit_layout_manifest(page, manifest, plan, font_buffer_map,
+                          primary_fontname, font_obj, candidates):
+    """
+    Canva-style absolute placement. Paints each run at its exact (x, baselineY)
+    instead of re-wrapping. Justification / word spacing / superscript baselines
+    are already baked into the coordinates by the frontend canvas engine.
+    """
+    emitted = 0
+    for run in manifest:
+        text = run.get("text", "")
+        if not text:
+            continue
+        try:
+            x = float(run["x"])
+            y = float(run["baselineY"])
+            size = float(run.get("fontSize") or plan["fontsize"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        color = _normalize_color_rgb(run.get("color"), plan["color"])
+
+        is_space_run = text.strip() == ""
+        if is_space_run or not candidates:
+            fn, fo, fbuf = primary_fontname, font_obj, None
+        else:
+            fn, fo, fbuf = _pick_run_font(text, candidates)
+        if fbuf is not None and fn != primary_fontname:
+            pb = font_buffer_map.get(primary_fontname) or (candidates[0][2] if candidates else None)
+            if pb:
+                scale_f = MANUAL_SIZE_SCALE.get(canonical_family(fn)) or standin_size_scale(pb, fbuf)
+                size = round(size * scale_f, 2)
+        logger.info(f"[EMIT] run={text[:18]!r} font={fn!r} fontsize={size}pt x={x:.1f}")
+        page.insert_text(fitz.Point(x, y), text, fontname=fn, fontsize=size, color=color)
+        emitted += 1
+
+    logger.info(f"LAYOUT-MANIFEST EMIT: {emitted} positioned run(s) on page {page.number + 1}")
 
 
 def _build_styled_chars(runs: list, orig_text: str, new_text: str, default_fontsize: float = 11.0, default_color=(0, 0, 0)) -> list:
@@ -512,24 +773,27 @@ def _find_change_range(orig: str, new: str):
     return prefix_len, orig_end, new_end
 
 
-def get_universal_fallback_font(fontname: str = "") -> tuple[str, Optional[bytes]]:
+def get_universal_fallback_font(
+    fontname: str = "", prefer_bold: Optional[bool] = None, prefer_italic: Optional[bool] = None
+) -> tuple[str, Optional[bytes]]:
     """
     Return (fontname, fontbuffer) using pymupdf_fonts (FiraGO / Noto Sans / Ubuntu)
     for universal Unicode coverage, falling back to Base-14.
-
-    pymupdf_fonts v1.0.5 verified codes (use .myfont(code) -> bytes):
-      figo/figbo/figit/figbi  - FiraGO (widest Unicode sans-serif)
-      notos/notosbo/notosit/notosbi - Noto Sans
-      ubuntu/ubuntubo/ubuntuit/ubuntubi
-      spacemo/spacembo/spacemit/spacembi - Space Mono (monospaced)
-      cascadia/cascadiai/cascadiab/cascadiabi - Cascadia Code
     """
     if not isinstance(fontname, str):
         fontname = str(fontname) if fontname is not None else ""
     fname_lower = fontname.lower()
 
-    is_bold   = any(k in fname_lower for k in ("bold", "-bd", "semibold", "heavy"))
-    is_italic = any(k in fname_lower for k in ("italic", "oblique", "-it"))
+    if prefer_bold is not None:
+        is_bold = prefer_bold
+    else:
+        is_bold = any(k in fname_lower for k in ("bold", "-bd", "semibold", "heavy"))
+
+    if prefer_italic is not None:
+        is_italic = prefer_italic
+    else:
+        is_italic = any(k in fname_lower for k in ("italic", "oblique", "-it"))
+
     is_mono   = any(k in fname_lower for k in ("courier", "mono", "consolas", "code", "cascadia"))
     is_serif  = any(k in fname_lower for k in ("times", "roman", "serif", "baskerville", "garamond"))
 
@@ -617,7 +881,7 @@ def _check_font_buf_missing_glyphs(font_buf: Optional[bytes], text: str) -> list
         return []
     try:
         f = fitz.Font(fontbuffer=font_buf)
-        return _find_missing_glyphs(f, text)
+        return list(_find_missing_glyphs(f, text, font_buffer=font_buf))
     except Exception as e:
         logger.debug(f"Glyph check failed for font buffer: {e}")
         return []
@@ -698,6 +962,8 @@ async def apply_edits(
                 "super_ranges": edit.get("superscriptRanges", []) or [],
                 "new_text": new_text,
                 "lines": lines,
+                "is_bold": edit.get("isBold", False),
+                "is_italic": edit.get("isItalic", False),
             }
 
             # ── Paragraph-Block Edit Handling (PDFgear / WPS Office Parity) ──────
@@ -713,8 +979,25 @@ async def apply_edits(
                     max(0, x0 - 2), max(0, y0 - 2),
                     x0 + edit["rect"]["w"] + 2, y0 + edit["rect"]["h"] + 2
                 )
+                mb = edit.get("manifestBbox")
+                if isinstance(mb, dict):
+                    try:
+                        mb_rect = fitz.Rect(float(mb["x0"]), float(mb["y0"]), float(mb["x1"]), float(mb["y1"]))
+                        mb_rect.x0 = max(mb_rect.x0, x0 - 2)
+                        mb_rect.x1 = min(mb_rect.x1, x0 + edit["rect"]["w"] + 2)
+                        erase_rect = erase_rect | fitz.Rect(
+                            mb_rect.x0 - 2, mb_rect.y0 - 2,
+                            mb_rect.x1 + 2, mb_rect.y1 + 2,
+                        )
+                    except Exception as e:
+                        logger.warning(f"manifestBbox expansion failed: {e}")
+
                 plan["erase_rects"].append(erase_rect)
                 plan["is_paragraph_op"] = True
+                plan["is_bold"] = bool(edit.get("isBold"))
+                plan["is_italic"] = bool(edit.get("isItalic"))
+                plan["origStr"] = orig_text  # Preserve original text for novel-char detection
+                plan["layout_manifest"] = edit.get("layoutManifest") or []
                 plan["paragraph_rect"] = fitz.Rect(
                     x0, y0,
                     x0 + edit["rect"]["w"], y0 + edit["rect"]["h"] + 10
@@ -724,10 +1007,12 @@ async def apply_edits(
                 plan["fontsize"] = fontsize
                 plan["color"] = insert_color
                 if font_result.font_buffer:
+                    buf_id = _font_id(font_result.font_buffer)
+                    plan["font_id"] = buf_id
                     plan["font_registrations"][font_result.fontname] = font_result.font_buffer
+                    plan["font_registrations"][buf_id] = font_result.font_buffer
                 # ── Run extraction (multi-font groundwork) — Phase 1, pre-redaction ──
                 runs = _span_runs_in_rect(page, erase_rect)
-                plan["runs"] = runs
                 plan["run_font_names"] = sorted({r["font"] for r in runs if r["font"]})
 
                 plan["super_ranges"] = edit.get("superscriptRanges", []) or []
@@ -859,7 +1144,10 @@ async def apply_edits(
 
             # Pre-record font registration for this edit
             if font_result.font_buffer:
+                buf_id = _font_id(font_result.font_buffer)
+                plan["font_id"] = buf_id
                 plan["font_registrations"][font_result.fontname] = font_result.font_buffer
+                plan["font_registrations"][buf_id] = font_result.font_buffer
 
             # ── MINIMAL-DIFF EDITING ─────────────────────────────────────────────
             rawdict_chars = [c for c in (matched_span.get("chars", []) if matched_span else []) if c.get("c") != "\u00AD"]
@@ -1527,7 +1815,10 @@ async def apply_edits(
                         logger.debug(f"  ERASING TEXT: {text_in_rect[:200]!r}")
                 except Exception:
                     pass
-                page.add_redact_annot(rect, fill=bg_color)
+                if all(c >= 0.98 for c in bg_color):
+                    page.add_redact_annot(rect)
+                else:
+                    page.add_redact_annot(rect, fill=bg_color)
         # Apply redactions cleanly with error recovery
         try:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE)
@@ -1549,12 +1840,15 @@ async def apply_edits(
 
         for plan in edit_plans:
             for fontname, font_buffer in list(plan["font_registrations"].items()):
+                if font_buffer:
+                    buf_id = _font_id(font_buffer)
+                    font_buffer_map[buf_id] = font_buffer
                 if fontname not in registered_fonts:
                     try:
                         # insert_font returns the xref integer; the usable alias
                         # is the fontname we passed (PyMuPDF registers it under
                         # that name when fontbuffer is provided).
-                        page.insert_font(fontname=fontname, fontbuffer=font_buffer)
+                        _safe_insert_font(page, fontname, font_buffer, plan.get("fontsize", 10.0))
                         font_tag_map[fontname]    = fontname  # alias == name we gave
                         font_buffer_map[fontname] = font_buffer
                         registered_fonts.add(fontname)
@@ -1567,7 +1861,7 @@ async def apply_edits(
                         registered_fonts.add(fontname)
                         if fallback_buf:
                             try:
-                                page.insert_font(fontname=fallback_name, fontbuffer=fallback_buf)
+                                _safe_insert_font(page, fallback_name, fallback_buf, plan.get("fontsize", 10.0))
                                 logger.debug(f"Phase 2.5: registered fallback '{fallback_name}' ({len(fallback_buf)} bytes)")
                             except Exception as e2:
                                 logger.warning(f"Phase 2.5: fallback insert_font failed: {e2}")
@@ -1590,6 +1884,43 @@ async def apply_edits(
         # ── Phase 3: Insert all new text ──
         for plan in edit_plans:
             if plan.get("is_paragraph_op"):
+                manifest = plan.get("layout_manifest")
+                if manifest:
+                    # Log the manifest's requested fontsize for comparison with canary
+                    manifest_sizes = set(r.get("fontSize") for r in manifest if r.get("fontSize"))
+                    logger.info(f"[MANIFEST] {len(manifest)} runs, sizes={sorted(manifest_sizes)}")
+
+                    font_obj, font_name_actual = _resolve_fitz_font_object(
+                        plan["fontname"], font_buffer_map
+                    )
+                    buf = _resolve_primary_buffer(plan, font_buffer_map)
+                    if buf:
+                        try:
+                            _safe_insert_font(page, plan["fontname"], buf, plan.get("fontsize", 10.0))
+                        except Exception:
+                            pass
+
+                    is_b = plan.get("is_bold", False)
+                    is_i = plan.get("is_italic", False)
+                    fam = canonical_family(plan["fontname"])
+                    want_style = ("bolditalic" if is_b and is_i else "bold" if is_b
+                                  else "italic" if is_i else "regular")
+                    candidates = _build_run_candidates(fam, want_style, font_buffer_map)
+                    for cname, cfo, cbuf in candidates:
+                        try:
+                            _safe_insert_font(page, cname, cbuf, plan.get("fontsize", 10.0))
+                        except Exception:
+                            pass
+                    if candidates:
+                        vault_set_alias(canonical_family(candidates[-1][0]), stand_in_for=fam, style=want_style)
+
+                    _emit_layout_manifest(
+                        page, manifest, plan, font_buffer_map,
+                        font_name_actual, font_obj, candidates
+                    )
+                    logger.info(f"PARAGRAPH MANIFEST INSERT SUCCESS: page {page_num}")
+                    continue  # CRITICAL: MUST continue to skip legacy greedy re-wrap
+
                 lines = plan.get("lines", [])
                 if lines:
                     paragraph_text = "\n".join(lines)
@@ -1687,36 +2018,26 @@ async def apply_edits(
 
                     font_obj, font_name_actual = _resolve_fitz_font_object(plan["fontname"], font_buffer_map)
 
-                    buf = font_buffer_map.get(plan["fontname"]) or font_buffer_map.get(plan["fontname"].split("+")[-1])
+                    buf = _resolve_primary_buffer(plan, font_buffer_map)
                     if buf:
                         try:
-                            page.insert_font(fontname=plan["fontname"], fontbuffer=buf)
+                            _safe_insert_font(page, plan["fontname"], buf, plan.get("fontsize", 10.0))
                         except Exception:
                             pass
 
-                    # ── Glyph coverage guard: subset fonts may lack newly typed chars.
-                    #    insert_text() silently DROPS them; canvas masked them via CSS fallback.
-                    missing_chars = set()
-                    try:
-                        missing_chars = set(_find_missing_glyphs(font_obj, paragraph_text))
-                    except Exception:
-                        missing_chars = set()
-
-                    fb_name, fb_font = None, None
-                    if missing_chars:
-                        logger.warning(
-                            f"RUN-SEG: '{font_name_actual}' lacks glyphs {sorted(missing_chars)} "
-                            f"— registering universal fallback for those chars"
-                        )
-                        fb_name, fb_buf = get_universal_fallback_font(plan["fontname"])
-                        if fb_buf:
-                            try:
-                                page.insert_font(fontname=fb_name, fontbuffer=fb_buf)
-                                font_buffer_map[fb_name] = fb_buf
-                                fb_font = fitz.Font(fontbuffer=fb_buf)
-                            except Exception as e:
-                                logger.warning(f"RUN-SEG: fallback registration failed: {e}")
-                                fb_name, fb_font = None, None
+                    is_b = plan.get("is_bold", False)
+                    is_i = plan.get("is_italic", False)
+                    fam = canonical_family(plan["fontname"])
+                    want_style = ("bolditalic" if is_b and is_i else "bold" if is_b
+                                  else "italic" if is_i else "regular")
+                    candidates = _build_run_candidates(fam, want_style, font_buffer_map)
+                    for cname, cfo, cbuf in candidates:
+                        try:
+                            _safe_insert_font(page, cname, cbuf, plan.get("fontsize", 10.0))
+                        except Exception:
+                            pass
+                    if candidates:
+                        vault_set_alias(canonical_family(candidates[-1][0]), stand_in_for=fam, style=want_style)
 
                     # ── Token stream: split on word/space boundaries, THEN split each
                     #    word at super/sub range boundaries so a glued citation like
@@ -1791,26 +2112,18 @@ async def apply_edits(
                         return total
 
                     def _emit_token(token, x_pos, y_pos):
-                        """Emit one text fragment; switches to fallback font char-by-char
-                        only for glyphs missing from the embedded subset.
-                        Returns the new x cursor position."""
-                        if not fb_name or not any(ch in missing_chars for ch in token["text"]):
-                            page.insert_text(
-                                fitz.Point(x_pos, y_pos), token["text"],
-                                fontname=font_name_actual, fontsize=token["size"], color=token["color"],
-                            )
-                            return x_pos + font_obj.text_length(token["text"], fontsize=token["size"])
-                        cx = x_pos
-                        for ch in token["text"]:
-                            if ch in missing_chars and fb_font is not None:
-                                page.insert_text(fitz.Point(cx, y_pos), ch,
-                                                 fontname=fb_name, fontsize=token["size"], color=token["color"])
-                                cx += fb_font.text_length(ch, fontsize=token["size"])
-                            else:
-                                page.insert_text(fitz.Point(cx, y_pos), ch,
-                                                 fontname=font_name_actual, fontsize=token["size"], color=token["color"])
-                                cx += font_obj.text_length(ch, fontsize=token["size"])
-                        return cx
+                        """Emit one text fragment using whole-token verified font selection."""
+                        if candidates and not token["text"].isspace():
+                            fn, fo, fbuf = _pick_run_font(token["text"], candidates)
+                        else:
+                            fn, fo, fbuf = font_name_actual, font_obj, None
+                        tok_size = token["size"]
+                        if fbuf is not None and fn != font_name_actual:
+                            pb = candidates[0][2] if candidates else None
+                            if pb:
+                                tok_size = round(tok_size * (MANUAL_SIZE_SCALE.get(canonical_family(fn)) or standin_size_scale(pb, fbuf)), 2)
+                        page.insert_text(fitz.Point(x_pos, y_pos), token["text"], fontname=fn, fontsize=tok_size, color=token["color"])
+                        return x_pos + fo.text_length(token["text"], fontsize=tok_size)
 
                     # ── Justification detection (───────────────────────────────────
                     def _detect_justify():
@@ -1937,7 +2250,7 @@ async def apply_edits(
 
                     if buf is not None:
                         try:
-                            page.insert_font(fontname=name, fontbuffer=buf)
+                            _safe_insert_font(page, name, buf, try_size if 'try_size' in dir() else base_fontsize)
                         except Exception as e_font:
                             logger.warning(f"page.insert_font('{name}') failed: {e_font}")
 

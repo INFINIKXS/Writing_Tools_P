@@ -3,7 +3,7 @@ import { pdfToScreen } from '../../utils/pdfCoords';
 import { SUPER_MAP, UNICODE_SUPER_MAP, UNICODE_SUB_MAP } from './superscriptUtils';
 import { pdfTypographyStore } from '../../stores/pdfTypographyStore';
 import { activeFileId } from '../../stores/pdfEditStore';
-import { getFontStemVwRatio } from '../../utils/pdfFontLoader';
+import { getFontStemVwRatio, getVaultManifest } from '../../utils/pdfFontLoader';
 import {
   registerEditor,
   unregisterEditor,
@@ -465,6 +465,11 @@ function parseCharMetadata(rawText, initialRanges = [], origLines = null) {
   }
 
   const cleanText = cleanChars.join('');
+  if (backendChars.length > 0 && cleanChars.length !== rawText.length) {
+    console.warn('[parseCharMetadata] length mismatch — falling back to plain parse',
+      { raw: rawText.length, clean: cleanChars.length });
+    return parseCharMetadata(rawText, initialRanges, null);
+  }
   return { cleanText, charMeta };
 }
 
@@ -541,6 +546,100 @@ const extractColor = (item) => {
   return '#000000';
 };
 
+function buildLayoutManifest(layout, item, opts) {
+  const manifest = [];
+  const blockX = item.pdfX;
+  const blockY = item.pdfY_top;
+  const basePt = opts.baseFontSizePt;
+  let bbox = null;
+
+  const pad = (b) => {
+    if (!bbox) bbox = { ...b };
+    else {
+      bbox.x0 = Math.min(bbox.x0, b.x0);
+      bbox.y0 = Math.min(bbox.y0, b.y0);
+      bbox.x1 = Math.max(bbox.x1, b.x1);
+      bbox.y1 = Math.max(bbox.y1, b.y1);
+    }
+  };
+  const grow = (x, y, size) =>
+    pad({ x0: x, y0: y - size * 0.9, x1: x + size * 0.7, y1: y + size * 0.3 });
+
+  const runFontSize = (cm) => {
+    const isScript = cm.kind === 'super' || cm.kind === 'sub';
+    if (isScript && cm.pdfSize) return cm.pdfSize;
+    if (isScript) return basePt * 0.65;
+    return basePt;
+  };
+  const runBaseline = (cm, line) => {
+    const isSuper = cm.kind === 'super', isSub = cm.kind === 'sub';
+    if ((isSuper || isSub) && line.usesPdfAnchoring &&
+        cm.pdfOriginY != null && line.dominantPdfOriginY != null) {
+      return line.yBaseline - (line.dominantPdfOriginY - cm.pdfOriginY);
+    }
+    if (isSuper) return line.yBaseline - 0.38 * basePt;
+    if (isSub)   return line.yBaseline + 0.15 * basePt;
+    return line.yBaseline;
+  };
+  const styleKey = (cm, baseline, size) => [
+    cm.kind || 'normal',
+    cm.charFont || opts.blockFontName,
+    size,
+    cm.color || opts.defaultColor,
+    baseline.toFixed(2),
+    cm.charIsBold != null ? cm.charIsBold : opts.isBold,
+    cm.charIsItalic != null ? cm.charIsItalic : opts.isItalic,
+  ].join('|');
+
+  for (const line of layout.lines || []) {
+    const lineBaseAbs = Math.round((blockY + line.yBaseline) * 100) / 100;
+    const chars = line.chars || [];
+    const xs = line.charXPositions || [];
+    let run = null;
+    const flush = () => { if (run && run.text) manifest.push(run); run = null; };
+
+    for (let i = 0; i < chars.length; i++) {
+      const cm = chars[i];
+      const rx = xs[i];
+      if (rx == null || !Number.isFinite(rx)) continue;
+
+      const ch = cm.displayChar != null ? cm.displayChar : cm.origChar;
+      const isSpace = cm.origChar === ' ' || cm.origChar === '\u00A0' || ch === ' ' || ch === '\u00A0';
+      const baseline = runBaseline(cm, line);
+      const size = runFontSize(cm);
+      const absX = blockX + rx;
+      let absY;
+      if (cm.kind === 'super' || cm.kind === 'sub') {
+        absY = Math.round((blockY + runBaseline(cm, line)) * 100) / 100;
+      } else {
+        absY = lineBaseAbs;
+      }
+      const fontName = cm.charFont || opts.blockFontName;
+      const color = cm.color || opts.defaultColor;
+
+      if (isSpace) {
+        flush();
+        run = { text: ' ', x: absX, baselineY: absY, fontSize: size, fontName, color, kind: 'normal' };
+        grow(absX, absY, size);
+        flush();
+        continue;
+      }
+
+      const key = styleKey(cm, baseline, size);
+      if (run && run._key === key) {
+        run.text += ch;
+        grow(absX, absY, size);
+      } else {
+        flush();
+        run = { _key: key, text: ch, x: absX, baselineY: absY, fontSize: size, fontName, color, kind: cm.kind || 'normal' };
+        grow(absX, absY, size);
+      }
+    }
+    flush();
+  }
+  return { manifest, bbox };
+}
+
 export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCancel, onHeightChange, editKey, isActive = true, onActivate }) {
   const getInitialText = useCallback(() => {
     let raw = '';
@@ -582,10 +681,29 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
     return { ...item, pdfX: minX, pdfY_top: minY, pdfW: maxX - minX, pdfH: maxY - minY };
   }, [item, origLines]);
 
-  const initialParsed = useMemo(() => {
+  const stagedRef = useRef(false);
+
+  // Parse char metadata ONCE at mount into a ref. Never re-parse on prop changes.
+  const initialParsedRef = useRef(null);
+  if (initialParsedRef.current === null) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.count('charMeta init');
+    }
     const rawInitialRanges = existingEdit ? existingEdit.superscriptRanges || [] : item.superscriptRanges || [];
-    return parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
-  }, [rawInitialStr, existingEdit, item, origLines]);
+    initialParsedRef.current = parseCharMetadata(rawInitialStr, rawInitialRanges, origLines);
+    if (process.env.NODE_ENV !== 'production') {
+      const lineToStr = l => (typeof l === 'string' ? l : l?.text || '');
+      const linesText = (item?.lines || []).map(lineToStr).join('\n');
+      const origText = (origLines || []).flatMap(l => l.chars || []).map(c => c.c).join('');
+      const cleanText = initialParsedRef.current.cleanText;
+      if (cleanText.replace(/\n/g, '') !== origText.replace(/\s/g, '') &&
+          linesText.replace(/\n/g, '') !== cleanText.replace(/\n/g, '')) {
+        console.warn('[CIE] init text diverges from extraction',
+          { clean: cleanText, lines: linesText, orig: origText });
+      }
+    }
+  }
+  const initialParsed = initialParsedRef.current;
   const initialStr = initialParsed.cleanText;
   const initialRanges = useMemo(() => extractRangesFromCharMeta(initialParsed.charMeta), [initialParsed.charMeta]);
   const initialLinesText = useMemo(() => initialStr.split('\n'), [initialStr]);
@@ -644,6 +762,12 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
 
     return textChanged || colorChanged || fontChanged || boldChanged || italicChanged || sizeChanged || supersChanged;
   }, [color, fontFamily, isBold, isItalic, fontSizeAdj, text]);
+
+  useEffect(() => {
+    if (isDirty() || isLocked) {
+      stagedRef.current = true;
+    }
+  }, [isDirty, isLocked]);
 
   const [keyboardOffset, setKeyboardOffset] = useState(0);
 
@@ -748,13 +872,40 @@ export function CanvasInlineEditor({ item, scale, existingEdit, onCommit, onCanc
   const realFontStack = sanitizedCandidates.map(n => `"${n}"`).join(', ');
 
   const isSans = sanitizedCandidates.some(n => /helvetica|arial|sans|gothic|verdana|tahoma|trebuchet|roboto/i.test(n));
-  const fallbackStack = isSans
+  const genericFallback = isSans
     ? 'sans-serif, Arial, "Helvetica Neue", Helvetica'
     : 'serif, "Times New Roman", Georgia';
+
+  const vaultAlias = sanitizedCandidates[0] ? `"${sanitizedCandidates[0]}-Vault"` : null;
+  const fallbackStack = vaultAlias ? `${vaultAlias}, ${genericFallback}` : genericFallback;
 
   const currentFontFamily = fontFamily === 'Original'
     ? (item.renderedFontFamily || (realFontStack ? `${realFontStack}, ${fallbackStack}` : fallbackStack))
     : fontFamily;
+
+  // Lazy vault @font-face injection
+  useEffect(() => {
+    if (!sanitizedCandidates[0]) return;
+    const baseName = sanitizedCandidates[0];
+    const aliasName = `${baseName}-Vault`;
+    getVaultManifest().then(manifest => {
+      if (!manifest) return;
+      // Search manifest by matching root family
+      const rootFam = baseName.replace(/^[A-Z]{6}\+/, '').replace(/[-_](Bold|Italic|Regular|Roman|Bd|It)$/i, '').toLowerCase().trim();
+      const entry = manifest[rootFam];
+      if (entry && entry.full_font) {
+        const filename = entry.full_font.split('/').pop();
+        const fontUrl = `/api/pdf/vault/font/${filename}`;
+        const styleId = `vault-font-${aliasName}`;
+        if (!document.getElementById(styleId)) {
+          const style = document.createElement('style');
+          style.id = styleId;
+          style.textContent = `@font-face { font-family: "${aliasName}"; src: url("${fontUrl}"); }`;
+          document.head.appendChild(style);
+        }
+      }
+    }).catch(() => {});
+  }, [sanitizedCandidates[0]]);
 
   const isFontEmbeddedAndActive = useMemo(() => {
     if (fontFamily !== 'Original') return false;
@@ -1923,16 +2074,61 @@ const selStart = Math.min(anchor, focusOffset);
 
     const canvas = canvasRef.current;
     let computedLines = [];
+    let layoutManifest = [];
+    let manifestBbox = null;
     if (canvas && canvas._layout && canvas._layout.lines) {
       computedLines = canvas._layout.lines.map(l => l.text);
+      const basePt = item.fontSize + (fontSizeAdj / scale);
+      const blockFontName = item.fontPostScriptName || item.fontName || item.font || fontFamily;
+      const res = buildLayoutManifest(canvas._layout, item, {
+        baseFontSizePt: basePt,
+        defaultColor: color,
+        isBold,
+        isItalic,
+        blockFontName,
+      });
+      layoutManifest = res.manifest;
+      manifestBbox = res.bbox;
     }
 
     onCommit(
       cleanText,
-      { fontSizeAdj, color, fontFamily, isBold, isItalic, lines: computedLines, align: blockAlign },
+      {
+        fontSizeAdj,
+        color,
+        fontFamily,
+        isBold,
+        isItalic,
+        lines: computedLines,
+        align: blockAlign,
+        layoutManifest,
+        manifestBbox,
+      },
       newRanges
     );
   };
+
+  const getCanvasSnapshot = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    try {
+      const dataUrl = canvas.toDataURL('image/png');
+      return {
+        key: editKey,
+        pageNum: item?.pageNum != null ? item.pageNum : 1,
+        rect: {
+          x: r.x,
+          y: r.y,
+          w: cssW,
+          h: cssH_initial,
+        },
+        dataUrl,
+      };
+    } catch (e) {
+      console.error('getCanvasSnapshot error:', e);
+      return null;
+    }
+  }, [editKey, item?.pageNum, r.x, r.y, cssW, cssH_initial]);
 
   // Keep handleCommitRef pointing at the latest handleCommit (avoid stale closure in document listener)
   useEffect(() => { handleCommitRef.current = handleCommit; });
@@ -1942,17 +2138,18 @@ const selStart = Math.min(anchor, focusOffset);
   // Push state to activeEditorStore only when formatting values change.
   const apiRef = useRef(null);
   apiRef.current = {
-    applyBold:     () => !isLocked && setIsBold(v => !v),
-    applyItalic:   () => !isLocked && setIsItalic(v => !v),
-    setColor:      (hex) => !isLocked && setColor(hex),
-    setSizeAdj:    (delta) => !isLocked && setFontSizeAdj(v => v + delta),
-    setFontFamily: (name) => !isLocked && setFontFamily(name),
-    focus:         () => !isLocked && textareaRef.current?.focus(),
-    discard:       () => { if (!isLocked) onCancel(); },
-    commit:        () => handleCommitRef.current?.(),
-    isDirty:       () => isDirty(),
-    setLocked:     (b) => setIsLocked(b),
-    close:         () => { if (!isLocked) onCancel(); },
+    applyBold:         () => !isLocked && setIsBold(v => !v),
+    applyItalic:       () => !isLocked && setIsItalic(v => !v),
+    setColor:          (hex) => !isLocked && setColor(hex),
+    setSizeAdj:        (delta) => !isLocked && setFontSizeAdj(v => v + delta),
+    setFontFamily:     (name) => !isLocked && setFontFamily(name),
+    focus:             () => !isLocked && textareaRef.current?.focus(),
+    discard:           () => { if (!isLocked) onCancel(); },
+    commit:            () => handleCommitRef.current?.(),
+    isDirty:           () => isDirty(),
+    setLocked:         (b) => setIsLocked(b),
+    close:             () => { if (!isLocked) onCancel(); },
+    getCanvasSnapshot: () => getCanvasSnapshot(),
   };
 
   useEffect(() => {

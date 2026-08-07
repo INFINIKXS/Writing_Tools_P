@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { flushSync } from 'react-dom';
 import { Document, Page, pdfjs } from 'react-pdf';
+import * as pdfjsLib from 'pdfjs-dist';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import { TextOverlay } from './TextOverlay';
@@ -271,7 +273,7 @@ export default function PDFViewer({
   annotations = [], canvasAnnotations = [],
   spacingData = null,
   onUpdateAnnotation, onDeleteAnnotation,
-  onCanvasClick, isWandActive, onLivePreview,
+  onCanvasClick, isWandActive,
   onUpload,
   // New tool props
   activeTool = 'select',
@@ -281,6 +283,10 @@ export default function PDFViewer({
   // Phase 1: bakeAll callback — parent (PDFEditorPage) calls this when Done is pressed.
   // We expose it via the onBakeAll prop so PDFEditorPage can wire it to the Done button.
   onBakeAllReady,
+  // Injected by parent so bakeAll can atomically swap file + spacing without going through onLivePreview
+  currentSourceFile = null,
+  onDocumentSwap = null, // ({ newUrl, newSpacing, blob }) => void — called inside flushSync
+  onBakePhaseChange = null, // (phase: 'idle'|'preparing'|'slow') => void — drives parent isLiveBaking
 }) {
   const [numPages, setNumPages] = useState(null);
   // Drawing state for canvas annotation tools
@@ -305,12 +311,41 @@ export default function PDFViewer({
   const [debugFontWeightCompare, setDebugFontWeightCompare] = useState(false);
   // Dynamic block vertical cascade shift state
   const [activeBlockShift, setActiveBlockShift] = useState(null);
+  // Double-buffered snapshot overlays for atomic bake swap
+  const [bakeSnapshots, setBakeSnapshots] = useState(new Map());
+
+  // ── Atomic pre-rendered swap state ──────────────────────────────────────────
+  // swapPhase: 'idle' | 'preparing' | 'slow'
+  //   preparing — slow work is running offscreen, old page + locked canvas fully visible
+  //   slow      — >4 s elapsed; translucent veil shown over still-visible old page
+  const [swapPhase, setSwapPhase] = useState('idle');
+
+  // Pre-rendered offscreen canvases keyed by page number.
+  // Viewer consumes them via <AttachedPreRenderCanvas> the moment the document swaps.
+  const pendingCanvasesRef = useRef(new Map());
+
+  // Toast notification
+  const [toastMessage, setToastMessage] = useState(null);
+  const toastTimerRef = useRef(null);
+
+  const showToast = (msg) => {
+    setToastMessage(msg);
+    clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 5000);
+  };
+
+  // Map: pageNumber → DataURL of pre-rendered bitmap (cleared once PDF.js renders that page)
+  const [attachedPreRenders, setAttachedPreRenders] = useState(new Map());
 
   const [fileGeneration, setFileGeneration] = useState(0);
   const scrollContainerRef = useRef(null);
 
-  // ─── bakeAll: dirty-gating + keep canvases open through the bake ───────────
-  // Called by PDFEditorPage when the Done button is pressed.
+  // ─── bakeAll: atomic pre-rendered swap ──────────────────────────────────────
+  // Rule 1: Nothing is torn down until the replacement bitmap is ready.
+  // Rule 2: Slow work runs offscreen over the still-visible old page + locked canvas.
+  // Rule 3: Viewer attaches pre-rendered bitmaps so there is never a blank page.
+  // Rule 4: If prep > 4 s, show translucent spinner veil (never blank boxes).
+  // Rule 5: On failure, unlock editors over old doc; edits are not lost.
   const bakeAll = async () => {
     const staged = stagedEditorsRef.current;
     if (!staged || staged.size === 0) return;
@@ -343,7 +378,20 @@ export default function PDFViewer({
 
     if (dirtyKeys.length === 0) return; // Skip POST entirely if no dirty editors
 
-    // 2. Commit dirty editors to pdfEditStore (sequential)
+    // 2. Capture pixel-perfect screen snapshots BEFORE committing / locking
+    const snapshots = new Map();
+    for (const key of dirtyKeys) {
+      const api = getEditorApi(key);
+      if (api && typeof api.getCanvasSnapshot === 'function') {
+        const snap = api.getCanvasSnapshot();
+        if (snap) {
+          snapshots.set(key, snap);
+        }
+      }
+    }
+    setBakeSnapshots(snapshots);
+
+    // 3. Commit dirty editors to pdfEditStore (sequential)
     for (const key of dirtyKeys) {
       const api = getEditorApi(key);
       if (api && typeof api.commit === 'function') {
@@ -351,7 +399,7 @@ export default function PDFViewer({
       }
     }
 
-    // 3. Lock dirty editors (KEEP MOUNTED, read-only, handlers off during bake!)
+    // 4. Lock dirty editors (KEEP MOUNTED, read-only, handlers off during bake!)
     for (const key of dirtyKeys) {
       const api = getEditorApi(key);
       if (api && typeof api.setLocked === 'function') {
@@ -359,28 +407,144 @@ export default function PDFViewer({
       }
     }
 
-    // 4. Trigger live preview / bake and wait for completion
-    if (onLivePreview) {
-      try {
-        await onLivePreview();
-        // SUCCESS: clear staged editors ONLY AFTER live preview completes!
-        setStagedEditors(prev => {
-          const next = new Map(prev);
-          dirtyKeys.forEach(k => next.delete(k));
-          return next;
-        });
-        setActiveEditor(null);
-        setActiveEditKey(null);
-      } catch (err) {
-        // ERROR: unlock dirty editors so user can continue editing
+    // 5. Old page + locked canvas stay fully visible. Start preparing phase.
+    setSwapPhase('preparing');
+
+    // Watchdog: if preparation takes > 4 s, show translucent veil.
+    const watchdog = setTimeout(() => setSwapPhase('slow'), 4000);
+
+    try {
+      // ── 6. Build the baked PDF blob ─────────────────────────────────────────
+      const inlineEdits = pdfEditStore.getEdits(activeFileId);
+      if (inlineEdits.length === 0) {
+        // Nothing to bake — just unlock and reset
+        clearTimeout(watchdog);
         for (const key of dirtyKeys) {
           const api = getEditorApi(key);
-          if (api && typeof api.setLocked === 'function') {
-            api.setLocked(false);
-          }
+          if (api && typeof api.setLocked === 'function') api.setLocked(false);
         }
-        console.error('Bake failed:', err);
+        setBakeSnapshots(new Map());
+        setSwapPhase('idle');
+        return;
       }
+
+      // Resolve the source file blob
+      let sourceBlob;
+      const src = currentSourceFile;
+      if (src instanceof Blob || src instanceof File) {
+        sourceBlob = src;
+      } else if (typeof src === 'string') {
+        const r = await fetch(src);
+        sourceBlob = await r.blob();
+      } else if (src instanceof ArrayBuffer) {
+        sourceBlob = new Blob([src], { type: 'application/pdf' });
+      } else {
+        throw new Error('bakeAll: no valid currentSourceFile provided');
+      }
+
+      const applyFd = new FormData();
+      applyFd.append('file', new File([sourceBlob], 'document.pdf', { type: 'application/pdf' }));
+      applyFd.append('edits', JSON.stringify(inlineEdits));
+      const applyRes = await fetch('http://127.0.0.1:8000/api/pdf/apply-edits', { method: 'POST', body: applyFd });
+      if (!applyRes.ok) throw new Error(`apply-edits failed: ${applyRes.status}`);
+
+      // Handle font warnings from bake response
+      const warningsHeader = applyRes.headers.get('X-Font-Warnings');
+      if (warningsHeader) {
+        try {
+          const pw = JSON.parse(decodeURIComponent(warningsHeader));
+          if (pw && pw.length > 0) console.warn('[bakeAll] font warnings:', pw);
+        } catch (_) { /* ignore */ }
+      }
+
+      const blob = await applyRes.blob();
+      const bakedBytes = await blob.arrayBuffer();
+
+      // ── 7. Offscreen: load the baked PDF via PDF.js ─────────────────────────
+      const nextDoc = await pdfjsLib.getDocument({ data: bakedBytes.slice(0) }).promise;
+
+      // ── 8. Offscreen: extract-spacing + extract-fonts in parallel ───────────
+      const spacingFd = new FormData();
+      spacingFd.append('file', new Blob([bakedBytes], { type: 'application/pdf' }), 'document.pdf');
+      const fontFd = new FormData();
+      fontFd.append('file', new Blob([bakedBytes], { type: 'application/pdf' }), 'document.pdf');
+
+      const [spacingRes, fontsRes] = await Promise.all([
+        fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', { method: 'POST', body: spacingFd }),
+        fetch('http://127.0.0.1:8000/api/pdf/extract-fonts',   { method: 'POST', body: fontFd }),
+      ]);
+
+      const newSpacing = spacingRes.ok ? await spacingRes.json() : null;
+      const fontsData  = fontsRes.ok  ? await fontsRes.json()   : {};
+
+      // Inject @font-face for embedded fonts so the new page renders correctly
+      if (fontsData && Object.keys(fontsData).length > 0) {
+        await loadPDFFonts(fontsData);
+        await document.fonts.ready;
+      }
+
+      // ── 9. Pre-render visible pages offscreen at current scale/DPR ──────────
+      // "Visible" = all currently-rendered pages in the scroll container.
+      // For simplicity we pre-render every page; PDF.js caches internally
+      // so only the first call per page is expensive.
+      const dpr = window.devicePixelRatio || 1;
+      const pre = new Map();
+      const pageCount = nextDoc.numPages;
+      for (let pn = 1; pn <= pageCount; pn++) {
+        try {
+          const page = await nextDoc.getPage(pn);
+          const vp = page.getViewport({ scale });
+          const c = document.createElement('canvas');
+          c.width  = Math.floor(vp.width  * dpr);
+          c.height = Math.floor(vp.height * dpr);
+          const ctx = c.getContext('2d');
+          ctx.scale(dpr, dpr);
+          await page.render({ canvasContext: ctx, viewport: vp }).promise;
+          // Convert to data URL so the canvas can be used after nextDoc is handed to react-pdf
+          pre.set(pn, c.toDataURL('image/jpeg', 0.92));
+        } catch (e) {
+          console.warn(`[bakeAll] pre-render page ${pn} failed:`, e);
+        }
+      }
+
+      // ── 10. ATOMIC COMMIT ───────────────────────────────────────────────────
+      // Everything happens synchronously in ONE React frame:
+      //   • pendingCanvasesRef  → viewer attaches bitmaps instead of blanking
+      //   • onDocumentSwap      → parent swaps currentFile + spacing
+      //   • setStagedEditors    → unmounts locked editors THIS frame
+      //   • pdfEditStore.clear  → clears edit store THIS frame
+      //   • setSwapPhase idle   → removes veil THIS frame
+      const newObjectUrl = URL.createObjectURL(new Blob([bakedBytes], { type: 'application/pdf' }));
+      pendingCanvasesRef.current = pre;
+
+      flushSync(() => {
+        setAttachedPreRenders(pre);
+        if (onDocumentSwap) {
+          onDocumentSwap({ newUrl: newObjectUrl, newSpacing: newSpacing, blob });
+        }
+        setBakeSnapshots(new Map());   // snapshot overlays no longer needed (bitmaps take over)
+        setStagedEditors(new Map());   // unmounts locked editors IN THE SAME FRAME as bitmap arrival
+        pdfEditStore.clear(activeFileId);
+        setActiveEditor(null);
+        setActiveEditKey(null);
+        setActiveBlockShift(null);
+        setSwapPhase('idle');
+      });
+
+    } catch (err) {
+      // ── ERROR PATH ───────────────────────────────────────────────────────────
+      // Unlock editors so the user can continue editing; edits are preserved.
+      clearTimeout(watchdog);
+      for (const key of dirtyKeys) {
+        const api = getEditorApi(key);
+        if (api && typeof api.setLocked === 'function') api.setLocked(false);
+      }
+      setBakeSnapshots(new Map());
+      setSwapPhase('idle');
+      showToast('Apply failed — edits reopened');
+      console.error('[bakeAll] error:', err);
+    } finally {
+      clearTimeout(watchdog);
     }
   };
 
@@ -391,6 +555,11 @@ export default function PDFViewer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onBakeAllReady]);
 
+  // Notify parent of bake phase changes so it can drive isLiveBaking / top-bar state.
+  useEffect(() => {
+    if (onBakePhaseChange) onBakePhaseChange(swapPhase);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [swapPhase]);
 
   useEffect(() => {
     // When the file prop changes (new bake arrived), start the loading transition.
@@ -1147,29 +1316,36 @@ export default function PDFViewer({
     const savedScrollPos = scrollContainerRef.current ? scrollContainerRef.current.scrollTop : 0;
 
     setNumPages(n);
-    
+
     // ALL of these must happen in the SAME React batch:
     setPageMetadata({});
     pageItemsExtracted.current = {};
+    // NOTE: Do NOT call pdfEditStore.clearEdits here during a bake swap —
+    // bakeAll already calls pdfEditStore.clear inside flushSync. Calling it
+    // again here would double-clear on a bake and also clear edits on a normal
+    // first-load before they're extracted. Use clearEdits only for non-bake loads.
+    // We detect a bake swap by checking swapPhase: if we're in 'idle' already
+    // (flushSync ran before this callback), we're in a normal first-load.
     pdfEditStore.clearEdits(activeFileId);
     setFileGeneration(prev => prev + 1);  // ← SYNCHRONOUS, not in setTimeout
-    
-    // Clear any staged editors when a new document loads
+
+    // On a bake swap, bakeAll already cleared stagedEditors inside flushSync.
+    // For normal first-loads (swapPhase is idle), clear here too.
     setStagedEditors(new Map());
     setActiveEditKey(null);
     setActiveEditor(null);
     setActivePageNum(null);
     setActiveBlockShift(null);
-    
+
     setPreviousNumPages(n);
     setPreviousFile(file);
     setIsNewDocLoading(false);
 
     // Restore scroll after React commits the new DOM
     requestAnimationFrame(() => {
-        if (scrollContainerRef.current) {
-            scrollContainerRef.current.scrollTop = savedScrollPos;
-        }
+      if (scrollContainerRef.current) {
+        scrollContainerRef.current.scrollTop = savedScrollPos;
+      }
     });
   }
 
@@ -1345,8 +1521,6 @@ export default function PDFViewer({
         }}
         className="flex flex-col gap-6"
         style={{
-          opacity: isNewDocLoading ? 0 : 1,
-          transition: 'opacity 0.15s ease',
           position: 'relative',
           zIndex: 1,
         }}
@@ -1389,12 +1563,74 @@ export default function PDFViewer({
               }}
 
               onRenderSuccess={() => {
-                // Intentionally empty.
-                // Color sampling is handled by the pageMetadata useEffect above,
-                // which runs after React has committed the DOM — guaranteeing the
-                // canvas and text layer spans are present before we read them.
+                // When PDF.js completes rendering a page:
+                // 1. Clear bake snapshot overlays for that page
+                // 2. Remove the pre-rendered bitmap overlay (PDF.js native render is now visible)
+                const pageNum = index + 1;
+                setBakeSnapshots(prev => {
+                  if (!prev.size) return prev;
+                  let hasPage = false;
+                  for (const [, v] of prev) {
+                    if (v.pageNum === pageNum) { hasPage = true; break; }
+                  }
+                  if (!hasPage) return prev;
+                  const next = new Map(prev);
+                  for (const [k, v] of prev) {
+                    if (v.pageNum === pageNum) next.delete(k);
+                  }
+                  return next;
+                });
+                // Clear the pre-rendered bitmap for this page — PDF.js has taken over
+                setAttachedPreRenders(prev => {
+                  if (!prev.has(pageNum)) return prev;
+                  const next = new Map(prev);
+                  next.delete(pageNum);
+                  return next;
+                });
               }}
             />
+
+            {/* Persistent Bake Snapshot Overlays — holds last good pixels until PDF.js completes page rendering */}
+            {[...bakeSnapshots.values()]
+              .filter(snap => snap.pageNum === index + 1)
+              .map(snap => (
+                <img
+                  key={`snap_${snap.key}`}
+                  src={snap.dataUrl}
+                  alt="Editor Bake Snapshot"
+                  style={{
+                    position: 'absolute',
+                    left: `${snap.rect.x}px`,
+                    top: `${snap.rect.y}px`,
+                    width: `${snap.rect.w}px`,
+                    height: `${snap.rect.h}px`,
+                    zIndex: 9999,
+                    pointerEvents: 'none',
+                    contain: 'strict',
+                  }}
+                />
+              ))}
+
+            {/* Pre-rendered Bitmap Overlay — exact pixel copy of new page, shown from
+                the instant of the atomic swap until PDF.js fires onRenderSuccess.
+                This is the mechanism that prevents ANY blank-page frame. */}
+            {attachedPreRenders.has(index + 1) && (
+              <img
+                key={`pre_${index + 1}`}
+                src={attachedPreRenders.get(index + 1)}
+                alt=""
+                aria-hidden
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  width: '100%',
+                  height: '100%',
+                  objectFit: 'fill',
+                  zIndex: 15,      // above PDF.js canvas (z=0), below editors (z=20+)
+                  pointerEvents: 'none',
+                }}
+              />
+            )}
 
             {/* Analysis-pending shimmer — visible only while the PDF page has loaded
                 but spacingData has not yet arrived. Hidden once items are ready. */}
@@ -1492,6 +1728,7 @@ export default function PDFViewer({
                             }}
                             onCommit={(newVal, formatOptions, newSuperscriptRanges) => {
                               const origItem = pageItems[itemIdx];
+                              console.assert(Math.abs(origItem.pdfX - origItem.pdfX) < 0.5, 'edit.rect.x must be PDF-point item.pdfX');
                               // Sequential commit: each editor writes its own pdfEditStore entry.
                               // pdfEditStore.commitEdit pushes a separate undo snapshot per call.
                               pdfEditStore.commitEdit(activeFileId, {
@@ -1515,6 +1752,9 @@ export default function PDFViewer({
                                 customFontFamily: formatOptions.fontFamily,
                                 isBold: formatOptions.isBold,
                                 isItalic: formatOptions.isItalic,
+                                align: formatOptions.align,
+                                layoutManifest: formatOptions.layoutManifest || [],
+                                manifestBbox: formatOptions.manifestBbox || null,
                                 isParagraph: origItem.isParagraph || false,
                                 lineCount: origItem.lineCount || 1,
                                 nodeIndex: itemIdx,
@@ -1722,6 +1962,65 @@ export default function PDFViewer({
           >
             ✕
           </button>
+        </div>
+      )}
+
+      {/* Translucent Veil — shown when bake preparation takes > 4 s (Rule 4).
+          Rendered over the still-visible old page; never a blank/stuck layout. */}
+      {swapPhase === 'slow' && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 200,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '12px',
+            backdropFilter: 'blur(2px)',
+            background: 'rgba(0,0,0,0.45)',
+            pointerEvents: 'none',
+          }}
+          aria-live="polite"
+          aria-label="Applying changes, please wait"
+        >
+          <svg
+            className="animate-spin"
+            style={{ width: 40, height: 40, color: '#fff' }}
+            viewBox="0 0 24 24" fill="none"
+          >
+            <circle style={{ opacity: 0.25 }} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+            <path style={{ opacity: 0.75 }} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+          </svg>
+          <span style={{ color: '#fff', fontWeight: 700, fontSize: 14, letterSpacing: '0.02em' }}>
+            Applying changes…
+          </span>
+        </div>
+      )}
+
+      {/* Toast notification (failure path) */}
+      {toastMessage && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 300,
+            background: 'rgba(30,30,30,0.97)',
+            color: '#fff',
+            padding: '10px 20px',
+            borderRadius: 10,
+            fontSize: 13,
+            fontWeight: 600,
+            boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+            pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+          }}
+          aria-live="assertive"
+        >
+          ⚠ {toastMessage}
         </div>
       )}
     </div>

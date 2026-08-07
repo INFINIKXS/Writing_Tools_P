@@ -15,9 +15,24 @@ import logging
 import base64
 import hashlib
 from collections import Counter
-from converter.font_utils import wrap_cff_in_otf, extract_stem_vw_ratio, _inject_cmap
+from converter.font_utils import (
+    wrap_cff_in_otf,
+    extract_stem_vw_ratio,
+    _inject_cmap,
+    vault_ingest,
+    root_family,
+)
+from converter.font_vault import vault_ingest_batch
+
+import os, re
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("EDITOR_LOG_LEVEL", "INFO").upper())
+if not logger.handlers:
+    _console = logging.StreamHandler()
+    _console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_console)
+    logger.propagate = False
 
 TYPOGRAPHY_CACHE = {}
 
@@ -338,6 +353,20 @@ def _line_font_flags(spans):
 
 
 def _collect_enclosing_rects(page):
+    """
+    Collect enclosing rects from page drawings, filtering out rules, page frames,
+    and — critically — nested redaction fill rects accumulated by repeated bakes.
+
+    Each bake paints a fill-only rect into the content stream; repeated bakes
+    over the same paragraph leave a stack of nested fill-only rects. If all are
+    returned, _innermost_rect partitions the paragraph's lines across the nested
+    rects into multiple 'rect' regions that _heal_rect_splits cannot merge
+    (rect→rect hits kind_mismatch). Dropping inner fill-only rects collapses
+    them back to the single outermost fill, keeping all lines in one region.
+
+    Only fill-only (no stroke) rects are eligible for dropping; stroked rects
+    (table cells, figure borders) are always preserved regardless of nesting.
+    """
     pr = page.rect
     rects = []
     for d in page.get_drawings():
@@ -349,13 +378,37 @@ def _collect_enclosing_rects(page):
             continue
         if r.get_area() > 0.9 * pr.get_area():        # skip page frame
             continue
-        rects.append(r)
+        fill_only = (d.get("fill") is not None) and (d.get("color") is None)
+        rects.append((r, fill_only))
+
     # de-duplicate near-identical rects (double-stroked borders)
-    out = []
-    for r in rects:
+    deduped = []
+    for r, fo in rects:
         if not any(abs(o.x0-r.x0)<0.5 and abs(o.y0-r.y0)<0.5 and
-                   abs(o.x1-r.x1)<0.5 and abs(o.y1-r.y1)<0.5 for o in out):
-            out.append(r)
+                   abs(o.x1-r.x1)<0.5 and abs(o.y1-r.y1)<0.5 for o, _ in deduped):
+            deduped.append((r, fo))
+
+    # ── KEY FIX: collapse nested redaction fills ─────────────────────────────
+    # Repeated bakes stack fill-only rects; _innermost_rect would partition one
+    # paragraph's lines across the nested rects into multiple 'rect' regions,
+    # which _heal_rect_splits cannot merge (rect→rect hits kind_mismatch).
+    # Keep only the OUTERMOST fill-only rect; never drop stroked (structural)
+    # rects, and never drop a rect that merely overlaps (not contained).
+    out = []
+    for r, fo in deduped:
+        nested = fo and any(
+            o_fo and (o is not r) and
+            o.x0 <= r.x0 + 0.5 and o.y0 <= r.y0 + 0.5 and
+            o.x1 >= r.x1 - 0.5 and o.y1 >= r.y1 - 0.5
+            for o, o_fo in deduped
+        )
+        if nested:
+            logger.debug(
+                f"[RECTS] dropping nested redaction fill "
+                f"{tuple(round(v, 1) for v in (r.x0, r.y0, r.x1, r.y1))}"
+            )
+            continue
+        out.append(r)
     return out
 
 
@@ -403,6 +456,103 @@ def _cluster_free_lines(free):
             out.append(cur); cur = [nxt]
     out.append(cur)
     return out
+
+
+def _merge_line_fragments(lines):
+    """Re-join baked-span fragments into single visual lines BEFORE clustering.
+    Uses baseline matching (origin_y) to survive fallback fonts with different
+    ascender/descender metrics that break strict bbox overlap checks."""
+    if not lines:
+        return lines
+        
+    from collections import Counter
+    
+    merged = []
+    for ln in lines:
+        h = max(0.1, ln["line_y1"] - ln["line_y0"])
+        hit = None
+        
+        # Calculate dominant baseline for this fragment (ignore super/sub chars)
+        ln_baseline = None
+        chars = ln.get("chars") or []
+        if chars:
+            orig_ys = [
+                c.get("origin_y", c.get("origin", [0,0])[1] if isinstance(c.get("origin"), (list, tuple)) and len(c.get("origin")) > 1 else 0) 
+                for c in chars 
+                if not c.get("is_superscript") and not c.get("is_subscript")
+            ]
+            if orig_ys:
+                ln_baseline = Counter(round(y, 1) for y in orig_ys).most_common(1)[0][0]
+
+        for m in merged:
+            mh = max(0.1, m["line_y1"] - m["line_y0"])
+            ov = min(m["line_y1"], ln["line_y1"]) - max(m["line_y0"], ln["line_y0"])
+            
+            # Check 1: Bbox overlap (lowered threshold to 0.25 for forgiveness)
+            bbox_match = ov > 0.25 * min(h, mh)
+            
+            # Check 2: Baseline match (survives fallback font metric mismatches)
+            baseline_match = False
+            if ln_baseline is not None and m.get("_baseline") is not None:
+                baseline_match = abs(ln_baseline - m["_baseline"]) < 1.5
+
+            if bbox_match or baseline_match:
+                hit = m
+                break
+                
+        if hit is None:
+            hit = dict(ln)
+            hit["chars"] = list(chars)
+            hit["_baseline"] = ln_baseline
+            merged.append(hit)
+            continue
+            
+        # Merge into existing hit
+        hit["chars"] += chars
+        hit["chars"].sort(key=lambda c: c.get("bbox", [c.get("x0", 0), c.get("y0", 0), c.get("x1", 0), c.get("y1", 0)])[0])
+        hit["line_x0"] = min(hit["line_x0"], ln["line_x0"])
+        hit["line_x1"] = max(hit["line_x1"], ln["line_x1"])
+        hit["line_y0"] = min(hit["line_y0"], ln["line_y0"])
+        hit["line_y1"] = max(hit["line_y1"], ln["line_y1"])
+        
+    # Rebuild text and metadata for merged lines
+    for m in merged:
+        cs = m["chars"]
+        txt = ""
+        for i, c in enumerate(cs):
+            ch_c = c.get("c", "")
+            c_x0 = c.get("bbox", [c.get("x0", 0), c.get("y0", 0), c.get("x1", 0), c.get("y1", 0)])[0]
+            prev_x1 = cs[i-1].get("bbox", [cs[i-1].get("x0", 0), cs[i-1].get("y0", 0), cs[i-1].get("x1", 0), cs[i-1].get("y1", 0)])[2]
+            if i and (c_x0 - prev_x1) > 0.5 and ch_c != " " and not txt.endswith(" "):
+                txt += " "
+            txt += ch_c
+        m["text"] = txt
+        m["bbox"] = [m["line_x0"], m["line_y0"], m["line_x1"], m["line_y1"]]
+        m["width"] = m["line_x1"] - m["line_x0"]
+        m["height"] = m["line_y1"] - m["line_y0"]
+        m["space_count"] = txt.count(" ")
+        m["gaps"] = [
+            cs[i].get("bbox", [cs[i].get("x0", 0), cs[i].get("y0", 0), cs[i].get("x1", 0), cs[i].get("y1", 0)])[0] - 
+            cs[i-1].get("bbox", [cs[i-1].get("x0", 0), cs[i-1].get("y0", 0), cs[i-1].get("x1", 0), cs[i-1].get("y1", 0)])[2] 
+            for i in range(1, len(cs))
+        ]
+        
+        body = [c for c in cs if not c.get("is_superscript") and not c.get("is_subscript")] or cs
+        m["size"] = round(Counter(c.get("size", 10) for c in body).most_common(1)[0][0], 1)
+        m["font"] = m["dominant_font"] = Counter(c.get("font", "helv") for c in body).most_common(1)[0][0]
+        m["font_family"] = get_base_font_family(m["font"]) if 'get_base_font_family' in globals() else m["font"]
+        m["color"] = m["dominant_color"] = Counter(c.get("color", 0) for c in body).most_common(1)[0][0]
+        
+    total_in  = sum(len(ln.get("chars") or []) for ln in lines)
+    total_out = sum(len(m["chars"]) for m in merged)
+    if total_out != total_in:
+        logger.warning(f"[MERGE-LOSS] page fragment merge dropped "
+                       f"{total_in - total_out} char(s); rebuilding unmerged")
+        return lines   # fail safe: never emit lossy text
+    for m in merged:
+        logger.debug(f"[MERGED-LINE] y={m['line_y0']:.1f}..{m['line_y1']:.1f} "
+                     f"text={m['text'][:60]!r}")
+    return merged
 
 
 def _split_bucket_by_left_edge(bucket, align_tol=3.0, min_share=0.15, depth=0):
@@ -688,6 +838,10 @@ def extract_page_spacing_data(page, page_idx: int = None,
             else:
                 free.append(line)
 
+        logger.debug(f"[RECTS] page {page_idx}: {len(rects)} rects: "
+                     f"{[tuple(round(v,1) for v in r) for r in rects]}")
+        logger.debug(f"[GROUP] page {page_idx}: rect-assigned={sum(len(v) for v in grouped.values())} free={len(free)}")
+
         buckets = {i: [] for i in range(len(cols))}
         for ln in free:
             x0 = ln["line_x0"]
@@ -726,11 +880,16 @@ def extract_page_spacing_data(page, page_idx: int = None,
                     f"anchors={[round(s[0]['line_x0'], 1) for s in subs]}"
                 )
                 for sub in subs:
+                    sub = _merge_line_fragments(sub)
                     for cluster in _cluster_free_lines(sub):
                         region_tuples.append((cluster, "gap", i))
 
         if not region_tuples:
             region_tuples = [([l], "line", 0) for l in all_lines]
+
+        for lines, kind, col in region_tuples:
+            logger.debug(f"[REGION] page {page_idx} kind={kind} col={col} n={len(lines)} "
+                         f"y={lines[0]['line_y0']:.0f}..{lines[-1]['line_y1']:.0f} '{lines[0]['text'][:30]}'")
 
         logger.debug(
             f"[REGIONS] page {page_idx}: rect_regions={len(grouped)} "
@@ -792,24 +951,7 @@ def extract_page_spacing_data(page, page_idx: int = None,
         block_y0 = min(b_y0s)
         block_y1 = max(b_y1s)
 
-        block_align = "left"
-        if len(reg_lines) > 1:
-            justified_count = 0
-            for l in reg_lines[:-1]:
-                touches_left = abs(l["line_x0"] - block_x0) < 5.0
-                touches_right = abs(l["line_x1"] - block_x1) < 18.0
-                if touches_left and touches_right:
-                    justified_count += 1
-
-            if len(reg_lines) > 1 and justified_count >= (len(reg_lines) - 1) / 2:
-                block_align = "justify"
-            else:
-                midpoints = [(l["line_x0"] + l["line_x1"]) / 2 for l in reg_lines]
-                block_mid = (block_x0 + block_x1) / 2
-                if all(abs(m - block_mid) < 5.0 for m in midpoints):
-                    block_align = "center"
-                elif all(abs(l["line_x1"] - block_x1) < 5.0 for l in reg_lines):
-                    block_align = "right"
+        block_align = _detect_align_from_lines(reg_lines)
 
         text_bbox = [block_x0, block_y0, block_x1, block_y1]
         union_bbox = text_bbox[:]
@@ -891,7 +1033,184 @@ def extract_page_spacing_data(page, page_idx: int = None,
             "region_kind": reg_kind,
         })
 
+    blocks_out = _heal_rect_splits(blocks_out, page_idx=page_idx)
     return blocks_out
+
+
+def _detect_align_from_lines(lines):
+    """
+    Detect text alignment ('left', 'justify', 'center', 'right') from a list of line dicts.
+    """
+    if not lines or len(lines) <= 1:
+        return "left"
+
+    b_x0s = [l.get("line_x0", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[0]) for l in lines]
+    b_x1s = [l.get("line_x1", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[2]) for l in lines]
+    block_x0 = min(b_x0s)
+    block_x1 = max(b_x1s)
+
+    justified_count = 0
+    for l in lines[:-1]:
+        lx0 = l.get("line_x0", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[0])
+        lx1 = l.get("line_x1", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[2])
+        touches_left = abs(lx0 - block_x0) < 5.0
+        touches_right = abs(lx1 - block_x1) < 18.0
+        if touches_left and touches_right:
+            justified_count += 1
+
+    if len(lines) > 1 and justified_count >= (len(lines) - 1) / 2:
+        return "justify"
+
+    midpoints = [
+        (l.get("line_x0", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[0]) +
+         l.get("line_x1", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[2])) / 2
+        for l in lines
+    ]
+    block_mid = (block_x0 + block_x1) / 2
+    if all(abs(m - block_mid) < 5.0 for m in midpoints):
+        return "center"
+    elif all(abs(l.get("line_x1", l.get("line_bbox", l.get("bbox", [0, 0, 0, 0]))[2]) - block_x1) < 5.0 for l in lines):
+        return "right"
+
+    return "left"
+
+
+def _merge_decision(a, b):
+    """(ok, reason, details) — verbose decision logger."""
+    d = {"a": a.get("paragraph_id"), "b": b.get("paragraph_id"),
+         "a_kind": a.get("region_kind"), "b_kind": b.get("region_kind")}
+    a_kind = a.get("region_kind")
+    b_kind = b.get("region_kind")
+    if a_kind != "rect" or b_kind not in ("gap", "line", "rect"):
+        return False, "kind_mismatch", d
+    if b_kind == "rect":
+        # Defense-in-depth: allow rect+rect only when b starts inside a's vertical
+        # extent (overflow assigned to outer fill by _innermost_rect after re-bake).
+        # Disjoint stacked boxes (table cells) have b["bbox"][1] >= a["bbox"][3].
+        if not (b["bbox"][1] < a["bbox"][3] - 1.0):
+            return False, "kind_mismatch", d
+
+    # Use TEXT extents, not block bbox (block bbox may include unioned drawings)
+    a_lines = a.get("lines") or []
+    b_lines = b.get("lines") or []
+    a_y1 = max((l.get("line_y1", l["bbox"][3]) for l in a_lines if "line_y1" in l or "bbox" in l), default=a["bbox"][3])
+    b_y0 = min((l.get("line_y0", l["bbox"][1]) for l in b_lines if "line_y0" in l or "bbox" in l), default=b["bbox"][1])
+    v_gap = b_y0 - a_y1
+    d["v_gap"] = round(v_gap, 2)
+    min_font = min(a["font_size"], b["font_size"])
+    max_gap = max(3.5, 0.6 * min_font)
+    min_gap = -max(5.0, 0.5 * min_font)
+    d["v_gap_bounds"] = [round(min_gap, 2), round(max_gap, 2)]
+    if v_gap < min_gap or v_gap > max_gap:
+        return False, "v_gap_out_of_bounds", d
+    if abs(a["font_size"] - b["font_size"]) > 1.0:
+        return False, "font_size", d
+
+    def _clean_fam(fam):
+        if not fam:
+            return ""
+        fam = re.sub(r"^[A-Z]{6}\+", "", fam).strip()
+        return get_base_font_family(fam).strip().lower()
+
+    fam_a = _clean_fam(a.get("font_family", ""))
+    fam_b = _clean_fam(b.get("font_family", ""))
+
+    if fam_a != fam_b:
+        short, long = (fam_a, fam_b) if len(fam_a) <= len(fam_b) else (fam_b, fam_a)
+        # prefix-tolerant: 'newbaskerville-roman' vs 'newbaskerville-roman reg'
+        if not (short and long.startswith(short)):
+            d.update(a_fam=a.get("font_family"), b_fam=b.get("font_family"),
+                     fam_a=fam_a, fam_b=fam_b)
+            return False, "font_family", d
+
+    a_w = a.get("pdfW", a["bbox"][2] - a["bbox"][0])
+    b_w = b.get("pdfW", b["bbox"][2] - b["bbox"][0])
+    min_w = min(a_w, b_w)
+    if min_w <= 0:
+        return False, "zero_width", d
+
+    h_ovl = min(a["bbox"][2], b["bbox"][2]) - max(a["bbox"][0], b["bbox"][0])
+    d["h_ovl_ratio"] = round(h_ovl / min_w, 2)
+    if d["h_ovl_ratio"] < 0.6:
+        return False, "h_overlap", d
+
+    d["left_diff"] = round(abs(a["bbox"][0] - b["bbox"][0]), 2)
+    if d["left_diff"] > 4.0:
+        return False, "left_edge", d
+
+    return True, "MERGE", d
+
+
+def _should_merge(a, b):
+    """
+    Check if overflow block `b` should be merged downward into rect-bound parent `a`.
+    
+    Merge rules:
+    - Merge is rect -> gap/line only, downward, adjacent.
+    - Same left edge, same font size/family, tight vertical gap, >=60% horizontal overlap.
+    
+    CRITICAL: Vertical gap MUST be calculated using ACTUAL TEXT EXTENTS (line_y0/line_y1),
+    NOT the block bounding boxes (bbox). Block bboxes are often artificially inflated by 
+    drawing unions (e.g., the redaction fill rect itself). Using bboxes causes `b["bbox"][1] - a["bbox"][3]` 
+    to yield a false negative (overlap) when the text actually has a small positive gap.
+    DO NOT refactor this to use `bbox` math.
+    """
+    return _merge_decision(a, b)[0]
+
+
+def _merge_blocks(a, b):
+    """
+    Merge overflow block `b` into rect-bound parent `a`.
+    """
+    m = dict(a)
+    bbox = [
+        min(a["bbox"][0], b["bbox"][0]),
+        a["bbox"][1],
+        max(a["bbox"][2], b["bbox"][2]),
+        b["bbox"][3]
+    ]
+    m["bbox"] = bbox
+    m["pdfX"] = bbox[0]
+    m["pdfY_top"] = bbox[1]
+    m["pdfW"] = bbox[2] - bbox[0]
+    m["pdfH"] = bbox[3] - bbox[1]
+    m["text"] = a["text"] + "\n" + b["text"]
+    m["lines"] = a["lines"] + b["lines"]
+    m["line_count"] = a["line_count"] + b["line_count"]
+    m["spans"] = a.get("spans", []) + b.get("spans", [])
+    m["align"] = _detect_align_from_lines(m["lines"])  # re-run alignment on merged lines
+    return m
+
+
+def _heal_rect_splits(blocks, page_idx=None):
+    """
+    Heal redaction-rect block splits by merging overflow blocks downward into their 
+    parent rect block. This handles cases where newly inserted text wraps below 
+    the original erased bounding box.
+    """
+    if not blocks:
+        return []
+
+    logger.debug(f"[HEAL] page {page_idx}: {len(blocks)} blocks: " +
+                 " | ".join(f"{b['paragraph_id']}({b['region_kind']}, y={b['bbox'][1]:.0f}..{b['bbox'][3]:.0f}, "
+                            f"{b['font_family']}/{b['font_size']}, '{b['text'][:25]}...')" for b in blocks))
+    healed = []
+    for blk in blocks:
+        if healed:
+            ok, reason, d = _merge_decision(healed[-1], blk)
+            logger.debug(f"[HEAL] {d['a']} + {d['b']} -> {reason} {d}")
+            if ok:
+                healed[-1] = _merge_blocks(healed[-1], blk)
+                continue
+        healed.append(blk)
+
+    # Re-index paragraph_id and block_number after merging
+    for idx, blk in enumerate(healed):
+        blk["block_number"] = idx
+        if page_idx is not None:
+            blk["paragraph_id"] = f"p_{page_idx}_{idx}"
+
+    return healed
 
 
 def _rects_intersect(r1, r2, pad=2.0):
@@ -1051,7 +1370,7 @@ async def extract_spacing(file: UploadFile = File(...)):
 
 
 @router.post("/extract-fonts")
-async def extract_fonts(file: UploadFile = File(...)):
+async def extract_fonts(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     Extract all embedded fonts from the PDF and return them as base64-encoded
     blobs suitable for @font-face injection in the frontend.
@@ -1073,6 +1392,7 @@ async def extract_fonts(file: UploadFile = File(...)):
         fonts_out = {}
         seen_xrefs = set()
         
+        extracted_vault_items = []
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             # page.get_fonts(full=True) returns list of tuples:
@@ -1140,6 +1460,13 @@ async def extract_fonts(file: UploadFile = File(...)):
                         continue
 
                     stem_vw_ratio = extract_stem_vw_ratio(buffer, ext)
+                    # Auto-ingested PDF fonts are SUBSETS (incomplete coverage).
+                    # Mark them so they go to subsets/ and never become promotion targets.
+                    is_subset = bool(subset_tag)  # subset_tag is the 6-letter prefix (e.g., "OPYJSL")
+                    extracted_vault_items.append((
+                        basename, basename, buffer,
+                        {"stem_vw_ratio": stem_vw_ratio, "fmt": ext, "license": "document-embedded", "is_subset": is_subset}
+                    ))
                     
                     fonts_out[basename] = {
                         "data": base64.b64encode(buffer).decode("ascii"),
@@ -1148,6 +1475,7 @@ async def extract_fonts(file: UploadFile = File(...)):
                         "subset_tag": subset_tag,
                         "stem_vw_ratio": stem_vw_ratio,
                     }
+
                     # Also register under the bare (tag-stripped) name so the canvas
                     # fontCandidates list matches across bake generations when PyMuPDF
                     # re-subsets the font under a new prefix.
@@ -1158,6 +1486,8 @@ async def extract_fonts(file: UploadFile = File(...)):
                     logger.warning(f"Failed to extract font {basename}: {e}")
         
         doc.close()
+        if extracted_vault_items:
+            background_tasks.add_task(vault_ingest_batch, extracted_vault_items)
         logger.info(f"   [FONT ENGINE] SUCCESS: Serving {len(fonts_out)} embedded PDF fonts to frontend")
         for fn in fonts_out.keys():
             logger.debug(f"      • {fn}")

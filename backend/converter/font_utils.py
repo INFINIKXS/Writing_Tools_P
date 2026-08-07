@@ -3,6 +3,7 @@ import io
 import re
 import struct
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
 from fontTools.ttLib import TTFont
@@ -80,6 +81,30 @@ def detect_font_format(font_bytes: bytes) -> str:
     elif magic == b'wOFF':
         return 'woff'
     return 'unknown'
+
+
+def prepare_for_insert(buffer: bytes) -> bytes:
+    """Buffer for page.insert_font/insert_text during BAKING.
+    Healthy TTF/OTF passes through byte-for-byte; bare CFF is wrapped once.
+    No cmap rewrite, no hmtx re-sync, no re-serialization of valid fonts."""
+    fmt = detect_font_format(buffer)
+    if fmt == "cff":
+        wrapped = wrap_cff_in_otf(buffer)
+        return wrapped if wrapped else buffer
+    return buffer  # ttf/otf/woff: UNTOUCHED
+
+
+def prepare_for_browser(buffer: bytes, doc, xref, page, basefont_name: str):
+    """Current /extract-fonts behavior (wrap + full cmap inject). Reserved for
+    the browser-serving path ONLY — never use for baking."""
+    if detect_font_format(buffer) == "cff":
+        wrapped = wrap_cff_in_otf(buffer, basefont_name=basefont_name)
+        if not wrapped:
+            return None
+        buffer = wrapped
+    return _inject_cmap(buffer, doc, xref, page=page,
+                        basefont_name=basefont_name, skip_cmap=False)
+
 
 def _synthesize_required_otf_tables(otf: TTFont, cff_reader):
     from fontTools.ttLib import newTable
@@ -181,11 +206,10 @@ def _synthesize_required_otf_tables(otf: TTFont, cff_reader):
         if gname in char_strings:
             cs = char_strings[gname]
             try:
-                cs.decompile()
-                if hasattr(cs, 'width') and cs.width is not None:
-                    width = cs.width + nominal_width
-                else:
-                    width = default_width
+                pen = RecordingPen()
+                cs.draw(pen)                      # reliably populates cs.width
+                w = getattr(cs, "width", None)
+                width = w if isinstance(w, (int, float)) else default_width
             except Exception:
                 width = default_width
         metrics[gname] = (int(width), 0)
@@ -219,35 +243,49 @@ def _ensure_browser_required_tables(tt: TTFont):
         name.names = []
         tt['name'] = name
 
+def _probe_wrapped_name(buf: bytes) -> str:
+    """Name MuPDF actually derives from a wrapped buffer, subset-tag stripped."""
+    try:
+        n = fitz.Font(fontbuffer=buf).name or ""
+    except Exception:
+        return ""
+    return re.sub(r"^[A-Z]{6}\+", "", n).strip()
+
+
 def wrap_cff_in_otf(cff_bytes: bytes, basefont_name: str = "") -> Optional[bytes]:
-    """Wraps bare CFF bytes into an OTF (SFNT) shell, embedding name table."""
+    """Wrap bare CFF bytes into an OTF (SFNT) shell.
+
+    ROOT-CAUSE HARDENING (font-name stability):
+    MuPDF derives /BaseFont from the buffer's internal names and truncates to
+    31 bytes; subset_fonts() then prepends a 7-byte 'ABCDEF+' tag, so any
+    internal name > 24 chars is silently truncated ('NewBaskerville-Roman Regular'
+    -> 'NewBaskerville-Roman Reg'), breaking family matching on re-extraction.
+    Therefore: cap the canonical name at 24 chars, write ONLY bare names (no
+    family+subfamily pair to compose), force CFF Top DICT names unconditionally,
+    and probe the result with fitz.Font, self-correcting until name == bare.
+    """
     try:
         from fontTools import cffLib, ttLib
 
-        # ── Compute the canonical bare name once ───────────────────────────────
-        # bare = tag-stripped, space-free PostScript name. Written into EVERY
-        # name slot (CFF Top DICT + OTF name table) so PyMuPDF always reads a
-        # short, stable string that fits inside the 31-char BaseFont limit.
         bare = re.sub(r"^[A-Z]{6}\+", "", (basefont_name or "")).strip() or "WrappedFont"
+        # 31-byte MuPDF name buffer minus 'ABCDEF+' tag headroom
+        if len(bare) > 24:
+            bare = bare[:24]
 
-        # ── Parse pristine CFF stream for binary pass-through ─────────────────
         cff_reader_pristine = cffLib.CFFFontSet()
         cff_reader_pristine.decompile(io.BytesIO(cff_bytes), otFont=None, isCFF2=False)
 
-        # ── Patch CFF Top DICT BEFORE renaming fontNames ──────────────────────
-        if hasattr(cff_reader_pristine, "fontNames") and cff_reader_pristine.fontNames:
-            original_cff_name = cff_reader_pristine.fontNames[0]
+        # ── Force CFF names UNCONDITIONALLY (no hasattr gates) ──────────
+        if getattr(cff_reader_pristine, "fontNames", None):
             try:
-                top_dict = cff_reader_pristine[original_cff_name]
-                if hasattr(top_dict, "FontName"):
-                    top_dict.FontName = bare
-                top_dict.FullName = bare
-                top_dict.FamilyName = bare
+                td = cff_reader_pristine[cff_reader_pristine.fontNames[0]]
+                for attr in ("FontName", "FullName", "FamilyName"):
+                    try: setattr(td, attr, bare)
+                    except Exception: pass
             except Exception:
                 pass
             cff_reader_pristine.fontNames = [bare]
 
-        # ── Parse disposable CFF stream for width metrics only ────────────────
         metrics_reader = cffLib.CFFFontSet()
         metrics_reader.decompile(io.BytesIO(cff_bytes), otFont=None, isCFF2=False)
 
@@ -255,61 +293,63 @@ def wrap_cff_in_otf(cff_bytes: bytes, basefont_name: str = "") -> Optional[bytes
         cff_table = ttLib.newTable("CFF ")
         cff_table.cff = cff_reader_pristine
         otf["CFF "] = cff_table
-
         _synthesize_required_otf_tables(otf, metrics_reader)
 
-        # ── Set CFF Top DICT & OTF name table on serialized TTFont instance ────
-        if "CFF " in otf and hasattr(otf["CFF "], "cff"):
-            cff_obj = otf["CFF "].cff
-            cff_obj.fontNames = [bare]
-            if hasattr(cff_obj, "topDictIndex") and len(cff_obj.topDictIndex) > 0:
-                td = cff_obj.topDictIndex[0]
-                if hasattr(td, "FontName"):
-                    td.FontName = bare
-                td.FullName = bare
-                td.FamilyName = bare
-
-        subfamily = "Regular"
-        fname_lower = bare.lower()
-        if "bold" in fname_lower:
-            subfamily = "Bold"
-        elif "italic" in fname_lower or "oblique" in fname_lower:
-            subfamily = "Italic"
-
-        unique_id = f"{bare}-PDFEditorWrap"
-
+        # ── Name table: bare-only records — NO subfamily record ─────────
         nt = ttLib.newTable("name")
         nt.names = []
-        for nid, val in [(1, bare), (2, subfamily), (3, unique_id),
-                         (4, bare), (6, bare)]:
-            nt.setName(val, nid, 3, 1, 0x409)   # Windows BMP Unicode
-            nt.setName(val, nid, 1, 0, 0)        # Mac Roman
+        for nid in (1, 3, 4, 6):
+            nt.setName(bare, nid, 3, 1, 0x409)
+            nt.setName(bare, nid, 1, 0, 0)
         otf["name"] = nt
 
         out = io.BytesIO()
         otf.save(out)
         out_bytes = out.getvalue()
 
-        # ── Post-serialization validation ─────────────────────────────────────
-        try:
-            verify_tt = TTFont(io.BytesIO(out_bytes))
-            v_name4 = verify_tt["name"].getDebugName(4)
-            v_name6 = verify_tt["name"].getDebugName(6)
-            check_font = fitz.Font(fontbuffer=out_bytes)
-
-            acceptable = {bare, f"{bare} {subfamily}"}
-            if v_name4 == bare and v_name6 == bare and check_font.name in acceptable:
-                logger.debug(
-                    f"Wrapped OTF font name sanity check \u2713: '{check_font.name}'"
-                )
+        # ── Self-correcting probe loop ──────────────────────────────────
+        for strategy in range(2):
+            got = _probe_wrapped_name(out_bytes)
+            if got == bare:
+                break
+            logger.warning(
+                f"Wrapped OTF name probe mismatch (strategy {strategy}): "
+                f"'{got}' != '{bare}' — rewriting name sources"
+            )
+            tt = TTFont(io.BytesIO(out_bytes))
+            name = tt["name"]
+            if strategy == 0:
+                # delete any subfamily records MuPDF could compose with family
+                name.removeNames(2)
+                name.removeNames(17)
             else:
-                logger.warning(
-                    f"Wrapped OTF font name sanity check \u2717: '{check_font.name}' "
-                    f"(expected '{bare}' or '{bare} {subfamily}', fontTools name4='{v_name4}', name6='{v_name6}')"
-                )
-        except Exception as check_err:
-            logger.warning(f"Wrapped OTF font sanity check failed: {check_err}")
+                # nuclear: rebuild name table + CFF names from scratch
+                name.names = []
+                for nid in (1, 3, 4, 6):
+                    name.setName(bare, nid, 3, 1, 0x409)
+                    name.setName(bare, nid, 1, 0, 0)
+                if "CFF " in tt:
+                    cff = tt["CFF "].cff
+                    cff.fontNames = [bare]
+                    try:
+                        td = cff.topDictIndex[0]
+                        for attr in ("FontName", "FullName", "FamilyName"):
+                            try: setattr(td, attr, bare)
+                            except Exception: pass
+                    except Exception:
+                        pass
+            o2 = io.BytesIO()
+            tt.save(o2)
+            out_bytes = o2.getvalue()
 
+        got = _probe_wrapped_name(out_bytes)
+        if got == bare:
+            logger.debug(f"Wrapped OTF font name sanity check ✓: '{got}'")
+        else:
+            logger.warning(
+                f"Wrapped OTF font name sanity check ✗: '{got}' (expected '{bare}') "
+                f"— heal-layer _clean_fam() remains as safety net"
+            )
         return out_bytes
     except Exception as e:
         logger.warning(f"CFF wrapping failed: {e}")
@@ -452,18 +492,17 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
             else:
                 reason = f"Embedded CFF font '{matched_basefont}' could not be wrapped into OTF."
                 logger.warning(reason)
-                return _fallback(font_name, is_bold, is_italic, reason)
+                return _try_vault_or_fallback(font_name, is_bold, is_italic, reason)
         elif fmt == 'unknown':
             reason = f"Embedded font '{matched_basefont}' has unknown binary format."
             logger.warning(reason)
-            return _fallback(font_name, is_bold, is_italic, reason)
+            return _try_vault_or_fallback(font_name, is_bold, is_italic, reason)
 
-        # ── Step 1.5: Inject OS Cmap for subsets ────────────────────────────
-        font_bytes = _inject_cmap(font_bytes, doc, xref, page, matched_basefont)
-        if font_bytes is None:
-            reason = f"Embedded font '{matched_basefont}' has corrupt/unsupported data (failed to rebuild cmap dictionary). Falling back to generic font."
-            logger.warning(reason)
-            return _fallback(font_name, is_bold, is_italic, reason)
+        # ── Step 1.5: NO table surgery on valid fonts ───────────────────────
+        # Wrapped CFF already has authoritative hmtx (Hunk 1); healthy TTF/OTF
+        # must stay byte-identical. Browser-only cmap injection lives solely in
+        # /extract-fonts (prepare_for_browser), never in the bake path.
+        font_bytes = prepare_for_insert(font_bytes)
 
         # ── Step 2: Validate — can MuPDF parse these bytes? ─────────────────
         try:
@@ -475,10 +514,10 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
                 f"and Identity-H CID composites."
             )
             logger.warning(reason)
-            return _fallback(font_name, is_bold, is_italic, reason)
+            return _try_vault_or_fallback(font_name, is_bold, is_italic, reason)
 
         # ── Step 3: Check glyph coverage for the new text ───────────────────
-        missing = _find_missing_glyphs(test_font, new_text)
+        missing = _find_missing_glyphs(test_font, new_text, font_buffer=font_bytes)
 
         if missing:
             logger.info(f"Embedded font '{matched_basefont}' missing glyphs {missing}. Attempting dynamic glyph merging...")
@@ -486,11 +525,11 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
             if merged_bytes:
                 try:
                     test_merged = fitz.Font(fontbuffer=merged_bytes)
-                    still_missing = _find_missing_glyphs(test_merged, new_text)
+                    still_missing = _find_missing_glyphs(test_merged, new_text, font_buffer=merged_bytes)
                     if not still_missing:
                         logger.info(f"Glyph merge successful for '{matched_basefont}'! All missing glyphs injected.")
                         return FontResult(
-                            fontname=f"emb_{matched_basefont[:20]}",
+                            fontname=matched_basefont,
                             font_buffer=merged_bytes,
                             fallback_used=False,
                         )
@@ -506,8 +545,23 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
                 f"{missing!r}. Dynamic glyph merging attempted."
             )
             logger.warning(reason)
+            try:
+                from .font_vault import vault_full_for
+                req_style = "bolditalic" if (is_bold and is_italic) else ("bold" if is_bold else ("italic" if is_italic else "regular"))
+                v_hit = vault_full_for(font_name, style=req_style)
+                if v_hit:
+                    v_name, v_buf = v_hit
+                    logger.info(f"Vault full font hit for '{font_name}': {v_name}")
+                    return FontResult(
+                        fontname=f"vault_{v_name}",
+                        font_buffer=v_buf,
+                        fallback_used=True,
+                        fallback_reason=f"vault:{v_name}",
+                    )
+            except Exception:
+                pass
             return FontResult(
-                fontname=f"emb_{matched_basefont[:20]}",
+                fontname=matched_basefont,
                 font_buffer=font_bytes,
                 fallback_used=True,
                 fallback_reason=reason,
@@ -526,7 +580,7 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
         # ── Step 4: All good — return embedded font ──────────────────────────
         logger.debug(f"Using embedded font '{matched_basefont}' for edit.")
         return FontResult(
-            fontname=f"emb_{matched_basefont[:20]}",
+            fontname=matched_basefont,
             font_buffer=font_bytes,
             fallback_used=False,
         )
@@ -543,6 +597,25 @@ def get_font_for_edit(doc: fitz.Document, page: fitz.Page, edit: dict) -> FontRe
         f"and no Base-14 alias was found."
     )
     logger.warning(reason)
+    return _try_vault_or_fallback(font_name, is_bold, is_italic, reason)
+
+
+def _try_vault_or_fallback(font_name: str, is_bold: bool, is_italic: bool, reason: str) -> FontResult:
+    try:
+        from .font_vault import vault_full_for
+        req_style = "bolditalic" if (is_bold and is_italic) else ("bold" if is_bold else ("italic" if is_italic else "regular"))
+        v_hit = vault_full_for(font_name, style=req_style)
+        if v_hit:
+            v_name, v_buf = v_hit
+            logger.info(f"Vault full font hit for '{font_name}': {v_name}")
+            return FontResult(
+                fontname=f"vault_{v_name}",
+                font_buffer=v_buf,
+                fallback_used=True,
+                fallback_reason=f"vault:{v_name}",
+            )
+    except Exception as ex:
+        logger.debug(f"vault_full_for check failed: {ex}")
     return _fallback(font_name, is_bold, is_italic, reason)
 
 
@@ -598,30 +671,152 @@ def _extract_matching_font(
     return None
 
 
-def _find_missing_glyphs(font: fitz.Font, text: str) -> list:
-    """
-    Return a list of characters in `text` that have no glyph in `font`.
+# ── Authoritative Coverage, In-Document Scavenging & Font Vault ────────────
 
-    Uses Font.has_glyph() with fallback=False so we only count glyphs
-    that are physically present in the font binary, not MuPDF substitutes.
+def cmap_set(buffer: bytes):
+    try:
+        import io
+        from fontTools.ttLib import TTFont
+        tt = TTFont(io.BytesIO(buffer))
+        cm = tt.getBestCmap() or {}
+        tt.close()
+        return set(cm.keys())
+    except Exception:
+        return None
 
-    Note: valid_codepoints() is broken in PyMuPDF >= 1.24.x (issue #3933),
-    so we use has_glyph() per-character instead.
-    """
-    missing = []
-    seen = set()
-    for ch in text:
-        if ch in seen or ch in (" ", "\n", "\r", "\t"):
-            continue
-        seen.add(ch)
-        try:
-            # fallback=False → returns 0 if the glyph is genuinely absent
-            if not font.has_glyph(ord(ch), fallback=False):
-                missing.append(ch)
-        except Exception:
-            # If has_glyph raises (e.g. corrupt font), treat as missing
-            missing.append(ch)
+
+_INK_CACHE = {}
+def _glyph_has_ink(font_buffer: bytes, ch: str, fontsize: int = 20) -> bool:
+    key = (hashlib.sha256(font_buffer).hexdigest()[:12], ch)
+    if key in _INK_CACHE:
+        return _INK_CACHE[key]
+    try:
+        d = fitz.open(); p = d.new_page(width=40, height=40)
+        p.insert_font(fontname="p", fontbuffer=font_buffer)
+        p.insert_text(fitz.Point(5, 28), ch, fontname="p", fontsize=fontsize)
+        res = sum(1 for v in p.get_pixmap(colors=fitz.csGRAY).samples if v < 250) > 0
+        d.close()
+    except Exception:
+        res = True
+    _INK_CACHE[key] = res
+    return res
+
+
+def _find_missing_glyphs(font_obj, text, font_buffer=None):
+    """Authoritative subset coverage.
+    Subset CMAPs frequently map missing chars to '.notdef' (gid 0) while still 
+    listing the codepoint. We MUST use the render-probe (_glyph_has_ink) as the 
+    ultimate source of truth to avoid false negatives."""
+    chars = [ch for ch in dict.fromkeys(text) if not ch.isspace()]
+    if not chars:
+        return set()
+    
+    missing = set()
+    if font_buffer:
+        for ch in chars:
+            # The render-probe is the only 100% reliable check for subsets
+            if not _glyph_has_ink(font_buffer, ch):
+                missing.add(ch)
+    else:
+        # Fallback if no buffer provided (should not happen in our pipeline)
+        cmap = cmap_set(font_buffer)
+        for ch in chars:
+            if cmap is None or ord(ch) not in cmap:
+                missing.add(ch)
+                
+    if missing:
+        import logging
+        logging.getLogger(__name__).warning(f"GLYPH-DETECTOR: subset font lacks ink for {sorted(missing)}")
+        
     return missing
+
+
+_SUBSET_RE = re.compile(r"^[A-Z]{6}\+")
+_STYLE_RE  = re.compile(r"[-_\s](Bold|Italic|Oblique|Regular|Roman|Light|Medium|Thin|Black|Heavy|Bd|It|Cn|CnO|Cond(?:ensed)?|Ext(?:ended)?|Narrow)$", re.I)
+_PREFIX_RE = re.compile(r"^(emb_|F\d+_|g_d\d+_|font_|pdf_|mp_)", re.I)
+
+
+def canonical_family(name: str) -> str:
+    n = name or ""
+    n = _PREFIX_RE.sub("", n)                 # emb_, F1_, g_d0_ ...
+    n = re.sub(r"^[A-Z]{6}\+", "", n)         # OPYJSL+
+    n = _STYLE_RE.sub("", n)                  # -Roman/-Bold/...
+    n = re.sub(r"[-_\s]+", "", n)             # "Libre Baskerville" == "libre-baskerville"
+    return n.lower().strip()
+
+
+def family_match(a: str, b: str) -> bool:
+    """Truncation-tolerant: 'newbaskervill' vs 'newbaskerville-roman'."""
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def root_family(name: str) -> str:
+    return canonical_family(name)
+
+
+def build_doc_glyph_index(doc) -> dict:
+    """root_family -> [(basename, buffer, cmap_set|None)]; built ONLY when missing chars exist."""
+    idx, seen = {}, set()
+    for page in doc:
+        for info in page.get_fonts(full=True):
+            xref = info[0]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                _, _, _, buf = doc.extract_font(xref)
+            except Exception:
+                continue
+            if buf:
+                idx.setdefault(root_family(info[3]), []).append((info[3], buf, cmap_set(buf)))
+    return idx
+
+
+def cover_for(index, family, ch):
+    cp = ord(ch)
+    for basename, buf, cm in index.get(family, []):
+        if cm and cp in cm:
+            return basename, buf
+    return None
+
+
+from pathlib import Path
+import json
+
+VAULT_DIR = Path(__file__).resolve().parent.parent / "font_vault"
+
+
+def vault_ingest(family, basename, buffer, *, stem_vw_ratio=None, fmt="otf", license="document-embedded", full=False, stand_in_for=None, style=None, is_subset=False):
+    from .font_vault import vault_ingest as _vi
+    return _vi(family, basename, buffer, stem_vw_ratio=stem_vw_ratio, fmt=fmt, license=license, full=full, stand_in_for=stand_in_for, style=style, is_subset=is_subset)
+
+
+def vault_cover_for(family, ch):
+    try:
+        mf_path = VAULT_DIR / "manifest.json"
+        if not mf_path.exists():
+            return None
+        e = json.loads(mf_path.read_text()).get(family)
+        if not e or ord(ch) not in set(e["coverage"]):
+            return None
+        if e.get("full_font") and (VAULT_DIR / e["full_font"]).exists():
+            buf = (VAULT_DIR / e["full_font"]).read_bytes()
+            cm = cmap_set(buf)
+            if cm and ord(ch) in cm:
+                return (f"{family}-FULL", buf)
+        for src in e["sources"]:
+            for ext in ("otf", "ttf"):
+                p = VAULT_DIR / "buffers" / f"{src}.{ext}"
+                if p.exists():
+                    buf = p.read_bytes()
+                    cm = cmap_set(buf)
+                    if cm and ord(ch) in cm:
+                        return (src, buf)
+    except Exception:
+        return None
+    return None
 
 
 def _match_base14(font_name: str) -> Optional[str]:
@@ -1413,3 +1608,35 @@ def merge_missing_glyphs(
         logger.warning(f"merge_missing_glyphs failed: {e}")
 
     return None
+
+
+_XH_CACHE = {}
+def xheight_ratio(buf: bytes) -> float:
+    key = hashlib.sha256(buf).hexdigest()[:12]
+    if key in _XH_CACHE: return _XH_CACHE[key]
+    r = 0.45
+    try:
+        tt = TTFont(io.BytesIO(buf))
+        upm = tt["head"].unitsPerEm or 1000
+        sx = 0
+        gname = (tt.getBestCmap() or {}).get(ord("x"))
+        if gname:
+            from fontTools.pens.boundsPen import BoundsPen
+            pen = BoundsPen(tt.getGlyphSet())
+            tt.getGlyphSet()[gname].draw(pen)          # true outline bounds
+            if pen.bounds:
+                sx = round(pen.bounds[3] - pen.bounds[1])
+        if not sx:                                      # last resort only
+            os2 = tt.get("OS/2")
+            sx = getattr(os2, "sxHeight", 0) or 0
+        if sx and upm:
+            r = sx / upm
+    except Exception:
+        pass
+    _XH_CACHE[key] = r
+    return r
+
+def standin_size_scale(primary_buf: bytes, standin_buf: bytes) -> float:
+    """Multiply stand-in size by this so its x-height matches the primary."""
+    rp, rs = xheight_ratio(primary_buf), xheight_ratio(standin_buf)
+    return round(rp / rs, 3) if rs else 1.0

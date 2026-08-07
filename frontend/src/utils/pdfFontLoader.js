@@ -12,6 +12,32 @@ const installedStyleElements = new Set();
 const loadedFontNames = new Set();
 const fontStemRatios = new Map();
 
+const _STYLE_RE = /[-_](Bold|Italic|Oblique|Regular|Roman|Light|Medium|Thin|Black|Heavy|Bd|It|Cn|CnO|Cond(?:ensed)?|Ext(?:ended)?|Narrow)$/i;
+const _SUBSET_RE = /^[A-Z]{6}\+/;
+function rootFamily(name) {
+  return (name || '').replace(_SUBSET_RE, '').replace(_STYLE_RE, '').toLowerCase().trim();
+}
+
+let vaultManifestPromise = null;
+let vaultManifestData = null;
+
+export async function getVaultManifest() {
+  if (vaultManifestData) return vaultManifestData;
+  if (!vaultManifestPromise) {
+    vaultManifestPromise = fetch('/api/pdf/vault/manifest')
+      .then(res => res.ok ? res.json() : {})
+      .then(data => {
+        vaultManifestData = data;
+        return data;
+      })
+      .catch(() => ({}));
+  }
+  return vaultManifestPromise;
+}
+
+// Automatically trigger manifest fetch
+getVaultManifest();
+
 /**
  * Retrieve stem_vw_ratio (StdVW / units_per_em) for a given font family name or font stack string.
  */
@@ -24,6 +50,12 @@ export function getFontStemVwRatio(fontFamilyName) {
     if (fontStemRatios.has(stripped)) return fontStemRatios.get(stripped);
     const sanitized = name.replace(/\s*-\s*/g, '-');
     if (fontStemRatios.has(sanitized)) return fontStemRatios.get(sanitized);
+    if (vaultManifestData) {
+      const rf = rootFamily(name);
+      if (vaultManifestData[rf]?.stem_vw_ratio) {
+        return vaultManifestData[rf].stem_vw_ratio;
+      }
+    }
   }
   return null;
 }

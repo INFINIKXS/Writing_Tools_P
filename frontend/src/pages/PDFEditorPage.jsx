@@ -122,19 +122,9 @@ export default function PDFEditorPage({ initialToolId = null }) {
     const reader = new FileReader();
     reader.onload = () => { setFileBytes(reader.result); };
     reader.readAsArrayBuffer(file);
-    setAnnotations([]);
-    setCanvasAnnotations([]);
-    setLivePreviewUrl(null);
-    if (prevLiveUrlRef.current) {
-      URL.revokeObjectURL(prevLiveUrlRef.current);
-      prevLiveUrlRef.current = null;
-    }
-    // Abort any in-flight analysis request before starting a new one
-    if (analyzeAbortRef.current) analyzeAbortRef.current.abort();
+    setIsAnalyzing(true);
     const controller = new AbortController();
     analyzeAbortRef.current = controller;
-    setIsAnalyzing(true);
-    setSpacingData(null);
     try {
       const fd = new FormData();
       fd.append('file', file, 'document.pdf');
@@ -155,57 +145,19 @@ export default function PDFEditorPage({ initialToolId = null }) {
     }
   };
 
-  const handleLivePreview = useCallback(async () => {
-    if (!currentFile) return;
-    const inlineEdits = pdfEditStore.getEdits(activeFileId);
-    if (inlineEdits.length === 0) return;
-    setIsLiveBaking(true);
-    try {
-      const fd = new FormData();
-      let sourceFile;
-      if (typeof currentFile === 'string') {
-        const localRes = await fetch(currentFile);
-        const localBlob = await localRes.blob();
-        sourceFile = new File([localBlob], 'document.pdf', { type: 'application/pdf' });
-      } else {
-        sourceFile = currentFile;
-      }
-      fd.append('file', sourceFile, 'document.pdf');
-      fd.append('edits', JSON.stringify(inlineEdits));
-      const res = await fetch('http://127.0.0.1:8000/api/pdf/apply-edits', { method: 'POST', body: fd });
-      if (!res.ok) throw new Error(`Live bake failed: ${res.status}`);
-
-      const warningsHeader = res.headers.get('X-Font-Warnings');
-      if (warningsHeader) {
-        try {
-          const pw = JSON.parse(decodeURIComponent(warningsHeader));
-          if (pw && pw.length > 0) { setFontWarnings(pw); setTimeout(() => setFontWarnings([]), 8000); }
-        } catch (e) { console.error('Failed to parse font warnings', e); }
-      }
-
-      const blob = await res.blob();
-      const bakedBytes = await blob.arrayBuffer();
-      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
-      const newUrl = URL.createObjectURL(blob);
-      objectUrlRef.current = newUrl;
-      pdfEditStore.clear(activeFileId);
-      setSpacingData(null);
-      pdfTypographyStore.setTypographyData(activeFileId, null);
-      try {
-        const spacingFd = new FormData();
-        spacingFd.append('file', blob, 'document.pdf');
-        const spacingRes = await fetch('http://127.0.0.1:8000/api/pdf/extract-spacing', { method: 'POST', body: spacingFd });
-        if (spacingRes.ok) {
-          const payload = await spacingRes.json();
-          setSpacingData(payload);
-          pdfTypographyStore.setTypographyData(activeFileId, payload);
-        }
-      } catch (e) { console.error('Failed to re-extract spacing after bake:', e); }
-      setCurrentFile(newUrl);
-      setFileBytes(bakedBytes);
-      setLivePreviewUrl(null);
-    } catch (err) { console.error('Live preview error:', err); throw err; } finally { setIsLiveBaking(false); }
-  }, [currentFile]);
+  // handleDocumentSwap is called from inside bakeAll's flushSync.
+  // It atomically updates currentFile + spacingData in the same React frame
+  // that the pre-rendered bitmap appears and staged editors are unmounted.
+  const handleDocumentSwap = useCallback(({ newUrl, newSpacing }) => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    objectUrlRef.current = newUrl;
+    setCurrentFile(newUrl);
+    setLivePreviewUrl(null);
+    if (newSpacing) {
+      setSpacingData(newSpacing);
+      pdfTypographyStore.setTypographyData(activeFileId, newSpacing);
+    }
+  }, []);
 
   const handleAddText = () => {
     const newId = Date.now().toString() + Math.random().toString().slice(2, 6);
@@ -378,14 +330,16 @@ export default function PDFEditorPage({ initialToolId = null }) {
 
           <div className="flex items-center gap-2 ml-auto shrink-0">
             <button
-              onClick={() => setScale(s => Math.max(0.4, s - 0.25))}
-              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center"
+              onClick={() => !isLiveBaking && setScale(s => Math.max(0.4, s - 0.25))}
+              disabled={isLiveBaking}
+              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
               title="Zoom out"
             >−</button>
             <span className="text-xs font-mono font-bold text-slate-700 dark:text-slate-200 min-w-[44px] text-center">{Math.round(scale * 100)}%</span>
             <button
-              onClick={() => setScale(s => s + 0.25)}
-              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center"
+              onClick={() => !isLiveBaking && setScale(s => s + 0.25)}
+              disabled={isLiveBaking}
+              className="w-7 h-7 rounded-lg bg-slate-100 dark:bg-neutral-800 border border-slate-300 dark:border-neutral-700 text-slate-800 dark:text-slate-100 text-sm font-bold hover:bg-slate-200 dark:hover:bg-neutral-700 transition-all shadow-xs flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
               title="Zoom in"
             >+</button>
 
@@ -420,7 +374,7 @@ export default function PDFEditorPage({ initialToolId = null }) {
         {/* PDF Canvas */}
         <div className="flex-1 overflow-hidden relative">
           <PDFErrorBoundary>
-            <PDFViewer
+          <PDFViewer
               file={viewerFile}
               scale={scale}
               annotations={annotations}
@@ -430,13 +384,15 @@ export default function PDFEditorPage({ initialToolId = null }) {
               onDeleteAnnotation={deleteAnnotation}
               onCanvasClick={handleCanvasClick}
               isWandActive={isWandActive}
-              onLivePreview={handleLivePreview}
               onUpload={handleUpload}
               activeTool={activeTool}
               toolSettings={toolSettings}
               onAddCanvasAnnotation={addCanvasAnnotation}
               onDeleteCanvasAnnotation={deleteCanvasAnnotation}
               onBakeAllReady={(fn) => { bakeAllRef.current = fn; }}
+              currentSourceFile={currentFile}
+              onDocumentSwap={handleDocumentSwap}
+              onBakePhaseChange={(phase) => setIsLiveBaking(phase !== 'idle')}
             />
           </PDFErrorBoundary>
         </div>
