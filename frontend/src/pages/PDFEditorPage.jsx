@@ -262,11 +262,23 @@ export default function PDFEditorPage({ initialToolId = null }) {
         workingBlob = await res2.blob();
       }
 
-      // Step 4: download
+      // Step 4: download (optimized terminal artifact for download; working copy stays un-subsetted)
+      let downloadBlob = workingBlob;
+      try {
+        const optFd = new FormData();
+        optFd.append('file', new File([workingBlob], 'document.pdf', { type: 'application/pdf' }), 'document.pdf');
+        const optRes = await fetch('http://127.0.0.1:8000/api/pdf/optimize', { method: 'POST', body: optFd });
+        if (optRes.ok) {
+          downloadBlob = await optRes.blob();
+        }
+      } catch (optErr) {
+        console.warn('Optimization endpoint failed, using working blob:', optErr);
+      }
+
       const fileName = typeof currentFile === 'string'
         ? 'edited_document.pdf'
         : `edited_${currentFile?.name || 'document.pdf'}`;
-      const url = URL.createObjectURL(workingBlob);
+      const url = URL.createObjectURL(downloadBlob);
       const a = document.createElement('a');
       a.href = url; a.download = fileName; a.click();
       URL.revokeObjectURL(url);

@@ -271,6 +271,11 @@ def _build_run_candidates(fam, want_style, font_buffer_map):
     if t and _font_id(t[1]) not in seen:
         try: cands.append((t[0], fitz.Font(fontbuffer=t[1]), t[1]))
         except Exception: pass
+    if not cands or (_font_id(cands[-1][2]) != _font_id(t[1]) if t else True):
+        fn_, fb_ = get_universal_fallback_font(fam)
+        if fb_ and (_font_id(fb_) not in seen):
+            try: cands.append((fn_, fitz.Font(fontbuffer=fb_), fb_))
+            except Exception: pass
     return cands
 
 _RUN_FONT_CACHE = {}
@@ -343,12 +348,14 @@ def _emit_layout_manifest(page, manifest, plan, font_buffer_map,
             fn, fo, fbuf = primary_fontname, font_obj, None
         else:
             fn, fo, fbuf = _pick_run_font(text, candidates)
+            try: _safe_insert_font(page, fn, fbuf, size)   # self-registration: probed buffer == emitted name
+            except Exception: pass
         if fbuf is not None and fn != primary_fontname:
             pb = font_buffer_map.get(primary_fontname) or (candidates[0][2] if candidates else None)
             if pb:
                 scale_f = MANUAL_SIZE_SCALE.get(canonical_family(fn)) or standin_size_scale(pb, fbuf)
                 size = round(size * scale_f, 2)
-        logger.info(f"[EMIT] run={text[:18]!r} font={fn!r} fontsize={size}pt x={x:.1f}")
+        logger.info(f"[RUNFONT] run={text[:18]!r} -> {fn!r} size={size}")
         page.insert_text(fitz.Point(x, y), text, fontname=fn, fontsize=size, color=color)
         emitted += 1
 
@@ -891,6 +898,7 @@ def _check_font_buf_missing_glyphs(font_buf: Optional[bytes], text: str) -> list
 async def apply_edits(
     file:  UploadFile = File(...),
     edits: str        = Form(...),
+    optimize: str     = Form("0"),
 ):
     data       = await file.read()
     edits_list = json.loads(edits)
@@ -975,29 +983,33 @@ async def apply_edits(
                     f"rect=[{x0:.1f}, {y0:.1f}, {edit['rect']['w']:.1f}, {edit['rect']['h']:.1f}], "
                     f"orig_len={len(orig_text)}, new_len={len(new_text)}"
                 )
-                erase_rect = fitz.Rect(
-                    max(0, x0 - 2), max(0, y0 - 2),
-                    x0 + edit["rect"]["w"] + 2, y0 + edit["rect"]["h"] + 2
-                )
-                mb = edit.get("manifestBbox")
-                if isinstance(mb, dict):
-                    try:
-                        mb_rect = fitz.Rect(float(mb["x0"]), float(mb["y0"]), float(mb["x1"]), float(mb["y1"]))
-                        mb_rect.x0 = max(mb_rect.x0, x0 - 2)
-                        mb_rect.x1 = min(mb_rect.x1, x0 + edit["rect"]["w"] + 2)
-                        erase_rect = erase_rect | fitz.Rect(
-                            mb_rect.x0 - 2, mb_rect.y0 - 2,
-                            mb_rect.x1 + 2, mb_rect.y1 + 2,
-                        )
-                    except Exception as e:
-                        logger.warning(f"manifestBbox expansion failed: {e}")
-
-                plan["erase_rects"].append(erase_rect)
                 plan["is_paragraph_op"] = True
                 plan["is_bold"] = bool(edit.get("isBold"))
                 plan["is_italic"] = bool(edit.get("isItalic"))
                 plan["origStr"] = orig_text  # Preserve original text for novel-char detection
-                plan["layout_manifest"] = edit.get("layoutManifest") or []
+
+                manifest = edit.get("layoutManifest") or []
+                if not manifest:
+                    initial_rect = fitz.Rect(max(0, x0 - 2), max(0, y0 - 2), x0 + edit["rect"]["w"] + 2, y0 + edit["rect"]["h"] + 2)
+                    syn_runs = _span_runs_in_rect(page, initial_rect)
+                    manifest = [{
+                        "text": r["text"], "x": r["x"], "baselineY": r["span_baseline_y"],
+                        "fontSize": r["size"], "color": r.get("color_rgb"),
+                    } for r in syn_runs if r.get("text")]
+                plan["layout_manifest"] = manifest
+
+                ys = [float(r["baselineY"]) for r in manifest]
+                if ys:
+                    mb = edit.get("manifestBbox")
+                    top = float(mb["y0"]) if isinstance(mb, dict) else (min(ys) - plan["fontsize"] * 0.9)
+                    ey0 = max(0, top - 1.0)                      # ascender + 1pt ONLY
+                    ey1 = min(y0 + edit["rect"]["h"] + 2, max(ys) + plan["fontsize"] * 0.5)
+                    erase_rect = fitz.Rect(max(0, x0 - 2), ey0, x0 + edit["rect"]["w"] + 2, ey1)
+                else:
+                    erase_rect = fitz.Rect(max(0, x0 - 2), max(0, y0 - 2),
+                                           x0 + edit["rect"]["w"] + 2, y0 + edit["rect"]["h"] + 2)
+                logger.info(f"[ERASE] clamped erase_rect=[{erase_rect.x0:.1f}, {erase_rect.y0:.1f}, {erase_rect.x1:.1f}, {erase_rect.y1:.1f}]")
+                plan["erase_rects"].append(erase_rect)
                 plan["paragraph_rect"] = fitz.Rect(
                     x0, y0,
                     x0 + edit["rect"]["w"], y0 + edit["rect"]["h"] + 10
@@ -1884,7 +1896,14 @@ async def apply_edits(
         # ── Phase 3: Insert all new text ──
         for plan in edit_plans:
             if plan.get("is_paragraph_op"):
-                manifest = plan.get("layout_manifest")
+                manifest = plan.get("layout_manifest") or []
+                if not manifest and plan.get("erase_rects"):
+                    runs = _span_runs_in_rect(page, plan["erase_rects"][0])
+                    manifest = [{
+                        "text": r["text"], "x": r["x"], "baselineY": r["span_baseline_y"],
+                        "fontSize": r["size"], "color": r.get("color_rgb"),
+                    } for r in runs if r.get("text")]
+                logger.info(f"[PATH] paragraph op -> {'manifest' if plan.get('layout_manifest') else 'synthesized'} verified emitter ({len(manifest)} runs)")
                 if manifest:
                     # Log the manifest's requested fontsize for comparison with canary
                     manifest_sizes = set(r.get("fontSize") for r in manifest if r.get("fontSize"))
@@ -1920,6 +1939,8 @@ async def apply_edits(
                     )
                     logger.info(f"PARAGRAPH MANIFEST INSERT SUCCESS: page {page_num}")
                     continue  # CRITICAL: MUST continue to skip legacy greedy re-wrap
+
+                logger.error("[PATH] paragraph op fell to legacy textbox path — must not happen")
 
                 lines = plan.get("lines", [])
                 if lines:
@@ -2212,17 +2233,20 @@ async def apply_edits(
                     or plan.get("font_registrations", {}).get(font_name_arg)
                 )
 
-                fallback_name, fallback_buf = get_universal_fallback_font(font_name_arg)
                 primary_missing = _check_font_buf_missing_glyphs(font_buf_arg, paragraph_text)
-
                 attempts = []
                 if primary_missing:
-                    logger.warning(
-                        f"Primary font subset '{font_name_arg}' is missing {len(primary_missing)} "
-                        f"glyph(s) for paragraph text. Prioritizing universal fallback '{fallback_name}'."
-                    )
-                    attempts.append((fallback_name, fallback_buf))
-                    attempts.append((font_name_arg, font_buf_arg))
+                    v = vault_full_for(font_name_arg) or resolve_promotion_target(canonical_family(font_name_arg))
+                    if v:
+                        logger.warning(f"[LEGACY-SAFE] {sorted(primary_missing)} -> vault {v[0]}")
+                        attempts = [(v[0], v[1]), (font_name_arg, font_buf_arg)]
+                    else:
+                        logger.warning(
+                            f"Primary font subset '{font_name_arg}' is missing {len(primary_missing)} "
+                            f"glyph(s) for paragraph text. Prioritizing universal fallback '{fallback_name}'."
+                        )
+                        attempts.append((fallback_name, fallback_buf))
+                        attempts.append((font_name_arg, font_buf_arg))
                 else:
                     attempts.append((font_name_arg, font_buf_arg))
                     if fallback_name != font_name_arg:
@@ -2410,11 +2434,15 @@ async def apply_edits(
                 )
                 i = j
 
-    # ── Subset embedded fonts to keep file size reasonable ──────────────────
-    try:
-        doc.subset_fonts()
-    except Exception as e:
-        logger.warning(f"subset_fonts() failed (non-fatal): {e}")
+    # ── Font subsetting is a PACKAGING step, not an editing step ───────────
+    # Recompiling shared font programs between edits drops glyphs referenced
+    # by paragraphs that were not edited (cross-paragraph coupling).
+    # Working documents stay un-subsetted; only /optimize (export) subsets.
+    if optimize == "1":
+        try:
+            doc.subset_fonts()
+        except Exception as e:
+            logger.warning(f"subset_fonts() failed (non-fatal): {e}")
 
     # ── Serialise with Garbage Collection & XREF Cleaning ────────────────────
     buf = io.BytesIO()
@@ -2440,6 +2468,26 @@ async def apply_edits(
             "Access-Control-Expose-Headers": "Content-Disposition, X-Font-Warnings",
             "X-Font-Warnings":            warnings_header,
         },
+    )
+
+
+@router.post("/optimize")
+async def optimize_pdf(file: UploadFile = File(...)):
+    """Final packaging: subset fonts + GC for a lean downloadable artifact.
+    The result is terminal — do not re-import it as a working document."""
+    data = await file.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        doc.subset_fonts()
+    except Exception as e:
+        logger.warning(f"optimize: subset_fonts failed (non-fatal): {e}")
+    buf = io.BytesIO()
+    doc.save(buf, garbage=4, deflate=True)
+    doc.close()
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="optimized.pdf"'},
     )
 
 

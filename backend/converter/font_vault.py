@@ -235,6 +235,9 @@ def vault_ingest_batch(items):
             kwargs = item[3] if len(item) > 3 else {}
             vault_ingest(family, basename, buffer, **kwargs)
 
+def _pdf_safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_+\-]", "-", name)
+
 def vault_cover_for(family, ch):
     """(name, buffer) of a vault font in the same family covering ch, else None.
     Preference: registered full font → stored subsets (newest coverage first)."""
@@ -260,39 +263,39 @@ def vault_cover_for(family, ch):
     
     for p in candidates:
         if p.exists() and ord(ch) in _cached_cmap(p):
-            return (p.stem, p.read_bytes())
+            return (_pdf_safe(p.stem), p.read_bytes())
     return None
 
 def vault_full_for(family, style="regular"):
     """Return a full-charset font buffer for promotion. NEVER returns subset buffers."""
     mf = _read_manifest()
-    fam = root_family(family)
+    fam = resolve_root_family(family)
     
     # 1. Exact family + style match
     for key, entry in mf.items():
-        if root_family(key) == fam or root_family(entry.get("stand_in_for", "")) == fam:
+        if resolve_root_family(key) == fam or resolve_root_family(entry.get("stand_in_for", "")) == fam:
             # Style-aware selection (prefer exact style, then regular)
             if entry.get("style", "regular") == style and entry.get("full_font"):
                 p = VAULT_DIR / entry["full_font"]
                 if p.exists() and "subsets/" not in str(p):
-                    return (p.stem, p.read_bytes())
+                    return (_pdf_safe(p.stem), p.read_bytes())
                 
     # 2. Fallback to "regular" if requested style missing
     if style != "regular":
         for key, entry in mf.items():
-            if root_family(key) == fam or root_family(entry.get("stand_in_for", "")) == fam:
+            if resolve_root_family(key) == fam or resolve_root_family(entry.get("stand_in_for", "")) == fam:
                 if entry.get("style", "regular") == "regular" and entry.get("full_font"):
                     p = VAULT_DIR / entry["full_font"]
                     if p.exists() and "subsets/" not in str(p):
-                        return (p.stem, p.read_bytes())
+                        return (_pdf_safe(p.stem), p.read_bytes())
                     
     # 3. Any variant as last resort
     for key, entry in mf.items():
-        if root_family(key) == fam or root_family(entry.get("stand_in_for", "")) == fam:
+        if resolve_root_family(key) == fam or resolve_root_family(entry.get("stand_in_for", "")) == fam:
             if entry.get("full_font"):
                 p = VAULT_DIR / entry["full_font"]
                 if p.exists() and "subsets/" not in str(p):
-                    return (p.stem, p.read_bytes())
+                    return (_pdf_safe(p.stem), p.read_bytes())
                 
     return None
 
@@ -342,6 +345,7 @@ def resolve_promotion_target(family, style="regular"):
         return None
     p = VAULT_DIR / rel
     if p.exists():
-        return (p.stem, p.read_bytes(), root)
+        return (_pdf_safe(p.stem), p.read_bytes(), root)
     return None
+
 

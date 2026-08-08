@@ -1,0 +1,110 @@
+{
+ "newbaskerville": {
+  "regular": "full/New Baskerville ITC W04 Roman.ttf",
+  "bold": "full/libre-baskerville-Bold.ttf",
+  "italic": "full/libre-baskerville-Italic.ttf"
+ },
+ "courier": {
+  "bold": "full/texgyrecursor-bold.otf"
+ },
+ "helvetica": {
+  "bold": "full/texgyreheros-bold.otf",
+  "bolditalic": "full/texgyreheros-bolditalic.otf",
+  "italic": "full/texgyreheros-italic.otf",
+  "regular": "full/OpenSans-300.ttf"
+ },
+ "palatino": {
+  "bold": "full/texgyrepagella-bold.otf",
+  "regular": "full/pala.ttf",
+  "bolditalic": "full/palabi.ttf",
+  "italic": "full/palai.ttf"
+ },
+ "timesnewroman": {
+  "bold": "full/texgyretermes-bold.otf",
+  "italic": "full/texgyretermes-italic.otf",
+  "regular": "full/Tinos-regular.ttf",
+  "bolditalic": "full/Tinos-700italic.ttf"
+ },
+ "arial": {
+  "regular": "full/Arimo-regular.ttf",
+  "bold": "full/Arimo-700.ttf",
+  "italic": "full/Arimo-italic.ttf",
+  "bolditalic": "full/Arimo-700italic.ttf"
+ },
+ "couriernew": {
+  "regular": "full/Cousine-regular.ttf",
+  "italic": "full/Cousine-italic.ttf",
+  "bold": "full/Cousine-700.ttf",
+  "bolditalic": "full/Cousine-700italic.ttf"
+ },
+ "calibri": {
+  "regular": "full/Carlito-regular.ttf",
+  "italic": "full/Carlito-italic.ttf",
+  "bold": "full/Carlito-700.ttf",
+  "bolditalic": "full/Carlito-700italic.ttf"
+ },
+ "cambria": {
+  "regular": "full/Caladea-regular.ttf",
+  "italic": "full/Caladea-italic.ttf",
+  "bold": "full/Caladea-700.ttf",
+  "bolditalic": "full/Caladea-700italic.ttf"
+ },
+ "helveticaneue": {
+  "regular": "full/Roboto-100.ttf",
+  "bold": "full/Roboto-700.ttf",
+  "italic": "full/Roboto-100italic.ttf",
+  "bolditalic": "full/Roboto-700italic.ttf"
+ },
+ "garamond": {
+  "regular": "full/EBGaramond-regular.ttf",
+  "bold": "full/EBGaramond-700.ttf",
+  "italic": "full/EBGaramond-italic.ttf",
+  "bolditalic": "full/EBGaramond-700italic.ttf"
+ },
+ "georgia": {
+  "regular": "full/Merriweather-300.ttf",
+  "bold": "full/Merriweather-700.ttf",
+  "italic": "full/Merriweather-300italic.ttf",
+  "bolditalic": "full/Merriweather-700italic.ttf"
+ },
+ "verdana": {
+  "regular": "full/verdana.ttf",
+  "bold": "full/verdanab.ttf",
+  "italic": "full/verdanai.ttf",
+  "bolditalic": "full/verdanaz.ttf"
+ },
+ "trebuchetms": {
+  "regular": "full/trebuc.ttf",
+  "bold": "full/trebucbd.ttf",
+  "bolditalic": "full/trebucbi.ttf",
+  "italic": "full/trebucit.ttf"
+ },
+ "bookmanoldstyle": {
+  "regular": "full/BOOKOS.TTF",
+  "bold": "full/BOOKOSB.TTF",
+  "bolditalic": "full/BOOKOSBI.TTF",
+  "italic": "full/BOOKOSI.TTF"
+ },
+ "segoeui": {
+  "italic": "full/segoeui.ttf",
+  "bold": "full/segoeuib.ttf",
+  "regular": "full/segoeuil.ttf",
+  "bolditalic": "full/segoeuiz.ttf"
+ },
+ "tahoma": {
+  "regular": "full/tahoma.ttf",
+  "bold": "full/tahomabd.ttf"
+ },
+ "consolas": {
+  "regular": "full/consola.ttf",
+  "bold": "full/consolab.ttf",
+  "italic": "full/consolai.ttf",
+  "bolditalic": "full/consolaz.ttf"
+ },
+ "symbol": {
+  "regular": "full/SYMBOL.TTF"
+ },
+ "wingdings": {
+  "regular": "full/wingding.ttf"
+ }
+}
